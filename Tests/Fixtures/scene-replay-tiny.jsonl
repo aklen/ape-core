@@ -1,0 +1,3 @@
+{"frameId":1,"command":"create","position":[1,2,3],"status":"Applied","digest":"6AFD100CD696C0439D56BF3D734AEEEB5DD31E68A420A5ECDE9EB779F4BB2247"}
+{"frameId":2,"command":"fail","position":null,"status":"Failed","digest":"6AFD100CD696C0439D56BF3D734AEEEB5DD31E68A420A5ECDE9EB779F4BB2247"}
+{"frameId":3,"command":"move","position":[4,5,6],"status":"Applied","digest":"D5EB167C6622487426991BCC662E6F66D0C993C8D978FDE42F27303DF4E08E7F"}

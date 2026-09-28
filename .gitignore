@@ -1,0 +1,146 @@
+## Build output
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+*.exe
+*.dll
+*.pdb
+*.app
+*.dylib
+*.so
+*.a
+
+# Publish folders
+/publish/
+/dist/
+/out/
+/artifacts/
+/build/
+
+## User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+## IDE metadata
+.vscode/
+.idea/
+*.swp
+*.DS_Store
+Thumbs.db
+
+## Visual Studio
+.vs/
+TestResults/
+*.VisualState.xml
+*.vsp
+*.vspx
+*.psess
+*.pidb
+*.svclog
+
+## Rider / JetBrains
+.idea/
+*.sln.iml
+
+## NuGet
+*.nupkg
+*.snupkg
+*.nuspec
+.nuget/
+packages/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+## dotnet tools
+.dotnet/
+dotnet-tools.json
+
+## Temporary files
+*.tmp
+*.temp
+~$*
+*.bak
+*.old
+
+## Logs
+*.log
+*.trace
+*.trace.json
+
+## Coverage / testing
+coverage/
+*.coverage
+*.coveragexml
+*.cov
+*.opencover.xml
+TestResults/
+BenchmarkDotNet.Artifacts/
+
+## OS junk
+ehthumbs.db
+Icon?
+Desktop.ini
+$RECYCLE.BIN/
+
+## Resharper
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+## Rider
+.idea/
+
+## Entity Framework
+migrations/
+
+## ASP.NET
+App_Data/
+App_Browsers/
+App_Code/
+App_GlobalResources/
+App_LocalResources/
+App_Themes/
+App_WebReferences/
+
+## Azure
+PublishProfiles/
+*.pubxml
+*.publishproj
+*.azurePubxml
+
+## Docker
+docker-compose.override.yml
+*.dockerfile
+*.dockerignore
+
+## Local secrets / keys
+secrets.json
+*.pem
+*.key
+*.crt
+
+## macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+__MACOSX/
+
+## Linux
+*~
+
+## Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+## Custom: ApeCore plugin outputs
+/plugins/*/bin/
+/plugins/*/obj/
+
+# Python
+__pycache__/
