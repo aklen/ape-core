@@ -1,0 +1,37 @@
+{
+  "modules": {
+    "Ape.Core.Network": {
+      "enabled": true,
+      "transport": "quic",
+      "role": "server",
+      "peerName": "subscription-server",
+      "port": 5002
+    },
+    "Ape.Core.Replica": {
+      "subscription": {
+        "paths": [
+          "/PingNode"
+        ],
+        "mode": "include"
+      },
+      "authentication": {
+        "rules": [
+          {
+            "path": "/PingNode",
+            "whitelist": {
+              "allowed-internal-only": {
+                "privileges": [
+                  "read"
+                ]
+              }
+            },
+            "blacklist": []
+          }
+        ]
+      },
+      "plugins": {
+        "SubscriptionServerDemo": {}
+      }
+    }
+  }
+}

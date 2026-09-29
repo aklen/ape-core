@@ -1,0 +1,17 @@
+{
+  "modules": {
+    "Ape.Core.Network": {
+      "enabled": true,
+      "transport": "quic",
+      "role": "client",
+      "peerName": "subscription-client",
+      "host": "127.0.0.1",
+      "port": 5002
+    },
+    "Ape.Core.Replica": {
+      "plugins": {
+        "SubscriptionDemo": {}
+      }
+    }
+  }
+}

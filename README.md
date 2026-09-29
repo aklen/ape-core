@@ -6,7 +6,7 @@
 
 Ape.Core is the foundational layer of [Ape](https://github.com/MTASZTAKI/ApertusVR): a cross-platform, event-driven framework for building distributed applications with a shared scene model and network-synchronized replicas. It continues the ideas of ApertusVR with modern .NET.
 
-This repository is **extracted from the former monolithic `apertus-csharp` tree** and is intended to live inside the [ape-skeleton](https://github.com/your-org/ape-skeleton) workspace at:
+This repository is **extracted from the former monolithic `apertus-csharp` tree** and is intended to live inside the [ape-skeleton](https://github.com/aklen/ape-skeleton) workspace at:
 
 ```
 ape-skeleton/
@@ -46,8 +46,6 @@ Ape.Core/
 ├── Logging/          # ILogger abstraction + console transport
 ├── Network/          # INetworkManager, LiteNetLib & QUIC transports
 ├── Replication/      # ApeReplica, delta sync, subscription demos
-│   ├── Plugins/      # Core demo plugins (subscription samples)
-│   └── Samples/      # Host JSON configs for replica demos
 ├── Runtime/          # ApeSystem, PluginManager, ServiceLoader
 ├── Scene/            # Scene graph, commit pipeline, ISceneRead
 ├── Tests/            # Unit tests (Ape.Core.Tests)
@@ -60,33 +58,81 @@ Ape.Core/
 
 ## Prerequisites
 
-- [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0)
+- [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0) — verify with `dotnet --version` (must report `9.x`)
 - **(macOS, QUIC only)** `brew install libmsquic`
+
+This repo has **no `.sln` file** — build projects directly via their `.csproj` paths from the repository root.
 
 ---
 
-## Building standalone
+## Building
 
-You can build and test this repo on its own without the full skeleton checkout:
+### Core library
 
 ```bash
-# Build the core library
-dotnet build Ape.Core.csproj -c Release
+cd ape-core   # repository root
 
-# Run tests
+dotnet restore Ape.Core.csproj
+dotnet build Ape.Core.csproj -c Release
+```
+
+**Output:** `build/bin/Ape.Core/Release/net9.0/Ape.Core.dll`
+
+Build artifacts are centralized under `build/` via root `Directory.Build.props` (not next to each `.csproj`).
+
+Debug build:
+
+```bash
+dotnet build Ape.Core.csproj -c Debug
+# → build/bin/Ape.Core/Debug/net9.0/Ape.Core.dll
+```
+
+### Unit tests
+
+```bash
 dotnet test Tests/Ape.Core.Tests.csproj -c Release
 ```
 
-To run demos (subscription server/client, etc.), use an **ape-skeleton** checkout with Core synced under `src/Ape.Core/`:
+Builds the test project (which references `Ape.Core.csproj`) and runs all tests in `Tests/`.
+
+### Core demo plugins (optional)
+
+Subscription demos under `Replication/Plugins/` are **separate projects** that reference the core library:
 
 ```bash
-# In ape-skeleton (after cloning this repo into src/Ape.Core/)
+dotnet build Replication/Plugins/SubscriptionDemo/Ape.Core.Replica.Plugin.SubscriptionDemo.csproj -c Release
+dotnet build Replication/Plugins/SubscriptionServerDemo/Ape.Core.Replica.Plugin.SubscriptionServerDemo.csproj -c Release
+dotnet build Replication/Plugins/SubscriptionClientDemo/Ape.Core.Replica.Plugin.SubscriptionClientDemo.csproj -c Release
+```
+
+Each plugin outputs its own DLL under `build/bin/<ProjectName>/Release/net9.0/`.
+
+### Clean build artifacts
+
+```bash
+rm -rf build/
+dotnet build Ape.Core.csproj -c Release
+```
+
+Legacy `bin/` / `obj/` folders under source trees (from older builds) can be removed the same way if present.
+
+### Building from ape-skeleton
+
+When this repo lives at `src/Ape.Core/` inside **ape-skeleton**, use the skeleton CLI instead:
+
+```bash
+./ape build core
+```
+
+To run replica subscription demos (requires launcher + built plugins):
+
+```bash
 ./ape sync    # or your submodule / clone workflow
 ./ape build
 ./ape run -c src/Ape.Core/Replication/Samples/subscription-server.json
 ```
 
-See [Replication/Samples/README.md](Replication/Samples/README.md) for replica subscription demos.
+See [Replication/Samples/README.md](Replication/Samples/README.md) for subscription demo details.
 
 ---
 
