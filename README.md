@@ -140,7 +140,7 @@ Or from the skeleton solution:
 dotnet add src/Ape.Modules/Ape.Module.Example/Ape.Module.Example.csproj reference src/Ape.Core/Ape.Core.csproj
 ```
 
-Plugins implement `IPlugin` and receive core services via DI in `OnInit()`. Scene writes go through the deterministic commit pipeline (`IFrameCommitBatch`), not direct property assignment from plugin threads. See skeleton `docs/ARCHITECTURE.md` and `docs/DETERMINISM.md`.
+Plugins implement `IPlugin` and receive core services via DI in `OnInit()`. Scene writes go through the deterministic commit pipeline (`IFrameCommitBatch`), not direct property assignment from plugin threads. See [Docs/DETERMINISM.md](Docs/DETERMINISM.md) and skeleton [ARCHITECTURE.md](https://github.com/aklen/ape-skeleton/blob/main/docs/ARCHITECTURE.md).
 
 ---
 
