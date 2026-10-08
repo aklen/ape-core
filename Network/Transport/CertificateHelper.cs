@@ -47,8 +47,8 @@ public static class CertificateHelper
             DateTimeOffset.UtcNow.AddDays(-1),
             DateTimeOffset.UtcNow.AddYears(1));
 
-        // Export with private key
-        return new X509Certificate2(
+        // Re-import so the private key is exportable. LoadPkcs12 replaces the obsolete constructor.
+        return X509CertificateLoader.LoadPkcs12(
             certificate.Export(X509ContentType.Pfx, ""),
             "",
             X509KeyStorageFlags.Exportable);
