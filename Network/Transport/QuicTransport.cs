@@ -47,7 +47,6 @@ public class QuicTransport : INetworkTransport
     private readonly CancellationTokenSource _cts = new();
     
     private int _nextPeerId = 1;
-    private bool _isServer;
     private bool _isRunning;
     private string _localPeerId = string.Empty;  // Empty = not connected/started
 
@@ -102,7 +101,6 @@ public class QuicTransport : INetworkTransport
             return;
         }
 
-        _isServer = true;
         _isRunning = true;
         
         // Generate unique PeerId using PeerIdGenerator
@@ -155,7 +153,6 @@ public class QuicTransport : INetworkTransport
             return;
         }
 
-        _isServer = false;
         _isRunning = true;
         
         // Generate unique PeerId using PeerIdGenerator
