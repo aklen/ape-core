@@ -311,7 +311,7 @@ public static class ApeSystem
                     }
                     catch (InvalidOperationException ex)
                     {
-                        _services.GetService<ILogger>()?.LogError(
+                        _services?.GetService<ILogger>()?.LogError(
                             $"Host frame pipeline stopped: {ex.Message}", ex);
                         running = false;
                     }
