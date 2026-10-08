@@ -28,7 +28,9 @@ public abstract class Replica : IReplica
     /// Set during construction or by SceneManager.
     /// </summary>
     [Key(0)]
+#pragma warning disable MsgPack017 // Serialize() always writes key 0; the Guid initializer is for local construction.
     public string Id { get; init; } = Guid.NewGuid().ToString();
+#pragma warning restore MsgPack017
     
     [IgnoreMember]
     public bool IsLocal { get; set; } = true;
