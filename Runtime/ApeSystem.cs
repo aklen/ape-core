@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Runtime.Loader;
+using System.Runtime.Versioning;
 using Ape.Core.Config;
 using Ape.Core.Config.Models;
 using Ape.Core.Config.Services;
@@ -25,6 +26,9 @@ namespace Ape.Core;
 /// with a host JSON; modules are loaded from DLLs next to the process (config <c>modules</c> keys),
 /// not compiled into Core.
 /// </summary>
+[SupportedOSPlatform("linux")]
+[SupportedOSPlatform("macos")]
+[SupportedOSPlatform("windows")]
 public static class ApeSystem
 {
     private const string DefaultLogTransport = "console";

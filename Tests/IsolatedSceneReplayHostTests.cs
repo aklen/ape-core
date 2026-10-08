@@ -1,9 +1,13 @@
 using System.Numerics;
+using System.Runtime.Versioning;
 using Ape.Core.Determinism;
 using Ape.Core.Scene.Commit;
 
 namespace Ape.Core.Tests;
 
+[SupportedOSPlatform("linux")]
+[SupportedOSPlatform("macos")]
+[SupportedOSPlatform("windows")]
 public sealed class IsolatedSceneReplayHostTests
 {
     private sealed class CreateNodeParticipant : IDeterministicFrameParticipant

@@ -1,3 +1,4 @@
+using System.Runtime.Versioning;
 using Ape.Core.Config.Models;
 using Ape.Core.Determinism;
 using Ape.Core.Event;
@@ -17,6 +18,9 @@ namespace Ape.Core.Scene.Commit;
 /// Owns a fresh, local Scene and host for replay. This never advances the production host.
 /// Module-specific entity registration can be supplied without Core naming any module.
 /// </summary>
+[SupportedOSPlatform("linux")]
+[SupportedOSPlatform("macos")]
+[SupportedOSPlatform("windows")]
 public sealed class IsolatedSceneReplayHost : IDisposable
 {
     private readonly ServiceProvider _services;

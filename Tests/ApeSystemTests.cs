@@ -1,8 +1,12 @@
+using System.Runtime.Versioning;
 using Ape.Core;
 
 namespace Ape.Core.Tests;
 
 [Collection(nameof(ApeSystemCollection))]
+[SupportedOSPlatform("linux")]
+[SupportedOSPlatform("macos")]
+[SupportedOSPlatform("windows")]
 public sealed class ApeSystemTests
 {
     [Fact]
