@@ -76,7 +76,7 @@ dotnet restore Ape.Core.csproj
 dotnet build Ape.Core.csproj -c Release
 ```
 
-**Output:** `build/bin/Ape.Core/Release/net9.0/Ape.Core.dll`
+**Output:** `build/bin/Ape.Core/Release/net10.0/Ape.Core.dll`
 
 Build artifacts are centralized under `build/` via root `Directory.Build.props` (not next to each `.csproj`).
 
@@ -84,7 +84,7 @@ Debug build:
 
 ```bash
 dotnet build Ape.Core.csproj -c Debug
-# → build/bin/Ape.Core/Debug/net9.0/Ape.Core.dll
+# → build/bin/Ape.Core/Debug/net10.0/Ape.Core.dll
 ```
 
 ### Unit tests

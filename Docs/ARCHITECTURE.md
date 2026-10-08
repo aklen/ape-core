@@ -728,7 +728,7 @@ Ape.Module.XY/
 Build artifacts live under `build/` (not `src/**/bin`). Configured via root `Directory.Build.props`.
 
 ```
-build/bin/Ape.Launcher/<Configuration>/net9.0/
+build/bin/Ape.Launcher/<Configuration>/net10.0/
   ├── Ape.Launcher.dll
   ├── Ape.Core.dll
   └── Ape.Module.*.dll
