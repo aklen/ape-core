@@ -369,6 +369,96 @@ public sealed class AetherReducerTests
     }
 
     [Fact]
+    public void A_lower_snapshot_row_cannot_conflict_under_a_newer_one()
+    {
+        var store = NewStore();
+        Apply(store, LabelOp("live", "peer-A", "peer-A/s1", 1, 10, "cube"));
+        var clock = store.Clock;
+        var dedup = store.DedupCount;
+
+        var image = new AetherImage(
+            999,
+            [
+                LabelRow(10, "box", "old-clash"),
+                LabelRow(20, "fresh", "newer"),
+            ],
+            [new SeenOperation("intruder", "abc", 20)]);
+
+        Assert.Throws<AetherProtocolException>(() => store.MergeImage(image));
+        Assert.Equal(clock, store.Clock);
+        Assert.Equal(dedup, store.DedupCount);
+        Assert.False(store.Remembers("intruder"));
+        Assert.Equal("cube", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(1, store.RecordCount);
+    }
+
+    [Fact]
+    public void A_lower_version_collision_is_rejected_in_either_row_order()
+    {
+        foreach (var rows in new[]
+        {
+            new[] { LabelRow(20, "new", "high"), LabelRow(10, "x", "low-x"), LabelRow(10, "y", "low-y") },
+            new[] { LabelRow(10, "x", "low-x"), LabelRow(10, "y", "low-y"), LabelRow(20, "new", "high") },
+        })
+        {
+            var store = NewStore();
+            Assert.Throws<AetherProtocolException>(() => store.MergeImage(new AetherImage(5, rows, [])));
+            Assert.Equal(0, store.Clock);
+            Assert.Equal(0, store.RecordCount);
+            Assert.Equal(0, store.DedupCount);
+        }
+    }
+
+    [Fact]
+    public void Agreeing_lower_rows_fold_to_the_newer_value()
+    {
+        var store = NewStore();
+        store.MergeImage(new AetherImage(
+            5,
+            [
+                LabelRow(10, "x", "low-a"),
+                LabelRow(10, "x", "low-b"),
+                LabelRow(20, "new", "high"),
+            ],
+            [new SeenOperation("s", "d", 20)]));
+
+        Assert.Equal("new", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(5, store.Clock);
+        Assert.Equal(1, store.RecordCount);
+        Assert.True(store.Remembers("s"));
+    }
+
+    [Fact]
+    public void A_lamport_that_cannot_advance_is_rejected_before_any_change()
+    {
+        var store = NewStore();
+        Apply(store, LabelOp("live", "peer-A", "peer-A/s1", 1, 1, "cube"));
+        var clock = store.Clock;
+        var dedup = store.DedupCount;
+
+        Assert.Throws<AetherProtocolException>(() =>
+            Apply(store, LabelOp("max", "peer-B", "peer-B/s1", 1, long.MaxValue, "later")));
+        Assert.Equal(clock, store.Clock);
+        Assert.Equal(dedup, store.DedupCount);
+        Assert.Equal(1, store.RecordCount);
+        Assert.Equal("cube", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.False(store.Remembers("max"));
+
+        store.MergeImage(new AetherImage(long.MaxValue, [], []));
+        Assert.Equal(long.MaxValue, store.Clock);
+        Assert.Throws<AetherProtocolException>(() => store.StampLocal(
+            "entity-1",
+            "peer-A",
+            "peer-A/s1",
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("next") }));
+        Assert.Throws<AetherProtocolException>(() =>
+            Apply(store, LabelOp("after", "peer-B", "peer-B/s1", 1, 1, "nope")));
+        Assert.Equal(long.MaxValue, store.Clock);
+        Assert.Equal("cube", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.False(store.Remembers("after"));
+    }
+
+    [Fact]
     public void A_remembered_digest_is_not_a_replayable_payload()
     {
         var store = NewStore();
@@ -499,6 +589,14 @@ public sealed class AetherReducerTests
     }
 
     private static void Apply(AetherReducer store, AetherOperation op) => store.Apply(op, observeClock: true);
+
+    private static StoredField LabelRow(long lamport, string label, string operationId) =>
+        new(
+            new RecordKey("entity-1", "peer-A", "label"),
+            FieldValue.Label(label),
+            new FieldVersion(lamport, "peer-A/s1"),
+            "peer-A",
+            operationId);
 
     private static AetherOperation ActorLabel(string id, string actorId, string label) =>
         new(id, "entity-1", "peer-A", actorId, 1, 10, new Dictionary<string, FieldValue>

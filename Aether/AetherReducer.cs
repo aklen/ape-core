@@ -58,7 +58,8 @@ public sealed class AetherReducer
         string actorId,
         IReadOnlyDictionary<string, FieldValue> changes)
     {
-        _clock++;
+        var nextClock = NextClock(_clock);
+        _clock = nextClock;
         if (!_nextSequence.TryGetValue(actorId, out var sequence))
             sequence = 1;
         else
@@ -103,7 +104,7 @@ public sealed class AetherReducer
         }
 
         if (observeClock)
-            _clock = Math.Max(_clock, op.Lamport) + 1;
+            _clock = NextClock(Math.Max(_clock, op.Lamport));
 
         Remember(op.Id, op.Digest, op.Lamport);
         foreach (var (key, value) in admitted)
@@ -112,7 +113,7 @@ public sealed class AetherReducer
 
     public void MergeImage(AetherImage image)
     {
-        RejectImage(image);
+        var folded = FoldImage(image);
 
         if (image.Clock > _clock)
             _clock = image.Clock;
@@ -120,7 +121,7 @@ public sealed class AetherReducer
         foreach (var seen in image.Seen)
             Remember(seen.Id, seen.Digest, seen.Lamport);
 
-        foreach (var field in image.Fields)
+        foreach (var field in folded)
             Upsert(field.Key, field.Value, field.Version, field.WriterId, field.OperationId);
     }
 
@@ -178,7 +179,7 @@ public sealed class AetherReducer
         return field.Value.Fixed;
     }
 
-    private void RejectImage(AetherImage image)
+    private List<StoredField> FoldImage(AetherImage image)
     {
         var digests = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var seen in image.Seen)
@@ -191,30 +192,48 @@ public sealed class AetherReducer
             digests[seen.Id] = seen.Digest;
         }
 
-        var folded = new Dictionary<RecordKey, (FieldValue Value, FieldVersion Version)>();
+        var versions = new Dictionary<RecordKey, Dictionary<FieldVersion, StoredField>>();
         foreach (var field in image.Fields)
         {
             RequireShape(field.Key.FieldId, field.Value);
-            if (!folded.TryGetValue(field.Key, out var already))
+            if (_records.TryGetValue(field.Key, out var existing)
+                && existing.Version.CompareTo(field.Version) == 0
+                && existing.Value != field.Value)
+                throw new AetherProtocolException($"Version collision on '{field.Key.FieldId}'.");
+
+            if (!versions.TryGetValue(field.Key, out var byVersion))
             {
-                folded[field.Key] = (field.Value, field.Version);
-                continue;
+                byVersion = new Dictionary<FieldVersion, StoredField>();
+                versions[field.Key] = byVersion;
             }
 
-            var compared = field.Version.CompareTo(already.Version);
-            if (compared == 0 && already.Value != field.Value)
+            if (byVersion.TryGetValue(field.Version, out var already) && already.Value != field.Value)
                 throw new AetherProtocolException($"Version collision on '{field.Key.FieldId}'.");
-            if (compared > 0)
-                folded[field.Key] = (field.Value, field.Version);
+
+            byVersion[field.Version] = field;
         }
 
-        foreach (var (key, incoming) in folded)
+        var folded = new List<StoredField>(versions.Count);
+        foreach (var byVersion in versions.Values)
         {
-            if (_records.TryGetValue(key, out var existing)
-                && existing.Version.CompareTo(incoming.Version) == 0
-                && existing.Value != incoming.Value)
-                throw new AetherProtocolException($"Version collision on '{key.FieldId}'.");
+            StoredField? winner = null;
+            foreach (var field in byVersion.Values)
+            {
+                if (winner is null || field.Version > winner.Version)
+                    winner = field;
+            }
+
+            folded.Add(winner!);
         }
+
+        return folded;
+    }
+
+    private static long NextClock(long clock)
+    {
+        if (clock == long.MaxValue)
+            throw new AetherProtocolException("Lamport clock overflow.");
+        return clock + 1;
     }
 
     private void RequireShape(string fieldId, FieldValue value)
