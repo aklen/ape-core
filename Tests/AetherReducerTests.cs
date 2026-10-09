@@ -459,6 +459,133 @@ public sealed class AetherReducerTests
     }
 
     [Fact]
+    public void Delete_and_update_leave_the_entity_deleted_in_either_order()
+    {
+        foreach (var deleteFirst in new[] { true, false })
+        {
+            var store = NewStore();
+            var update = LabelOp("update", "peer-A", "peer-A/s1", 1, 10, "cube");
+            var delete = Life(AetherEffect.DeleteEntity, "delete", 5);
+            if (deleteFirst)
+            {
+                Apply(store, delete);
+                Apply(store, update);
+            }
+            else
+            {
+                Apply(store, update);
+                Apply(store, delete);
+            }
+
+            Apply(store, Life(AetherEffect.RestoreShared, "restore", 30, "peer-B/s1"));
+            Assert.True(store.IsDeleted("entity-1"));
+            Assert.Equal("cube", store.ResolveLww("entity-1", "label")?.Text);
+        }
+    }
+
+    [Fact]
+    public void A_snapshot_from_before_delete_does_not_revive()
+    {
+        var origin = NewStore();
+        Apply(origin, LabelOp("old", "peer-A", "peer-A/s1", 1, 10, "cube"));
+        var before = origin.Capture();
+        Apply(origin, Life(AetherEffect.DeleteEntity, "delete", 20));
+        origin.MergeImage(before);
+
+        Assert.True(origin.IsDeleted("entity-1"));
+        Assert.Equal("cube", origin.ResolveLww("entity-1", "label")?.Text);
+
+        var live = NewStore();
+        Apply(live, LabelOp("new", "peer-A", "peer-A/s1", 2, 30, "box"));
+        live.MergeImage(origin.Capture());
+        Assert.True(live.IsDeleted("entity-1"));
+        Assert.Equal("box", live.ResolveLww("entity-1", "label")?.Text);
+    }
+
+    [Fact]
+    public void Hide_and_restore_follow_the_greater_version_in_either_order()
+    {
+        foreach (var hideFirst in new[] { true, false })
+        {
+            var hidden = NewStore();
+            ApplyPair(
+                hidden,
+                hideFirst,
+                Life(AetherEffect.HideShared, "hide", 20),
+                Life(AetherEffect.RestoreShared, "restore", 10, "peer-B/s1"));
+            Assert.False(hidden.IsSharedVisible("entity-1"));
+
+            var shown = NewStore();
+            ApplyPair(
+                shown,
+                hideFirst,
+                Life(AetherEffect.HideShared, "hide", 10),
+                Life(AetherEffect.RestoreShared, "restore", 20, "peer-B/s1"));
+            Assert.True(shown.IsSharedVisible("entity-1"));
+        }
+    }
+
+    [Fact]
+    public void Hide_keeps_the_raw_contribution()
+    {
+        var store = NewStore();
+        Apply(store, FixedOp("a", "peer-A", "peer-A/s1", 1, 1, 4));
+        Apply(store, Life(AetherEffect.HideShared, "hide", 2));
+
+        Assert.False(store.IsSharedVisible("entity-1"));
+        Assert.Equal(4, store.RawContribution("entity-1", "peer-A", "offset"));
+        Assert.Equal(4, store.ResolveSum("entity-1", "offset"));
+
+        Apply(store, Life(AetherEffect.RestoreShared, "restore", 3));
+        Assert.True(store.IsSharedVisible("entity-1"));
+        Assert.Equal(4, store.RawContribution("entity-1", "peer-A", "offset"));
+    }
+
+    [Fact]
+    public void A_snapshot_from_before_withdraw_does_not_restore_membership()
+    {
+        var origin = NewStore();
+        Apply(origin, Life(AetherEffect.Publish, "pub", 10, publicationId: "catalog"));
+        var before = origin.Capture();
+        Apply(origin, Life(AetherEffect.WithdrawPublication, "wd", 20, publicationId: "catalog"));
+        origin.MergeImage(before);
+        Assert.False(origin.IsMember("entity-1", "catalog"));
+
+        var live = NewStore();
+        Apply(live, Life(AetherEffect.Publish, "pub", 10, publicationId: "catalog"));
+        live.MergeImage(origin.Capture());
+        Assert.False(live.IsMember("entity-1", "catalog"));
+    }
+
+    [Fact]
+    public void Republish_needs_a_higher_membership_version()
+    {
+        var store = NewStore();
+        Apply(store, Life(AetherEffect.Publish, "pub", 10, publicationId: "catalog"));
+        Apply(store, Life(AetherEffect.WithdrawPublication, "wd", 20, publicationId: "catalog"));
+        Apply(store, Life(AetherEffect.Publish, "older", 15, publicationId: "catalog"));
+        Assert.False(store.IsMember("entity-1", "catalog"));
+
+        Apply(store, Life(AetherEffect.Publish, "again", 30, publicationId: "catalog"));
+        Assert.True(store.IsMember("entity-1", "catalog"));
+    }
+
+    [Fact]
+    public void Withdraw_removes_one_publication_and_leaves_the_other()
+    {
+        var store = NewStore();
+        Apply(store, Life(AetherEffect.Publish, "cat", 10, publicationId: "catalog"));
+        Apply(store, Life(AetherEffect.Publish, "notes", 11, publicationId: "notes"));
+        Apply(store, FixedOp("a", "peer-A", "peer-A/s1", 1, 1, 4));
+        Apply(store, Life(AetherEffect.WithdrawPublication, "wd", 12, publicationId: "notes"));
+
+        Assert.True(store.IsMember("entity-1", "catalog"));
+        Assert.False(store.IsMember("entity-1", "notes"));
+        Assert.False(store.IsDeleted("entity-1"));
+        Assert.Equal(4, store.RawContribution("entity-1", "peer-A", "offset"));
+    }
+
+    [Fact]
     public void A_remembered_digest_is_not_a_replayable_payload()
     {
         var store = NewStore();
@@ -580,6 +707,42 @@ public sealed class AetherReducerTests
         Assert.Equal(3, viaPlan.RecordCount);
     }
 
+    [Fact]
+    public void Frozen_plan_hides_a_deleted_entity_and_keeps_the_raw_field()
+    {
+        var delete = Life(AetherEffect.DeleteEntity, "delete", 20);
+        var ops = new[]
+        {
+            LabelOp("a-label", "peer-A", "peer-A/s1", 1, 10, "cube"),
+            delete,
+        };
+
+        var direct = NewStore();
+        foreach (var op in ops)
+            Apply(direct, op);
+
+        var viaPlan = NewStore();
+        var plan = AetherFrame.Compile();
+        var scratch = new AetherScratch
+        {
+            Reducer = viaPlan,
+            Inbox = ops.ToList(),
+            EntityId = "entity-1",
+            LabelFieldId = "label",
+            SumFieldId = "offset",
+        };
+        var runtime = new PlanRuntime();
+        plan.InitRuntime(ref runtime);
+        plan.Tick(ref scratch, ref runtime);
+
+        Assert.True(direct.IsDeleted("entity-1"));
+        Assert.Equal("cube", direct.ResolveLww("entity-1", "label")?.Text);
+        Assert.True(scratch.ResolvedDeleted);
+        Assert.Null(scratch.ResolvedLabel);
+        Assert.Equal(0, scratch.ResolvedSum);
+        Assert.Equal(direct.IsDeleted("entity-1"), viaPlan.IsDeleted("entity-1"));
+    }
+
     private static AetherReducer NewStore(long sumMax = long.MaxValue, int dedupCapacity = AetherReducer.DefaultDedupCapacity)
     {
         var store = new AetherReducer(dedupCapacity);
@@ -589,6 +752,27 @@ public sealed class AetherReducerTests
     }
 
     private static void Apply(AetherReducer store, AetherOperation op) => store.Apply(op, observeClock: true);
+
+    private static void ApplyPair(AetherReducer store, bool firstWins, AetherOperation first, AetherOperation second)
+    {
+        if (firstWins)
+        {
+            Apply(store, first);
+            Apply(store, second);
+            return;
+        }
+
+        Apply(store, second);
+        Apply(store, first);
+    }
+
+    private static AetherOperation Life(
+        AetherEffect effect,
+        string id,
+        long lamport,
+        string actorId = "peer-A/s1",
+        string? publicationId = null) =>
+        new(id, "entity-1", "peer-A", actorId, 1, lamport, new Dictionary<string, FieldValue>(), effect, publicationId);
 
     private static StoredField LabelRow(long lamport, string label, string operationId) =>
         new(

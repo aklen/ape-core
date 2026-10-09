@@ -1,6 +1,6 @@
-# Aether reducer, first slice
+# Aether reducer
 
-Normative for the code under `Aether/`. Later protocol work (lifecycle, publications, trees, transport) is not implemented here. Working notes outside this repository are not the contract.
+Normative for the code under `Aether/`. Trees, checkpoints, disk, and transport are not implemented here. Working notes outside this repository are not the contract.
 
 ## What this slice does
 
@@ -39,9 +39,19 @@ That includes a received Lamport that is already behind the local clock. The add
 
 ## Snapshot
 
-`Capture` returns the clock, the raw records, and the dedup window. It does not return a resolved sum or a rendered label.
+`Capture` returns the clock, the raw records, the dedup window, tombstones, visibility, and publication membership. It does not return a resolved sum or a rendered label.
 
-`MergeImage` checks the whole image before it changes the clock, the window, or any record. That check includes a digest mismatch, a value of the wrong shape, an unknown field, and every `(key, version)` collision against the store or against another row in the same image. A higher row does not hide a conflict on a lower version. Row order does not change the result. A rejected image leaves the reducer unchanged. After the check, `MergeImage` raises the clock to the image clock when that is greater. It does not add one to the restored clock. It then writes the highest version of each key from that same checked set, and unions the window, trimming back to capacity. A newer value wins whether it arrives in the image or in a later operation. The destination must already define every field in the image. An id still in either window keeps the same-digest rule after the merge.
+`MergeImage` checks the whole image before it changes the clock, the window, or any record. That check includes a digest mismatch, a value of the wrong shape, an unknown field, and every `(key, version)` collision against the store or against another row in the same image. Visibility and membership use that same rule. A higher row does not hide a conflict on a lower version. Row order does not change the result. A rejected image leaves the reducer unchanged. After the check, `MergeImage` raises the clock to the image clock when that is greater. It does not add one to the restored clock. It then writes the highest version of each key from that same checked set, unions tombstones, and unions the window, trimming back to capacity. A tombstone is only added. An image that lacks one does not clear it. A newer value wins whether it arrives in the image or in a later operation. The destination must already define every field in the image. An id still in either window keeps the same-digest rule after the merge.
+
+## Lifecycle
+
+`DeleteEntity` stores a tombstone for that `entityId`. A later field write, `HideShared`, `RestoreShared`, `WithdrawPublication`, `Publish`, or an older snapshot leaves the tombstone in place. The raw field values stay. The shared view does not.
+
+`HideShared` and `RestoreShared` are one visibility record per entity. The greater `(lamport, actorId)` wins. Equal version with the opposite flag is rejected before any change. Hiding leaves the raw contribution and the sum in the store. With no visibility record, the entity is shared-visible.
+
+`Publish` and `WithdrawPublication` are one membership record per `(entityId, publicationId)`. The greater version wins. Republishing is a `Publish` with a higher version. A snapshot taken while the publication was a member does not undo a later withdraw. Withdrawing one publication leaves the others, the fields, and the entity.
+
+This slice does not check owner, delete, or hide lists. `writerId` is whoever built the operation.
 
 ## Frame
 
@@ -50,7 +60,7 @@ That includes a received Lamport that is already behind the local clock. The add
 ## What this slice does not do
 
 - No scene writes, network, relay, or authentication. `writerId` is whoever built the operation.
-- No delete, hide, withdraw, policy cutover, or parent edges.
+- No owner, delete, or hide lists, policy cutover, or parent edges.
 - `keepConflicts`, `coordinate`, and `treeMove` are rejected at field definition.
 - No shared checkpoint yet. After an id leaves the dedup window, a rewritten payload is not detected. A checkpoint later proves coverage and can reject a covered id without the original digest. An unchanged replay is still held by the field version.
 - No retained operation payloads, so `CanReplay` is false. Digest memory does not become a delta.

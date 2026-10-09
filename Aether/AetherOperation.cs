@@ -5,6 +5,16 @@ using System.Text;
 
 namespace Ape.Core.Aether;
 
+public enum AetherEffect : byte
+{
+    Write = 0,
+    DeleteEntity = 1,
+    HideShared = 2,
+    RestoreShared = 3,
+    WithdrawPublication = 4,
+    Publish = 5,
+}
+
 /// <summary>
 /// One admitted write. <see cref="Lamport"/> stays as stamped.
 /// <see cref="WriterId"/> is the author. The first slice has no relay, so the carrier is the same peer.
@@ -18,7 +28,9 @@ public sealed class AetherOperation
         string actorId,
         long sequence,
         long lamport,
-        IReadOnlyDictionary<string, FieldValue> changes)
+        IReadOnlyDictionary<string, FieldValue> changes,
+        AetherEffect effect = AetherEffect.Write,
+        string? publicationId = null)
     {
         Id = id ?? throw new ArgumentNullException(nameof(id));
         EntityId = entityId ?? throw new ArgumentNullException(nameof(entityId));
@@ -27,8 +39,30 @@ public sealed class AetherOperation
         Sequence = sequence;
         Lamport = lamport;
         var stored = new Dictionary<string, FieldValue>(changes, StringComparer.Ordinal);
+        if (effect == AetherEffect.Write)
+        {
+            if (publicationId is not null)
+                throw new AetherProtocolException("A field write has no publication.");
+        }
+        else if (stored.Count > 0)
+        {
+            throw new AetherProtocolException("A lifecycle operation has no field values.");
+        }
+
+        if (effect is AetherEffect.Publish or AetherEffect.WithdrawPublication)
+        {
+            if (string.IsNullOrEmpty(publicationId))
+                throw new AetherProtocolException("Membership needs a publication id.");
+        }
+        else if (publicationId is not null)
+        {
+            throw new AetherProtocolException("This operation has no publication.");
+        }
+
+        Effect = effect;
+        PublicationId = publicationId;
         Changes = new ReadOnlyDictionary<string, FieldValue>(stored);
-        Digest = ComputeDigest(EntityId, WriterId, ActorId, Sequence, Lamport, Changes);
+        Digest = ComputeDigest(EntityId, WriterId, ActorId, Sequence, Lamport, Changes, effect, publicationId);
     }
 
     public string Id { get; }
@@ -43,6 +77,10 @@ public sealed class AetherOperation
 
     public long Lamport { get; }
 
+    public AetherEffect Effect { get; }
+
+    public string? PublicationId { get; }
+
     public IReadOnlyDictionary<string, FieldValue> Changes { get; }
 
     public string Digest { get; }
@@ -53,9 +91,13 @@ public sealed class AetherOperation
         string actorId,
         long sequence,
         long lamport,
-        IReadOnlyDictionary<string, FieldValue> changes)
+        IReadOnlyDictionary<string, FieldValue> changes,
+        AetherEffect effect = AetherEffect.Write,
+        string? publicationId = null)
     {
         using var buffer = new MemoryStream();
+        buffer.WriteByte((byte)effect);
+        WriteString(buffer, publicationId ?? "");
         WriteString(buffer, entityId);
         WriteString(buffer, writerId);
         WriteString(buffer, actorId);
