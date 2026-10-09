@@ -20,6 +20,8 @@ public sealed class AetherArchive
     private static ReadOnlySpan<byte> LogMagic => "AEL1"u8;
 
     private readonly string _directory;
+    private long? _logEnd;
+    private long _logGeneration;
 
     public AetherArchive(string directory)
     {
@@ -43,6 +45,7 @@ public sealed class AetherArchive
         WriteDurable(SnapshotPath, Finish(SnapshotMagic, generation, body), commitReplacement);
         if (!commitReplacement)
             return;
+        _logEnd = null;
         WriteDurable(LogPath, Finish(LogMagic, generation, []), commitReplacement: true);
     }
 
@@ -369,10 +372,34 @@ public sealed class AetherArchive
 
     private void AppendRecord(byte[] record, long generation)
     {
+        if (_logEnd is null || _logGeneration != generation || LogShorterThanRememberedEnd())
+            _logEnd = RepairLog(generation);
+        _logGeneration = generation;
+
+        using var stream = new FileStream(LogPath, FileMode.Open, FileAccess.Write, FileShare.Read);
+        var end = _logEnd.Value;
+        stream.Position = end;
+        stream.Write(record);
+        end += record.Length;
+        if (stream.Length != end)
+            stream.SetLength(end);
+        stream.Flush(flushToDisk: true);
+        _logEnd = end;
+    }
+
+    private bool LogShorterThanRememberedEnd()
+    {
+        if (_logEnd is null || !File.Exists(LogPath))
+            return true;
+        return new FileInfo(LogPath).Length < _logEnd.Value;
+    }
+
+    private long RepairLog(long generation)
+    {
         if (!File.Exists(LogPath))
             throw new AetherProtocolException("Recovery log does not match the snapshot.");
 
-        using var stream = new FileStream(LogPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        using var stream = new FileStream(LogPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
         var header = ReadHeader(stream, LogMagic);
         if (header.Generation != generation)
             throw new AetherProtocolException("Recovery log does not match the snapshot.");
@@ -416,9 +443,7 @@ public sealed class AetherArchive
             stream.Flush(flushToDisk: true);
         }
 
-        stream.Position = validEnd;
-        stream.Write(record);
-        stream.Flush(flushToDisk: true);
+        return validEnd;
     }
 
     private static void WriteDurable(string path, byte[] bytes, bool commitReplacement)

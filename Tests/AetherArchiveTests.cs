@@ -176,6 +176,47 @@ public sealed class AetherArchiveTests
     }
 
     [Fact]
+    public void A_reopened_archive_repairs_a_torn_tail_before_append()
+    {
+        using var dir = new TempDir();
+        var archive = new AetherArchive(dir.Path);
+        var store = NewStore();
+        archive.Save(store);
+        var one = LabelOp("one", "peer-A", "peer-A/s1", 1, 10, "one");
+        Apply(store, one);
+        archive.Append(one);
+        File.AppendAllBytes(archive.LogPath, [0, 0, 1, 0]);
+
+        var reopened = new AetherArchive(dir.Path);
+        var two = LabelOp("two", "peer-A", "peer-A/s1", 2, 20, "two");
+        Apply(store, two);
+        reopened.Append(two);
+        var loaded = reopened.Load();
+        Assert.Equal("two", loaded.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(store.Clock, loaded.Clock);
+    }
+
+    [Fact]
+    public void An_append_after_a_new_snapshot_uses_the_new_log()
+    {
+        using var dir = new TempDir();
+        var archive = new AetherArchive(dir.Path);
+        var store = NewStore();
+        archive.Save(store);
+        var one = LabelOp("one", "peer-A", "peer-A/s1", 1, 10, "one");
+        Apply(store, one);
+        archive.Append(one);
+
+        archive.Save(store);
+        var two = LabelOp("two", "peer-A", "peer-A/s1", 2, 20, "two");
+        Apply(store, two);
+        archive.Append(two);
+        var loaded = archive.Load();
+        Assert.Equal("two", loaded.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(store.Clock, loaded.Clock);
+    }
+
+    [Fact]
     public void A_damaged_log_generation_is_rejected()
     {
         using var dir = new TempDir();
