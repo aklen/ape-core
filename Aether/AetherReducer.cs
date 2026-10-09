@@ -41,6 +41,10 @@ public sealed class AetherReducer
     {
         if (resolver is not ("lww" or "sumContributions"))
             throw new AetherProtocolException($"Unknown resolver '{resolver}'.");
+        if (min > max)
+            throw new AetherProtocolException($"Field '{fieldId}' has a minimum above its maximum.");
+        if (_fields.ContainsKey(fieldId))
+            throw new AetherProtocolException($"Field '{fieldId}' is already defined.");
 
         _fields[fieldId] = new FieldSchema(
             resolver == "lww" ? FieldKind.Lww : FieldKind.Sum,
@@ -89,8 +93,7 @@ public sealed class AetherReducer
         var admitted = new List<(RecordKey Key, FieldValue Value)>(op.Changes.Count);
         foreach (var (fieldId, value) in op.Changes)
         {
-            if (!_fields.ContainsKey(fieldId))
-                throw new AetherProtocolException($"Field '{fieldId}' has no resolver.");
+            RequireShape(fieldId, value);
 
             var key = new RecordKey(op.EntityId, op.WriterId, fieldId);
             if (_records.TryGetValue(key, out var existing) && existing.Version.CompareTo(version) == 0 && existing.Value != value)
@@ -109,17 +112,7 @@ public sealed class AetherReducer
 
     public void MergeImage(AetherImage image)
     {
-        foreach (var seen in image.Seen)
-        {
-            if (_digests.TryGetValue(seen.Id, out var prior) && !string.Equals(prior, seen.Digest, StringComparison.Ordinal))
-                throw new AetherProtocolException($"Operation '{seen.Id}' changed payload.");
-        }
-
-        foreach (var field in image.Fields)
-        {
-            if (!_fields.ContainsKey(field.Key.FieldId))
-                throw new AetherProtocolException($"Field '{field.Key.FieldId}' has no resolver.");
-        }
+        RejectImage(image);
 
         if (image.Clock > _clock)
             _clock = image.Clock;
@@ -183,6 +176,56 @@ public sealed class AetherReducer
         if (!_records.TryGetValue(new RecordKey(entityId, writerId, fieldId), out var field))
             throw new AetherProtocolException("Missing contribution.");
         return field.Value.Fixed;
+    }
+
+    private void RejectImage(AetherImage image)
+    {
+        var digests = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var seen in image.Seen)
+        {
+            if (digests.TryGetValue(seen.Id, out var prior) && !string.Equals(prior, seen.Digest, StringComparison.Ordinal))
+                throw new AetherProtocolException($"Operation '{seen.Id}' changed payload.");
+            if (_digests.TryGetValue(seen.Id, out var local) && !string.Equals(local, seen.Digest, StringComparison.Ordinal))
+                throw new AetherProtocolException($"Operation '{seen.Id}' changed payload.");
+
+            digests[seen.Id] = seen.Digest;
+        }
+
+        var folded = new Dictionary<RecordKey, (FieldValue Value, FieldVersion Version)>();
+        foreach (var field in image.Fields)
+        {
+            RequireShape(field.Key.FieldId, field.Value);
+            if (!folded.TryGetValue(field.Key, out var already))
+            {
+                folded[field.Key] = (field.Value, field.Version);
+                continue;
+            }
+
+            var compared = field.Version.CompareTo(already.Version);
+            if (compared == 0 && already.Value != field.Value)
+                throw new AetherProtocolException($"Version collision on '{field.Key.FieldId}'.");
+            if (compared > 0)
+                folded[field.Key] = (field.Value, field.Version);
+        }
+
+        foreach (var (key, incoming) in folded)
+        {
+            if (_records.TryGetValue(key, out var existing)
+                && existing.Version.CompareTo(incoming.Version) == 0
+                && existing.Value != incoming.Value)
+                throw new AetherProtocolException($"Version collision on '{key.FieldId}'.");
+        }
+    }
+
+    private void RequireShape(string fieldId, FieldValue value)
+    {
+        if (!_fields.TryGetValue(fieldId, out var schema))
+            throw new AetherProtocolException($"Field '{fieldId}' has no resolver.");
+
+        if (schema.Kind == FieldKind.Sum && value.IsText)
+            throw new AetherProtocolException($"Field '{fieldId}' stores a fixed-point contribution.");
+        if (schema.Kind == FieldKind.Lww && !value.IsText)
+            throw new AetherProtocolException($"Field '{fieldId}' stores a label.");
     }
 
     private void Upsert(RecordKey key, FieldValue value, FieldVersion version, string writerId, string operationId)

@@ -1,3 +1,8 @@
+using System.Buffers.Binary;
+using System.Collections.ObjectModel;
+using System.Security.Cryptography;
+using System.Text;
+
 namespace Ape.Core.Aether;
 
 /// <summary>
@@ -21,7 +26,8 @@ public sealed class AetherOperation
         ActorId = actorId ?? throw new ArgumentNullException(nameof(actorId));
         Sequence = sequence;
         Lamport = lamport;
-        Changes = new Dictionary<string, FieldValue>(changes, StringComparer.Ordinal);
+        var stored = new Dictionary<string, FieldValue>(changes, StringComparer.Ordinal);
+        Changes = new ReadOnlyDictionary<string, FieldValue>(stored);
         Digest = ComputeDigest(EntityId, WriterId, ActorId, Sequence, Lamport, Changes);
     }
 
@@ -49,22 +55,45 @@ public sealed class AetherOperation
         long lamport,
         IReadOnlyDictionary<string, FieldValue> changes)
     {
-        var parts = new List<string>
-        {
-            entityId,
-            writerId,
-            actorId,
-            sequence.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            lamport.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        };
+        using var buffer = new MemoryStream();
+        WriteString(buffer, entityId);
+        WriteString(buffer, writerId);
+        WriteString(buffer, actorId);
+        WriteInt64(buffer, sequence);
+        WriteInt64(buffer, lamport);
         foreach (var key in changes.Keys.Order(StringComparer.Ordinal))
         {
             var value = changes[key];
-            parts.Add(key);
-            parts.Add(value.Fixed.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            parts.Add(value.Text ?? "");
+            WriteString(buffer, key);
+            if (value.Text is null)
+            {
+                buffer.WriteByte(0);
+                WriteInt64(buffer, value.Fixed);
+            }
+            else
+            {
+                buffer.WriteByte(1);
+                WriteInt64(buffer, value.Fixed);
+                WriteString(buffer, value.Text);
+            }
         }
 
-        return string.Join("|", parts);
+        return Convert.ToHexString(SHA256.HashData(buffer.ToArray()));
+    }
+
+    private static void WriteString(Stream buffer, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        Span<byte> length = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(length, (uint)bytes.Length);
+        buffer.Write(length);
+        buffer.Write(bytes);
+    }
+
+    private static void WriteInt64(Stream buffer, long value)
+    {
+        Span<byte> encoded = stackalloc byte[8];
+        BinaryPrimitives.WriteInt64BigEndian(encoded, value);
+        buffer.Write(encoded);
     }
 }

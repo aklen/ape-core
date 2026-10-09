@@ -52,6 +52,24 @@ public sealed class AetherReducerTests
     }
 
     [Fact]
+    public void Equal_lamport_keeps_the_greater_utf8_actor_id()
+    {
+        var replacement = "\uFFFD";
+        var emoji = "\U0001F600";
+        Assert.True(string.CompareOrdinal(emoji, replacement) < 0);
+
+        foreach (var first in new[] { replacement, emoji })
+        {
+            var store = NewStore();
+            Apply(store, ActorLabel(first == emoji ? "emoji-first" : "replacement-first", first, first == emoji ? "emoji" : "replacement"));
+            var second = first == emoji ? replacement : emoji;
+            Apply(store, ActorLabel(second == emoji ? "emoji-second" : "replacement-second", second, second == emoji ? "emoji" : "replacement"));
+
+            Assert.Equal("emoji", store.ResolveLww("entity-1", "label")?.Text);
+        }
+    }
+
+    [Fact]
     public void Duplicate_sum_update_keeps_one_contribution()
     {
         var store = NewStore();
@@ -191,6 +209,166 @@ public sealed class AetherReducerTests
     }
 
     [Fact]
+    public void A_field_schema_cannot_be_redefined_or_inverted()
+    {
+        var store = new AetherReducer();
+        store.DefineField("offset", "sumContributions", 0, 10);
+
+        Assert.Throws<AetherProtocolException>(() => store.DefineField("offset", "lww"));
+        Assert.Throws<AetherProtocolException>(() => store.DefineField("wide", "sumContributions", 5, 4));
+        Assert.Equal(0, store.RecordCount);
+    }
+
+    [Fact]
+    public void Distinct_payloads_keep_distinct_digests()
+    {
+        var left = new AetherOperation("same", "e", "w", "a", 1, 1, new Dictionary<string, FieldValue>());
+        var right = new AetherOperation("same", "e|w", "a", "1", 1, 1, new Dictionary<string, FieldValue>());
+        Assert.NotEqual(left.Digest, right.Digest);
+        Assert.Equal(64, left.Digest.Length);
+
+        var zero = new AetherOperation("zero", "e", "w", "a", 1, 1, new Dictionary<string, FieldValue>
+        {
+            ["offset"] = FieldValue.FixedPoint(0),
+        });
+        var emptyLabel = new AetherOperation("empty", "e", "w", "a", 1, 1, new Dictionary<string, FieldValue>
+        {
+            ["offset"] = FieldValue.Label(""),
+        });
+        Assert.NotEqual(zero.Digest, emptyLabel.Digest);
+
+        var bulky = LabelOp("n", "peer-A", "peer-A/s1", 1, 1, new string('x', 4000));
+        Assert.Equal(64, bulky.Digest.Length);
+
+        var store = NewStore();
+        Apply(store, left);
+        var clock = store.Clock;
+        Assert.Throws<AetherProtocolException>(() => Apply(store, right));
+        Assert.Equal(clock, store.Clock);
+        Assert.Equal(0, store.RecordCount);
+    }
+
+    [Fact]
+    public void An_operation_payload_stays_fixed_after_construction()
+    {
+        var changes = new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("cube"),
+        };
+        var op = new AetherOperation("id", "entity-1", "peer-A", "peer-A/s1", 1, 1, changes);
+        var digest = op.Digest;
+        changes["label"] = FieldValue.Label("box");
+
+        Assert.Equal("cube", op.Changes["label"].Text);
+        Assert.Equal(digest, op.Digest);
+        Assert.False(op.Changes is Dictionary<string, FieldValue>);
+    }
+
+    [Fact]
+    public void A_sum_field_rejects_a_label_without_changing_the_contribution()
+    {
+        var store = NewStore();
+        Apply(store, FixedOp("a", "peer-A", "peer-A/s1", 1, 1, 4));
+        var clock = store.Clock;
+        var bad = new AetherOperation("b", "entity-1", "peer-A", "peer-A/s1", 2, 8, new Dictionary<string, FieldValue>
+        {
+            ["offset"] = FieldValue.Label("hibás"),
+        });
+
+        Assert.Throws<AetherProtocolException>(() => Apply(store, bad));
+        Assert.Equal(clock, store.Clock);
+        Assert.Equal(4, store.RawContribution("entity-1", "peer-A", "offset"));
+        Assert.Equal(4, store.ResolveSum("entity-1", "offset"));
+        Assert.Equal(1, store.RecordCount);
+        Assert.False(store.Remembers("b"));
+
+        var image = new AetherImage(
+            80,
+            [
+                new StoredField(
+                    new RecordKey("entity-1", "peer-A", "offset"),
+                    FieldValue.Label("hibás"),
+                    new FieldVersion(30, "peer-A/s1"),
+                    "peer-A",
+                    "bad"),
+            ],
+            []);
+        Assert.Throws<AetherProtocolException>(() => store.MergeImage(image));
+        Assert.Equal(clock, store.Clock);
+        Assert.Equal(4, store.RawContribution("entity-1", "peer-A", "offset"));
+    }
+
+    [Fact]
+    public void A_rejected_snapshot_leaves_the_reducer_unchanged()
+    {
+        var store = NewStore();
+        Apply(store, LabelOp("live", "peer-A", "peer-A/s1", 1, 10, "cube"));
+        Apply(store, FixedOp("off", "peer-B", "peer-B/s1", 1, 4, 3));
+        var clock = store.Clock;
+        var dedup = store.DedupCount;
+
+        var image = new AetherImage(
+            999,
+            [
+                new StoredField(
+                    new RecordKey("entity-1", "peer-B", "offset"),
+                    FieldValue.FixedPoint(9),
+                    new FieldVersion(20, "peer-B/s1"),
+                    "peer-B",
+                    "newer-off"),
+                new StoredField(
+                    new RecordKey("entity-1", "peer-A", "label"),
+                    FieldValue.Label("box"),
+                    new FieldVersion(10, "peer-A/s1"),
+                    "peer-A",
+                    "clash"),
+            ],
+            [new SeenOperation("intruder", "abc", 20)]);
+
+        Assert.Throws<AetherProtocolException>(() => store.MergeImage(image));
+        Assert.Equal(clock, store.Clock);
+        Assert.Equal(dedup, store.DedupCount);
+        Assert.False(store.Remembers("intruder"));
+        Assert.Equal("cube", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(3, store.RawContribution("entity-1", "peer-B", "offset"));
+
+        var within = NewStore();
+        var colliding = new AetherImage(
+            5,
+            [
+                new StoredField(
+                    new RecordKey("entity-1", "peer-A", "label"),
+                    FieldValue.Label("one"),
+                    new FieldVersion(1, "peer-A/s1"),
+                    "peer-A",
+                    "row-1"),
+                new StoredField(
+                    new RecordKey("entity-1", "peer-A", "label"),
+                    FieldValue.Label("two"),
+                    new FieldVersion(1, "peer-A/s1"),
+                    "peer-A",
+                    "row-2"),
+            ],
+            []);
+        Assert.Throws<AetherProtocolException>(() => within.MergeImage(colliding));
+        Assert.Equal(0, within.Clock);
+        Assert.Equal(0, within.DedupCount);
+        Assert.Equal(0, within.RecordCount);
+
+        var digests = NewStore();
+        var clashingDigests = new AetherImage(
+            5,
+            [],
+            [
+                new SeenOperation("x", "one", 1),
+                new SeenOperation("x", "two", 1),
+            ]);
+        Assert.Throws<AetherProtocolException>(() => digests.MergeImage(clashingDigests));
+        Assert.Equal(0, digests.Clock);
+        Assert.Equal(0, digests.DedupCount);
+    }
+
+    [Fact]
     public void A_remembered_digest_is_not_a_replayable_payload()
     {
         var store = NewStore();
@@ -321,6 +499,12 @@ public sealed class AetherReducerTests
     }
 
     private static void Apply(AetherReducer store, AetherOperation op) => store.Apply(op, observeClock: true);
+
+    private static AetherOperation ActorLabel(string id, string actorId, string label) =>
+        new(id, "entity-1", "peer-A", actorId, 1, 10, new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label(label),
+        });
 
     private static AetherOperation LabelOp(string id, string writerId, string actorId, long sequence, long lamport, string label) =>
         new(id, "entity-1", writerId, actorId, sequence, lamport, new Dictionary<string, FieldValue>

@@ -15,7 +15,11 @@ A record key is `(entityId, writerId, fieldId)`.
 
 A greater Lamport wins. Equal Lamport keeps the greater `actorId`, compared as raw UTF-8 bytes. A writer's newer contribution replaces their own record. It does not add another term.
 
-The dedup window holds a bounded number of recent operation ids and their digests. It does not hold the operation payload. While an id is in the window, the same digest is a no-op and a different digest is rejected. The store does not change on either result.
+The dedup window holds a bounded number of recent operation ids and their digests. A digest is the SHA-256 of a length-prefixed, type-tagged encoding, written as 64 hexadecimal characters. Strings are UTF-8 with a 4-byte big-endian length. A fixed-point value and a label stay distinct, including zero and an empty label. The window stores that hash. While an id is in the window, the same digest is a no-op and a different digest is rejected. The store does not change on either result.
+
+An operation copies its field values into a read-only map before it hashes them. A later edit of the caller's dictionary leaves the operation and its digest unchanged.
+
+A sum field accepts a fixed-point contribution. An LWW field accepts a label. The other shape is rejected before any record, clock, or digest changes. Defining a field twice is rejected. A minimum above the maximum is rejected.
 
 Dropping an id from the window is local cache cleanup. It does not close that operation, and it does not close any other operation with a smaller Lamport. A smaller Lamport can still be the first write of another field or another writer. Both arrival orders of such a set produce the same field view.
 
@@ -37,7 +41,7 @@ That includes a received Lamport that is already behind the local clock. An exac
 
 `Capture` returns the clock, the raw records, and the dedup window. It does not return a resolved sum or a rendered label.
 
-`MergeImage` raises the clock to the image clock when that is greater. It does not add one to the restored clock. It then folds records by version and unions the window, trimming back to capacity. A newer value wins whether it arrives in the image or in a later operation. The destination must already define every field in the image. An id still in either window keeps the same-digest rule after the merge.
+`MergeImage` checks the whole image before it changes the clock, the window, or any record. That check includes a digest mismatch, a value of the wrong shape, an unknown field, and a version collision against the store or against another row in the same image. A rejected image leaves the reducer unchanged. After the check, `MergeImage` raises the clock to the image clock when that is greater. It does not add one to the restored clock. It then folds records by version and unions the window, trimming back to capacity. A newer value wins whether it arrives in the image or in a later operation. The destination must already define every field in the image. An id still in either window keeps the same-digest rule after the merge.
 
 ## Frame
 
