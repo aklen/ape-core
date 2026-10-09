@@ -1,0 +1,108 @@
+---
+description: Aether distributed scene invariants; apply when changing reducers, projections, lifecycle, persistence, sync, or their integration with the host frame
+globs: Aether/**/*.cs,Tests/Aether*.cs,Docs/AETHER.md
+alwaysApply: false
+---
+
+# Aether engineering rules
+
+Use these rules for Aether work, including integration outside `Aether/`.
+Read `Docs/AETHER.md` before changing semantics. It is the versioned contract
+for implemented behavior. Local plans and research notes are design references,
+not an implicit extension of the implemented protocol. Keep the contract,
+implementation, and meaningful tests aligned in the same change. Clearly mark
+unsupported behavior; do not silently approximate it with another resolver.
+
+## Keep the scope small
+
+Implement the current slice. Do not add speculative infrastructure, a generic
+database framework, a full operation history, or one graph per entity.
+Reuse Automerge's engineering ideas where useful; do not assume its document,
+counter, deletion, or sync semantics match Aether's contracts.
+
+## Preserve determinism
+
+- The same valid input state, policy, and membership facts must yield the same
+  resolved view. Different read sets may legitimately yield different views.
+- Keep operation identity, transport sequence, field version, causal context,
+  and local clock separate. A Lamport value is not wall-clock freshness or proof
+  that every smaller operation has arrived.
+- Neither arrival order, dictionary enumeration, local timeouts, socket state,
+  nor local cache eviction may decide durable shared-state semantics.
+- Specify canonical encodings and identifier comparisons. Validate accepted
+  identifier encodings so distinct accepted IDs cannot collapse during encoding.
+- Distinguish valid-operation convergence from malformed or equivocating actors.
+  Do not claim that a bounded digest cache detects all historical ID reuse.
+
+## Bound memory and frame work
+
+- Store current versioned state, not every update. A sum replaces one writer's
+  raw contribution; it does not accumulate retransmitted operations.
+- Give queues and caches explicit limits. Entry counts alone do not bound bytes
+  when identifiers or values have unbounded size. Define overflow behavior.
+- Cache eviction is not protocol closure. Forgetting an ID must not discard an
+  unseen valid write. Replay requires retained payload, not just a digest.
+- Tombstones, membership, session metadata, and pending operations need explicit
+  retention/recovery rules too. Do not describe an ever-growing auxiliary map
+  as bounded merely because field-record count is stable.
+- Prefer work proportional to changed state. Avoid scanning and sorting the
+  entire store for every entity each frame. Measure before adding optimizations.
+- Ephemeral poses/cursors use latest-sample buffers outside the durable store.
+  Durable final state uses the ordinary validated reducer path.
+
+## Validate before mutation
+
+- Operations own immutable payloads. Digests use unambiguous, type-tagged,
+  canonical encoding and a fixed-size hash.
+- Validate operation kind, field shape, schema, version conflicts, and numeric
+  limits before changing records, clocks, dedup state, or lifecycle metadata.
+- For snapshot merge, validate all relevant key/version pairs, including lower
+  versions hidden by a newer row. Apply the same validated folded representation.
+- Expected protocol rejection leaves semantic state, clock, and cache unchanged.
+  Define batch failure behavior separately; a frame is not implicitly a transaction.
+- Guard arithmetic before mutation. Sum raw fixed-point contributions with a
+  sufficiently wide accumulator; clamp only the resolved total. Preserve raw values.
+
+## Keep meanings separate
+
+- Creator, owner, original writer, actor session, and carrier are different roles.
+  Preserve their meaning when adding authentication, relay, or recovery.
+- Delete is terminal for an entity ID. Hide changes shared visibility. Withdraw
+  changes one publication membership. Field writes and heartbeat do not restore them.
+- Compose the actual shared projection from deletion, visibility, and relevant
+  publication/read membership. Storing a membership flag is insufficient if the
+  frame or API projection ignores it. Preserve raw data as the contract requires.
+- Paths and grouped natural-key views do not silently redefine identity or rights.
+- An owner-only parent field does not prove a cycle-free tree. Tree repair must
+  be deterministic for the same candidate-edge set and preserve raw candidates.
+
+## Use ComponentGraph as the frame boundary
+
+Compile a small, fixed `ComponentGraph` into `FrozenPlan` before ticking.
+Stages call the same reducer exercised by direct tests. Graph topology alone
+does not prove convergence. Keep local and remote durable operations on the
+same admission path. Only the designated COMMIT stage writes the scene.
+Disk and socket work must not block the tick; completion arrives through a
+bounded inbox. Pending lookup never turns an Update into a Create.
+
+## Treat persistence as protocol state
+
+A saved image contains raw state and the metadata needed to continue safely,
+not only rendered values. An old or partial image must not resurrect deletion
+or withdrawn membership; absence alone is not deletion.
+Local save is not policy cutover. Restore and merge are distinct operations.
+Document clock/session recovery, snapshot scope, and durable acknowledgement.
+When persistence is implemented, test interrupted snapshot replacement, journal
+replay, and truncated tails. Do not require full historical replay for startup.
+
+## Test contracts, not just implementation agreement
+
+Use handwritten expected results and adversarial small examples. Cover relevant
+arrival permutations, duplicates, cache eviction, delayed lower versions,
+snapshot/live interleaving, rejection without mutation, and numeric boundaries.
+Test the composed frame projection as well as raw reducer state. Direct and
+FrozenPlan agreement is useful but does not replace independent expectations.
+Add each discovered counterexample as a regression. Verify bounded memory
+across many distinct operations, not only stable contribution-record count.
+Follow the repository's test-running rule. Report what actually ran and what
+remains unimplemented; green tests do not establish untested protocol guarantees.
