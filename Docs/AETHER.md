@@ -57,6 +57,8 @@ This slice does not check owner, delete, or hide lists. `writerId` is whoever bu
 
 `AetherFrame.Compile` freezes two stages, `apply` then `resolve`, on one host tick. Both stages call the reducer. The frame does not grow per entity. Disk and sockets are outside the tick.
 
+The resolve stage keeps three answers apart. `ResolvedDeleted` is the tombstone. `ResolvedSharedVisible` is the entity Hide/Restore record. `ResolvedMember` is membership of the selected `PublicationId`. The shared label and sum require a publication id, membership in it, a living entity, and shared visibility. A missing or empty `PublicationId` leaves that shared output blank. It does not show every field. Raw fields stay in the reducer.
+
 ## What this slice does not do
 
 - No scene writes, network, relay, or authentication. `writerId` is whoever built the operation.

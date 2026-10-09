@@ -14,8 +14,10 @@ public struct AetherScratch
     public string SumFieldId;
     public string? ResolvedLabel;
     public long ResolvedSum;
+    public string? PublicationId;
     public bool ResolvedDeleted;
     public bool ResolvedSharedVisible;
+    public bool ResolvedMember;
 }
 
 public static class AetherFrame
@@ -47,7 +49,10 @@ public static class AetherFrame
         {
             scratch.ResolvedDeleted = scratch.Reducer.IsDeleted(scratch.EntityId);
             scratch.ResolvedSharedVisible = scratch.Reducer.IsSharedVisible(scratch.EntityId);
-            if (scratch.ResolvedDeleted || !scratch.ResolvedSharedVisible)
+            var publicationChosen = !string.IsNullOrEmpty(scratch.PublicationId);
+            scratch.ResolvedMember = publicationChosen
+                && scratch.Reducer.IsMember(scratch.EntityId, scratch.PublicationId!);
+            if (!publicationChosen || scratch.ResolvedDeleted || !scratch.ResolvedSharedVisible || !scratch.ResolvedMember)
             {
                 scratch.ResolvedLabel = null;
                 scratch.ResolvedSum = 0;

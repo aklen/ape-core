@@ -679,6 +679,7 @@ public sealed class AetherReducerTests
             LabelOp("a-label", "peer-A", "peer-A/s1", 1, 10, "cube"),
             FixedOp("a-offset", "peer-A", "peer-A/s1", 2, 11, 2),
             FixedOp("b-offset", "peer-B", "peer-B/s1", 1, 12, 3),
+            Life(AetherEffect.Publish, "pub", 13, publicationId: "catalog"),
         };
 
         var direct = NewStore();
@@ -694,6 +695,7 @@ public sealed class AetherReducerTests
             EntityId = "entity-1",
             LabelFieldId = "label",
             SumFieldId = "offset",
+            PublicationId = "catalog",
         };
         var runtime = new PlanRuntime();
         plan.InitRuntime(ref runtime);
@@ -714,6 +716,7 @@ public sealed class AetherReducerTests
         var ops = new[]
         {
             LabelOp("a-label", "peer-A", "peer-A/s1", 1, 10, "cube"),
+            Life(AetherEffect.Publish, "pub", 11, publicationId: "catalog"),
             delete,
         };
 
@@ -730,6 +733,7 @@ public sealed class AetherReducerTests
             EntityId = "entity-1",
             LabelFieldId = "label",
             SumFieldId = "offset",
+            PublicationId = "catalog",
         };
         var runtime = new PlanRuntime();
         plan.InitRuntime(ref runtime);
@@ -738,9 +742,92 @@ public sealed class AetherReducerTests
         Assert.True(direct.IsDeleted("entity-1"));
         Assert.Equal("cube", direct.ResolveLww("entity-1", "label")?.Text);
         Assert.True(scratch.ResolvedDeleted);
+        Assert.True(scratch.ResolvedSharedVisible);
+        Assert.True(scratch.ResolvedMember);
         Assert.Null(scratch.ResolvedLabel);
         Assert.Equal(0, scratch.ResolvedSum);
         Assert.Equal(direct.IsDeleted("entity-1"), viaPlan.IsDeleted("entity-1"));
+    }
+
+    [Fact]
+    public void Frozen_plan_drops_the_shared_view_when_the_last_publication_is_withdrawn()
+    {
+        var ops = new[]
+        {
+            LabelOp("write", "peer-A", "peer-A/s1", 1, 10, "secret"),
+            Life(AetherEffect.Publish, "pub", 11, publicationId: "catalog"),
+            Life(AetherEffect.WithdrawPublication, "wd", 12, publicationId: "catalog"),
+        };
+        var scratch = TickPlan(ops, "catalog");
+
+        Assert.False(scratch.Reducer.IsMember("entity-1", "catalog"));
+        Assert.False(scratch.ResolvedDeleted);
+        Assert.True(scratch.ResolvedSharedVisible);
+        Assert.False(scratch.ResolvedMember);
+        Assert.Null(scratch.ResolvedLabel);
+        Assert.Equal(0, scratch.ResolvedSum);
+        Assert.Equal("secret", scratch.Reducer.ResolveLww("entity-1", "label")?.Text);
+    }
+
+    [Fact]
+    public void Frozen_plan_keeps_the_shared_view_for_a_publication_that_stays_active()
+    {
+        var ops = new[]
+        {
+            LabelOp("write", "peer-A", "peer-A/s1", 1, 10, "secret"),
+            Life(AetherEffect.Publish, "cat", 11, publicationId: "catalog"),
+            Life(AetherEffect.Publish, "notes", 12, publicationId: "notes"),
+            Life(AetherEffect.WithdrawPublication, "wd", 13, publicationId: "notes"),
+        };
+        var scratch = TickPlan(ops, "catalog");
+
+        Assert.False(scratch.ResolvedDeleted);
+        Assert.True(scratch.ResolvedSharedVisible);
+        Assert.True(scratch.ResolvedMember);
+        Assert.True(scratch.Reducer.IsMember("entity-1", "catalog"));
+        Assert.False(scratch.Reducer.IsMember("entity-1", "notes"));
+        Assert.Equal("secret", scratch.ResolvedLabel);
+        Assert.Equal("secret", scratch.Reducer.ResolveLww("entity-1", "label")?.Text);
+    }
+
+    [Fact]
+    public void Frozen_plan_without_a_publication_does_not_emit_a_shared_view()
+    {
+        var ops = new[]
+        {
+            LabelOp("write", "peer-A", "peer-A/s1", 1, 10, "secret"),
+            Life(AetherEffect.Publish, "pub", 11, publicationId: "catalog"),
+        };
+
+        foreach (var publicationId in new string?[] { null, "" })
+        {
+            var scratch = TickPlan(ops, publicationId);
+            Assert.True(scratch.Reducer.IsMember("entity-1", "catalog"));
+            Assert.False(scratch.ResolvedDeleted);
+            Assert.True(scratch.ResolvedSharedVisible);
+            Assert.False(scratch.ResolvedMember);
+            Assert.Null(scratch.ResolvedLabel);
+            Assert.Equal(0, scratch.ResolvedSum);
+            Assert.Equal("secret", scratch.Reducer.ResolveLww("entity-1", "label")?.Text);
+        }
+    }
+
+    private static AetherScratch TickPlan(IReadOnlyList<AetherOperation> ops, string? publicationId)
+    {
+        var plan = AetherFrame.Compile();
+        var scratch = new AetherScratch
+        {
+            Reducer = NewStore(),
+            Inbox = ops.ToList(),
+            EntityId = "entity-1",
+            LabelFieldId = "label",
+            SumFieldId = "offset",
+            PublicationId = publicationId,
+        };
+        var runtime = new PlanRuntime();
+        plan.InitRuntime(ref runtime);
+        plan.Tick(ref scratch, ref runtime);
+        return scratch;
     }
 
     private static AetherReducer NewStore(long sumMax = long.MaxValue, int dedupCapacity = AetherReducer.DefaultDedupCapacity)
