@@ -28,6 +28,24 @@ public sealed class AetherReducer
 
     public long Clock => _clock;
 
+    public int DedupCapacity => _dedupCapacity;
+
+    public IReadOnlyList<FieldDefinition> Schema =>
+        _fields
+            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => new FieldDefinition(
+                pair.Key,
+                pair.Value.Kind == FieldKind.Lww ? "lww" : "sumContributions",
+                pair.Value.Min,
+                pair.Value.Max))
+            .ToArray();
+
+    public IReadOnlyList<ActorCursor> ActorCursors =>
+        _nextSequence
+            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => new ActorCursor(pair.Key, pair.Value))
+            .ToArray();
+
     public int RecordCount => _records.Count;
 
     public int DedupCount => _digests.Count;
@@ -155,6 +173,15 @@ public sealed class AetherReducer
             .Select(pair => new MembershipMark(pair.Key.EntityId, pair.Key.PublicationId, pair.Value.Version, pair.Value.Published))
             .ToArray();
         return new AetherImage(_clock, fields, _seenOrder.ToArray(), deleted, visibility, membership);
+    }
+
+    public void RestoreActorSequence(string actorId, long sequence)
+    {
+        if (string.IsNullOrEmpty(actorId) || sequence < 1)
+            throw new AetherProtocolException("Actor sequence is missing.");
+        if (_nextSequence.TryGetValue(actorId, out var current) && current >= sequence)
+            return;
+        _nextSequence[actorId] = sequence;
     }
 
     public bool IsDeleted(string entityId) => _deleted.Contains(entityId);
@@ -513,6 +540,10 @@ public sealed class AetherReducer
         List<VisibilityMark> Visibility,
         List<MembershipMark> Membership);
 }
+
+public readonly record struct FieldDefinition(string Id, string Resolver, long Min, long Max);
+
+public readonly record struct ActorCursor(string ActorId, long Sequence);
 
 public readonly record struct RecordKey(string EntityId, string WriterId, string FieldId);
 

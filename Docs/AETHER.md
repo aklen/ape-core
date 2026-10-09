@@ -1,6 +1,6 @@
 # Aether reducer
 
-Normative for the code under `Aether/`. Trees, checkpoints, disk, and transport are not implemented here. Working notes outside this repository are not the contract.
+Normative for the code under `Aether/`. Trees, checkpoints, and transport are not implemented here. Local save is outside the frame. Working notes outside this repository are not the contract.
 
 ## What this slice does
 
@@ -59,9 +59,20 @@ This slice does not check owner, delete, or hide lists. `writerId` is whoever bu
 
 The resolve stage keeps three answers apart. `ResolvedDeleted` is the tombstone. `ResolvedSharedVisible` is the entity Hide/Restore record. `ResolvedMember` is membership of the selected `PublicationId`. The shared label and sum require a publication id, membership in it, a living entity, and shared visibility. A missing or empty `PublicationId` leaves that shared output blank. It does not show every field. Raw fields stay in the reducer.
 
+## Local save
+
+`AetherArchive` stores one binary snapshot and a short recovery log beside the frame. `Save` captures the raw reducer: schema, clock, records, dedup window, tombstones, visibility, membership, and actor sequences. It does not store a resolved sum or a rendered label, and it does not change membership or open a publication epoch.
+
+The new bytes are flushed to a temporary file. The current file is replaced only after that flush. A temporary file left behind is not loaded. The snapshot carries format version `1`, type tags, and a SHA-256 of its body. A truncated snapshot or a bad checksum is rejected.
+
+After the snapshot is in place, the log for the previous generation is replaced. A log whose generation differs from the snapshot is ignored, so an older tail cannot move the clock or the fields. Matching log records are applied in order through the same reducer. A torn final record is dropped. A checksum failure on a complete record is rejected.
+
+`Load` builds a fresh reducer. It does not merge into a live one. The frame does not read or write these files.
+
 ## What this slice does not do
 
-- No scene writes, network, relay, or authentication. `writerId` is whoever built the operation.
+- No scene writes, network, relay, or authentication. `writerId` is whoever built the operation. Disk save stays outside the tick.
+- No retired-id table outside the snapshot. A load installs the tombstones the snapshot holds.
 - No owner, delete, or hide lists, policy cutover, or parent edges.
 - `keepConflicts`, `coordinate`, and `treeMove` are rejected at field definition.
 - No shared checkpoint yet. After an id leaves the dedup window, a rewritten payload is not detected. A checkpoint later proves coverage and can reject a covered id without the original digest. An unchanged replay is still held by the field version.
