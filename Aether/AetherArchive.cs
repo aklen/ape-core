@@ -13,6 +13,8 @@ public sealed class AetherArchive
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
     private const ushort FormatVersion = 1;
+    private const int HeaderPrefixLength = 18;
+    private const int HeaderLength = 50;
 
     private static ReadOnlySpan<byte> SnapshotMagic => "AET1"u8;
     private static ReadOnlySpan<byte> LogMagic => "AEL1"u8;
@@ -51,17 +53,12 @@ public sealed class AetherArchive
             throw new AetherProtocolException("No snapshot to append after.");
 
         var generation = ReadGeneration(SnapshotPath);
-        if (!File.Exists(LogPath) || ReadGeneration(LogPath) != generation)
-            throw new AetherProtocolException("Recovery log does not match the snapshot.");
-
         var payload = EncodeOperation(op);
         var record = new byte[4 + payload.Length + 32];
         BinaryPrimitives.WriteUInt32BigEndian(record, (uint)payload.Length);
         payload.CopyTo(record.AsSpan(4));
         SHA256.HashData(payload).CopyTo(record.AsSpan(4 + payload.Length));
-        using var stream = new FileStream(LogPath, FileMode.Append, FileAccess.Write, FileShare.Read);
-        stream.Write(record);
-        stream.Flush(flushToDisk: true);
+        AppendRecord(record, generation);
     }
 
     public AetherReducer Load()
@@ -105,8 +102,12 @@ public sealed class AetherArchive
         foreach (var cursor in cursors)
             reducer.RestoreActorSequence(cursor.ActorId, cursor.Sequence);
 
-        if (File.Exists(LogPath) && ReadGeneration(LogPath) == snapshot.Generation)
-            Replay(reducer, File.ReadAllBytes(LogPath));
+        if (File.Exists(LogPath))
+        {
+            var logHeader = ReadHeader(LogPath, LogMagic);
+            if (logHeader.Generation == snapshot.Generation)
+                Replay(reducer, File.ReadAllBytes(LogPath));
+        }
 
         return reducer;
     }
@@ -355,14 +356,69 @@ public sealed class AetherArchive
 
     private static byte[] Finish(ReadOnlySpan<byte> magic, long generation, byte[] body)
     {
-        var framed = new byte[4 + 2 + 8 + 4 + body.Length + 32];
+        var framed = new byte[HeaderLength + body.Length + 32];
         magic.CopyTo(framed);
         BinaryPrimitives.WriteUInt16BigEndian(framed.AsSpan(4), FormatVersion);
         BinaryPrimitives.WriteInt64BigEndian(framed.AsSpan(6), generation);
         BinaryPrimitives.WriteUInt32BigEndian(framed.AsSpan(14), (uint)body.Length);
-        body.CopyTo(framed.AsSpan(18));
-        SHA256.HashData(body).CopyTo(framed.AsSpan(18 + body.Length));
+        SHA256.HashData(framed.AsSpan(0, HeaderPrefixLength)).CopyTo(framed.AsSpan(HeaderPrefixLength));
+        body.CopyTo(framed.AsSpan(HeaderLength));
+        SHA256.HashData(body).CopyTo(framed.AsSpan(HeaderLength + body.Length));
         return framed;
+    }
+
+    private void AppendRecord(byte[] record, long generation)
+    {
+        if (!File.Exists(LogPath))
+            throw new AetherProtocolException("Recovery log does not match the snapshot.");
+
+        using var stream = new FileStream(LogPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        var header = ReadHeader(stream, LogMagic);
+        if (header.Generation != generation)
+            throw new AetherProtocolException("Recovery log does not match the snapshot.");
+
+        var records = HeaderLength + (long)header.BodyLength + 32;
+        if (stream.Length < records)
+            throw new AetherProtocolException("Recovery log is truncated.");
+
+        stream.Position = HeaderLength;
+        var body = new byte[header.BodyLength];
+        ReadExact(stream, body);
+        var bodyHash = new byte[32];
+        ReadExact(stream, bodyHash);
+        if (!SHA256.HashData(body).AsSpan().SequenceEqual(bodyHash))
+            throw new AetherProtocolException("Recovery log checksum failed.");
+
+        long validEnd = records;
+        while (stream.Position < stream.Length)
+        {
+            if (stream.Length - stream.Position < 4)
+                break;
+
+            var lengthBytes = new byte[4];
+            ReadExact(stream, lengthBytes);
+            var length = BinaryPrimitives.ReadUInt32BigEndian(lengthBytes);
+            if (stream.Length - stream.Position < length + 32)
+                break;
+
+            var payload = new byte[length];
+            ReadExact(stream, payload);
+            var hash = new byte[32];
+            ReadExact(stream, hash);
+            if (!SHA256.HashData(payload).AsSpan().SequenceEqual(hash))
+                throw new AetherProtocolException("Recovery log checksum failed.");
+            validEnd = stream.Position;
+        }
+
+        if (stream.Length != validEnd)
+        {
+            stream.SetLength(validEnd);
+            stream.Flush(flushToDisk: true);
+        }
+
+        stream.Position = validEnd;
+        stream.Write(record);
+        stream.Flush(flushToDisk: true);
     }
 
     private static void WriteDurable(string path, byte[] bytes, bool commitReplacement)
@@ -383,7 +439,43 @@ public sealed class AetherArchive
     {
         if (!File.Exists(path))
             return 0;
-        return Open(File.ReadAllBytes(path), default).Generation;
+        return ReadHeader(path, default).Generation;
+    }
+
+    private static FileHeader ReadHeader(string path, ReadOnlySpan<byte> magic)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        return ReadHeader(stream, magic);
+    }
+
+    private static FileHeader ReadHeader(Stream stream, ReadOnlySpan<byte> magic)
+    {
+        stream.Position = 0;
+        var header = new byte[HeaderLength];
+        ReadExact(stream, header);
+        if (!magic.IsEmpty && !header.AsSpan(0, 4).SequenceEqual(magic))
+            throw new AetherProtocolException("Archive file magic is unknown.");
+        if (!SHA256.HashData(header.AsSpan(0, HeaderPrefixLength)).AsSpan().SequenceEqual(header.AsSpan(HeaderPrefixLength)))
+            throw new AetherProtocolException("Archive header checksum failed.");
+
+        var version = BinaryPrimitives.ReadUInt16BigEndian(header.AsSpan(4));
+        if (version != FormatVersion)
+            throw new AetherProtocolException($"Archive format {version} is unknown.");
+        var generation = BinaryPrimitives.ReadInt64BigEndian(header.AsSpan(6));
+        var bodyLength = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(14));
+        return new FileHeader(generation, bodyLength);
+    }
+
+    private static void ReadExact(Stream stream, Span<byte> buffer)
+    {
+        var offset = 0;
+        while (offset < buffer.Length)
+        {
+            var read = stream.Read(buffer[offset..]);
+            if (read == 0)
+                throw new AetherProtocolException("Archive file is truncated.");
+            offset += read;
+        }
     }
 
     private static Framed ReadFramed(string path, ReadOnlySpan<byte> magic)
@@ -402,8 +494,10 @@ public sealed class AetherArchive
 
     private static Framed Open(byte[] bytes, ReadOnlySpan<byte> magic)
     {
-        if (bytes.Length < 18)
+        if (bytes.Length < HeaderLength)
             throw new AetherProtocolException("Archive file is truncated.");
+        if (!SHA256.HashData(bytes.AsSpan(0, HeaderPrefixLength)).AsSpan().SequenceEqual(bytes.AsSpan(HeaderPrefixLength, 32)))
+            throw new AetherProtocolException("Archive header checksum failed.");
         if (!magic.IsEmpty && !bytes.AsSpan(0, 4).SequenceEqual(magic))
             throw new AetherProtocolException("Archive file magic is unknown.");
         var version = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(4));
@@ -411,9 +505,9 @@ public sealed class AetherArchive
             throw new AetherProtocolException($"Archive format {version} is unknown.");
         var generation = BinaryPrimitives.ReadInt64BigEndian(bytes.AsSpan(6));
         var length = BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(14));
-        if (bytes.Length < 18 + length)
+        if (bytes.Length < HeaderLength + length)
             throw new AetherProtocolException("Archive file is truncated.");
-        return new Framed(generation, bytes.AsSpan(18, (int)length).ToArray(), 18);
+        return new Framed(generation, bytes.AsSpan(HeaderLength, (int)length).ToArray(), HeaderLength);
     }
 
     private static void WriteTexts(Stream buffer, IReadOnlyList<string>? values)
@@ -443,6 +537,8 @@ public sealed class AetherArchive
         BinaryPrimitives.WriteInt64BigEndian(encoded, value);
         buffer.Write(encoded);
     }
+
+    private readonly record struct FileHeader(long Generation, uint BodyLength);
 
     private readonly record struct Framed(long Generation, byte[] Body, int BodyOffset);
 

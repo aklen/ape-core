@@ -153,6 +153,46 @@ public sealed class AetherArchiveTests
     }
 
     [Fact]
+    public void An_append_after_a_torn_tail_stays_reachable()
+    {
+        using var dir = new TempDir();
+        var archive = new AetherArchive(dir.Path);
+        var store = NewStore();
+        archive.Save(store);
+        var one = LabelOp("one", "peer-A", "peer-A/s1", 1, 10, "one");
+        Apply(store, one);
+        archive.Append(one);
+        File.AppendAllBytes(archive.LogPath, [0, 0, 1, 0]);
+
+        var restored = archive.Load();
+        Assert.Equal("one", restored.ResolveLww("entity-1", "label")?.Text);
+
+        var two = LabelOp("two", "peer-A", "peer-A/s1", 2, 20, "two");
+        Apply(store, two);
+        archive.Append(two);
+        var again = archive.Load();
+        Assert.Equal("two", again.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(store.Clock, again.Clock);
+    }
+
+    [Fact]
+    public void A_damaged_log_generation_is_rejected()
+    {
+        using var dir = new TempDir();
+        var archive = new AetherArchive(dir.Path);
+        var store = NewStore();
+        archive.Save(store);
+        var kept = LabelOp("kept", "peer-A", "peer-A/s1", 1, 10, "kept");
+        Apply(store, kept);
+        archive.Append(kept);
+        var bytes = File.ReadAllBytes(archive.LogPath);
+        bytes[6] ^= 0xFF;
+        File.WriteAllBytes(archive.LogPath, bytes);
+
+        Assert.Throws<AetherProtocolException>(() => archive.Load());
+    }
+
+    [Fact]
     public void A_restored_actor_sequence_continues_after_the_saved_cursor()
     {
         using var dir = new TempDir();

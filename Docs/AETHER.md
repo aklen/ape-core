@@ -63,9 +63,9 @@ The resolve stage keeps three answers apart. `ResolvedDeleted` is the tombstone.
 
 `AetherArchive` stores one binary snapshot and a short recovery log beside the frame. `Save` captures the raw reducer: schema, clock, records, dedup window, tombstones, visibility, membership, and actor sequences. It does not store a resolved sum or a rendered label, and it does not change membership or open a publication epoch.
 
-The new bytes are flushed to a temporary file. The current file is replaced only after that flush. A temporary file left behind is not loaded. The snapshot carries format version `1`, type tags, and a SHA-256 of its body. A truncated snapshot or a bad checksum is rejected.
+The new bytes are flushed to a temporary file. The current file is replaced only after that flush. A temporary file left behind is not loaded. The snapshot carries format version `1`, type tags, and a SHA-256 over the header and another over the body. The header hash covers the generation. A truncated snapshot or a bad checksum is rejected.
 
-After the snapshot is in place, the log for the previous generation is replaced. A log whose generation differs from the snapshot is ignored, so an older tail cannot move the clock or the fields. Matching log records are applied in order through the same reducer. A torn final record is dropped. A checksum failure on a complete record is rejected.
+After the snapshot is in place, the log for the previous generation is replaced. A log is ignored only when its header checksum matches and its generation differs, so an older tail cannot move the clock or the fields. A bad header is rejected. Matching log records are applied in order through the same reducer. A torn final record is dropped on load. The next append cuts the file back to the last complete record before it writes, so the new record stays reachable. A checksum failure on a complete record is rejected. Reading a generation uses the fixed header, not the rest of the file.
 
 `Load` builds a fresh reducer. It does not merge into a live one. The frame does not read or write these files.
 
