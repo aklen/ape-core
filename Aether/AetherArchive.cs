@@ -49,14 +49,15 @@ public sealed class AetherArchive
         WriteDurable(LogPath, Finish(LogMagic, generation, []), commitReplacement: true);
     }
 
-    public void Append(AetherOperation op)
+    public void Append(AetherReducer reducer, AetherOperation op)
     {
+        ArgumentNullException.ThrowIfNull(reducer);
         ArgumentNullException.ThrowIfNull(op);
         if (!File.Exists(SnapshotPath))
             throw new AetherProtocolException("No snapshot to append after.");
 
         var generation = ReadGeneration(SnapshotPath);
-        var payload = EncodeOperation(op);
+        var payload = EncodeOperation(op, reducer.Clock);
         var record = new byte[4 + payload.Length + 32];
         BinaryPrimitives.WriteUInt32BigEndian(record, (uint)payload.Length);
         payload.CopyTo(record.AsSpan(4));
@@ -138,9 +139,12 @@ public sealed class AetherArchive
             if (!SHA256.HashData(payload).AsSpan().SequenceEqual(hash))
                 throw new AetherProtocolException("Recovery log checksum failed.");
 
-            var op = DecodeOperation(payload);
+            var (op, clock) = DecodeOperation(payload);
+            if (clock < reducer.Clock)
+                throw new AetherProtocolException("Recovery log clock moved backwards.");
             reducer.RestoreActorSequence(op.ActorId, op.Sequence);
-            reducer.Apply(op, observeClock: true);
+            reducer.Apply(op, observeClock: false);
+            reducer.RestoreClock(clock);
         }
     }
 
@@ -294,7 +298,7 @@ public sealed class AetherArchive
         return buffer.ToArray();
     }
 
-    private static byte[] EncodeOperation(AetherOperation op)
+    private static byte[] EncodeOperation(AetherOperation op, long clock)
     {
         using var buffer = new MemoryStream();
         buffer.WriteByte((byte)op.Effect);
@@ -314,10 +318,11 @@ public sealed class AetherArchive
             WriteText(buffer, value.Text ?? "");
         }
 
+        WriteI64(buffer, clock);
         return buffer.ToArray();
     }
 
-    private static AetherOperation DecodeOperation(byte[] payload)
+    private static (AetherOperation Operation, long Clock) DecodeOperation(byte[] payload)
     {
         var reader = new Reader(payload);
         var effect = (AetherEffect)reader.U8();
@@ -344,8 +349,9 @@ public sealed class AetherArchive
             };
         }
 
+        var clock = reader.I64();
         reader.End();
-        return new AetherOperation(
+        return (new AetherOperation(
             id,
             entityId,
             writerId,
@@ -354,7 +360,7 @@ public sealed class AetherArchive
             lamport,
             changes,
             effect,
-            effect is AetherEffect.Publish or AetherEffect.WithdrawPublication ? publicationId : null);
+            effect is AetherEffect.Publish or AetherEffect.WithdrawPublication ? publicationId : null), clock);
     }
 
     private static byte[] Finish(ReadOnlySpan<byte> magic, long generation, byte[] body)

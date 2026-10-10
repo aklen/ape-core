@@ -49,11 +49,11 @@ public sealed class AetherArchiveTests
         var first = LabelOp("first", "peer-A", "peer-A/s1", 1, 10, "cube");
         Apply(store, first);
         archive.Save(store);
-        archive.Append(first);
+        archive.Append(store, first);
 
         var second = LabelOp("second", "peer-A", "peer-A/s1", 2, 20, "box");
         Apply(store, second);
-        archive.Append(second);
+        archive.Append(store, second);
 
         var loaded = archive.Load();
         Assert.Equal("box", loaded.ResolveLww("entity-1", "label")?.Text);
@@ -70,7 +70,7 @@ public sealed class AetherArchiveTests
         Apply(store, LabelOp("n1", "peer-A", "peer-A/s1", 1, 1, "v1"));
         Apply(store, LabelOp("n2", "peer-A", "peer-A/s1", 2, 2, "v2"));
         archive.Save(store);
-        archive.Append(LabelOp("n1", "peer-A", "peer-A/s1", 1, 1, "v1"));
+        archive.Append(store, LabelOp("n1", "peer-A", "peer-A/s1", 1, 1, "v1"));
         var staleLog = File.ReadAllBytes(archive.LogPath);
         var clock = store.Clock;
 
@@ -139,7 +139,7 @@ public sealed class AetherArchiveTests
         archive.Save(store);
         var second = LabelOp("second", "peer-A", "peer-A/s1", 2, 20, "box");
         Apply(store, second);
-        archive.Append(second);
+        archive.Append(store, second);
         var intact = File.ReadAllBytes(archive.LogPath);
         File.AppendAllBytes(archive.LogPath, [0, 0, 1, 0]);
 
@@ -161,7 +161,7 @@ public sealed class AetherArchiveTests
         archive.Save(store);
         var one = LabelOp("one", "peer-A", "peer-A/s1", 1, 10, "one");
         Apply(store, one);
-        archive.Append(one);
+        archive.Append(store, one);
         File.AppendAllBytes(archive.LogPath, [0, 0, 1, 0]);
 
         var restored = archive.Load();
@@ -169,7 +169,7 @@ public sealed class AetherArchiveTests
 
         var two = LabelOp("two", "peer-A", "peer-A/s1", 2, 20, "two");
         Apply(store, two);
-        archive.Append(two);
+        archive.Append(store, two);
         var again = archive.Load();
         Assert.Equal("two", again.ResolveLww("entity-1", "label")?.Text);
         Assert.Equal(store.Clock, again.Clock);
@@ -184,13 +184,13 @@ public sealed class AetherArchiveTests
         archive.Save(store);
         var one = LabelOp("one", "peer-A", "peer-A/s1", 1, 10, "one");
         Apply(store, one);
-        archive.Append(one);
+        archive.Append(store, one);
         File.AppendAllBytes(archive.LogPath, [0, 0, 1, 0]);
 
         var reopened = new AetherArchive(dir.Path);
         var two = LabelOp("two", "peer-A", "peer-A/s1", 2, 20, "two");
         Apply(store, two);
-        reopened.Append(two);
+        reopened.Append(store, two);
         var loaded = reopened.Load();
         Assert.Equal("two", loaded.ResolveLww("entity-1", "label")?.Text);
         Assert.Equal(store.Clock, loaded.Clock);
@@ -205,12 +205,12 @@ public sealed class AetherArchiveTests
         archive.Save(store);
         var one = LabelOp("one", "peer-A", "peer-A/s1", 1, 10, "one");
         Apply(store, one);
-        archive.Append(one);
+        archive.Append(store, one);
 
         archive.Save(store);
         var two = LabelOp("two", "peer-A", "peer-A/s1", 2, 20, "two");
         Apply(store, two);
-        archive.Append(two);
+        archive.Append(store, two);
         var loaded = archive.Load();
         Assert.Equal("two", loaded.ResolveLww("entity-1", "label")?.Text);
         Assert.Equal(store.Clock, loaded.Clock);
@@ -225,12 +225,45 @@ public sealed class AetherArchiveTests
         archive.Save(store);
         var kept = LabelOp("kept", "peer-A", "peer-A/s1", 1, 10, "kept");
         Apply(store, kept);
-        archive.Append(kept);
+        archive.Append(store, kept);
         var bytes = File.ReadAllBytes(archive.LogPath);
         bytes[6] ^= 0xFF;
         File.WriteAllBytes(archive.LogPath, bytes);
 
         Assert.Throws<AetherProtocolException>(() => archive.Load());
+    }
+
+    [Fact]
+    public void Local_stamps_reload_at_the_same_clock()
+    {
+        using var dir = new TempDir();
+        var archive = new AetherArchive(dir.Path);
+        var store = NewStore();
+        archive.Save(store);
+
+        var first = store.StampLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("one"),
+        });
+        store.Apply(first, observeClock: false);
+        archive.Append(store, first);
+        var second = store.StampLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("two"),
+        });
+        store.Apply(second, observeClock: false);
+        archive.Append(store, second);
+
+        Assert.Equal(2, store.Clock);
+        var loaded = archive.Load();
+        Assert.Equal(store.Clock, loaded.Clock);
+        Assert.Equal("two", loaded.ResolveLww("entity-1", "label")?.Text);
+        var third = loaded.StampLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("three"),
+        });
+        Assert.Equal(3, third.Lamport);
+        Assert.Equal(second.Sequence + 1, third.Sequence);
     }
 
     [Fact]

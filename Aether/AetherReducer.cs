@@ -80,11 +80,8 @@ public sealed class AetherReducer
         IReadOnlyDictionary<string, FieldValue> changes)
     {
         var nextClock = NextClock(_clock);
+        var sequence = NextSequence(actorId);
         _clock = nextClock;
-        if (!_nextSequence.TryGetValue(actorId, out var sequence))
-            sequence = 1;
-        else
-            sequence++;
         _nextSequence[actorId] = sequence;
 
         return new AetherOperation(
@@ -183,6 +180,8 @@ public sealed class AetherReducer
             return;
         _nextSequence[actorId] = sequence;
     }
+
+    internal void RestoreClock(long clock) => _clock = clock;
 
     public bool IsDeleted(string entityId) => _deleted.Contains(entityId);
 
@@ -477,6 +476,15 @@ public sealed class AetherReducer
         if (clock == long.MaxValue)
             throw new AetherProtocolException("Lamport clock overflow.");
         return clock + 1;
+    }
+
+    private long NextSequence(string actorId)
+    {
+        if (!_nextSequence.TryGetValue(actorId, out var sequence))
+            return 1;
+        if (sequence == long.MaxValue)
+            throw new AetherProtocolException("Actor sequence overflow.");
+        return sequence + 1;
     }
 
     private void RequireShape(string fieldId, FieldValue value)

@@ -459,6 +459,24 @@ public sealed class AetherReducerTests
     }
 
     [Fact]
+    public void An_actor_sequence_at_its_limit_is_rejected_before_any_change()
+    {
+        var store = NewStore();
+        store.RestoreActorSequence("peer-A/s1", long.MaxValue);
+
+        Assert.Throws<AetherProtocolException>(() => store.StampLocal(
+            "entity-1",
+            "peer-A",
+            "peer-A/s1",
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("next") }));
+
+        Assert.Equal(0, store.Clock);
+        Assert.Equal(0, store.RecordCount);
+        Assert.Equal(0, store.DedupCount);
+        Assert.Equal(long.MaxValue, Assert.Single(store.ActorCursors).Sequence);
+    }
+
+    [Fact]
     public void Delete_and_update_leave_the_entity_deleted_in_either_order()
     {
         foreach (var deleteFirst in new[] { true, false })
