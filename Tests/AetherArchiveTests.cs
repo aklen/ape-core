@@ -172,6 +172,53 @@ public sealed class AetherArchiveTests
     }
 
     [Fact]
+    public void A_complete_record_is_not_durable_until_repair_flushes_it()
+    {
+        using var dir = new TempDir();
+        var archive = new AetherArchive(dir.Path);
+        var store = NewStore();
+        archive.Save(store);
+        var one = Apply(store, LabelOp("one", "peer-A", "peer-A/s1", 1, 10, "one"));
+        var two = Apply(store, LabelOp("two", "peer-A", "peer-A/s1", 2, 20, "two"));
+
+        archive.FailNextFlushes(1);
+        Assert.Throws<IOException>(() => archive.Append(one));
+        var written = File.ReadAllBytes(archive.LogPath);
+
+        archive.FailNextFlushes(1);
+        Assert.Throws<IOException>(() => archive.Append(one));
+        Assert.Equal(written, File.ReadAllBytes(archive.LogPath));
+
+        archive.Append(one);
+        Assert.Equal(written, File.ReadAllBytes(archive.LogPath));
+        archive.Append(two);
+        var loaded = archive.Load();
+        Assert.Equal("two", loaded.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(store.Clock, loaded.Clock);
+    }
+
+    [Fact]
+    public void A_finished_record_left_by_a_failed_append_is_not_written_again()
+    {
+        using var dir = new TempDir();
+        var archive = new AetherArchive(dir.Path);
+        var store = NewStore();
+        archive.Save(store);
+        var one = Apply(store, LabelOp("one", "peer-A", "peer-A/s1", 1, 10, "one"));
+        archive.Append(one);
+        var two = Apply(store, LabelOp("two", "peer-A", "peer-A/s1", 2, 20, "two"));
+        new AetherArchive(dir.Path).Append(two);
+        var bytes = File.ReadAllBytes(archive.LogPath);
+
+        archive.Append(two);
+
+        Assert.Equal(bytes, File.ReadAllBytes(archive.LogPath));
+        var loaded = archive.Load();
+        Assert.Equal("two", loaded.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(store.Clock, loaded.Clock);
+    }
+
+    [Fact]
     public void A_reopened_archive_repairs_a_torn_tail_before_append()
     {
         using var dir = new TempDir();

@@ -12,14 +12,18 @@ public sealed class AetherHostTests
         var remote = Remote("cube");
         var host = new AetherHost(store, AetherHost.Measure(remote) - 1, 8);
 
-        Assert.False(host.TryAcceptRemote(remote));
+        var refused = host.TryAcceptRemote(remote);
+        Assert.Equal(AetherAdmitKind.Full, refused.Kind);
+        Assert.Equal(0, refused.RequestId);
         Assert.Equal(0, host.PendingBytes);
         Assert.Equal(0, store.Clock);
         Assert.Equal(0, store.RecordCount);
 
         var room = new AetherHost(store, AetherHost.Measure(remote), 8);
-        Assert.True(room.TryAcceptRemote(remote));
-        Assert.False(room.TryAcceptRemote(Remote("later")));
+        Assert.Equal(AetherAdmitKind.Queued, room.TryAcceptRemote(remote).Kind);
+        var later = room.TryAcceptRemote(Remote("later"));
+        Assert.Equal(AetherAdmitKind.Full, later.Kind);
+        Assert.Equal(0, later.RequestId);
         Assert.Equal(AetherHost.Measure(remote), room.PendingBytes);
         Assert.Equal(0, store.Clock);
     }
@@ -33,22 +37,26 @@ public sealed class AetherHostTests
         archive.Save(store);
         var remote = Remote("cube");
         var host = new AetherHost(store, 4096, 8);
-        Assert.True(host.TryAcceptRemote(remote));
-        Assert.True(host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        var remoteId = host.TryAcceptRemote(remote);
+        var localId = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
         {
             ["label"] = FieldValue.Label("box"),
-        }));
+        });
+        Assert.Equal(1, remoteId.RequestId);
+        Assert.Equal(2, localId.RequestId);
 
         var logBefore = File.ReadAllBytes(archive.LogPath);
         var drained = host.Drain();
         Assert.Equal(logBefore, File.ReadAllBytes(archive.LogPath));
         Assert.Equal(2, drained.Count);
+        Assert.All(drained, outcome => Assert.Equal(AetherOutcomeKind.Applied, outcome.Kind));
         Assert.Equal(12, store.Clock);
         Assert.Equal("box", store.ResolveLww("entity-1", "label")?.Text);
         Assert.Equal(1, store.ActorCursors.Single(cursor => cursor.ActorId == "peer-B/s1").Sequence);
         Assert.Equal(1, store.ActorCursors.Single(cursor => cursor.ActorId == "peer-A/s1").Sequence);
 
-        host.Commit(archive);
+        var durable = host.Commit(archive);
+        Assert.Equal(new long[] { 1, 2 }, durable.Select(item => item.RequestId));
         Assert.Equal(0, host.PendingBytes);
         var loaded = archive.Load();
         Assert.Equal(12, loaded.Clock);
@@ -68,9 +76,12 @@ public sealed class AetherHostTests
         var archive = new AetherArchive(dir.Path);
         var store = NewStore();
         var host = new AetherHost(store, 4096, 8);
-        Assert.True(host.TryAcceptRemote(Remote("cube")));
-        host.Drain();
-        host.Save(archive);
+        var queued = host.TryAcceptRemote(Remote("cube"));
+        var drained = host.Drain();
+        Assert.Equal(AetherOutcomeKind.Applied, Assert.Single(drained).Kind);
+        var durable = host.Save(archive);
+        Assert.Equal(queued.RequestId, Assert.Single(durable).RequestId);
+        Assert.Empty(host.Commit(archive));
 
         var loaded = archive.Load();
         Assert.Equal("cube", loaded.ResolveLww("entity-1", "label")?.Text);
@@ -91,9 +102,14 @@ public sealed class AetherHostTests
         Assert.Equal(0, store.Clock);
 
         var byCount = new AetherHost(store, maxBytes: 100_000, maxCount: 2);
-        Assert.True(byCount.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>()));
-        Assert.True(byCount.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>()));
-        Assert.False(byCount.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>()));
+        var first = byCount.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>());
+        var second = byCount.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>());
+        var third = byCount.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>());
+        Assert.Equal(AetherAdmitKind.Queued, first.Kind);
+        Assert.Equal(1, first.RequestId);
+        Assert.Equal(2, second.RequestId);
+        Assert.Equal(AetherAdmitKind.Full, third.Kind);
+        Assert.Equal(0, third.RequestId);
         Assert.Equal(2, byCount.PendingCount);
         Assert.Equal(0, store.Clock);
     }
@@ -103,17 +119,20 @@ public sealed class AetherHostTests
     {
         var store = NewStore();
         var host = new AetherHost(store, 4096, 8);
-        Assert.True(host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
         {
             ["label"] = FieldValue.FixedPoint(4),
-        }));
-        Assert.True(host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        }).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
         {
             ["label"] = FieldValue.Label("ok"),
-        }));
+        }).Kind);
 
+        var drained = host.Drain();
         host.Drain();
-        host.Drain();
+        Assert.Equal(AetherOutcomeKind.Rejected, drained[0].Kind);
+        Assert.Equal("Field 'label' stores a label.", drained[0].Reason);
+        Assert.Equal(AetherOutcomeKind.Applied, drained[1].Kind);
 
         Assert.Equal(1, store.Clock);
         Assert.Equal(1, Assert.Single(store.ActorCursors).Sequence);
@@ -126,17 +145,19 @@ public sealed class AetherHostTests
     {
         var store = NewStore();
         var host = new AetherHost(store, 4096, 8);
-        Assert.True(host.TryAcceptRemote(new AetherOperation(
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(new AetherOperation(
             "bad",
             "entity-1",
             "peer-B",
             "peer-B/s1",
             0,
             10,
-            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("nope") })));
-        Assert.True(host.TryAcceptRemote(Remote("yes")));
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("nope") })).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(Remote("yes")).Kind);
 
-        host.Drain();
+        var drained = host.Drain();
+        Assert.Equal("Actor sequence is missing.", drained[0].Reason);
+        Assert.Equal(AetherOutcomeKind.Applied, drained[1].Kind);
 
         Assert.Equal(11, store.Clock);
         Assert.Equal("yes", store.ResolveLww("entity-1", "label")?.Text);
@@ -175,19 +196,24 @@ public sealed class AetherHostTests
     {
         var store = NewStore();
         var host = new AetherHost(store, 4096, 8);
-        Assert.True(host.TryAcceptLocal("entity-1", "peer-A", "", new Dictionary<string, FieldValue>
+        var rejected = host.TryAcceptLocal("entity-1", "peer-A", "", new Dictionary<string, FieldValue>
         {
             ["label"] = FieldValue.Label("nope"),
-        }));
-        Assert.True(host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        });
+        var accepted = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
         {
             ["label"] = FieldValue.Label("ok"),
-        }));
+        });
 
         var drained = host.Drain();
         host.Drain();
 
-        Assert.Single(drained);
+        Assert.Equal(2, drained.Count);
+        Assert.Equal(rejected.RequestId, drained[0].RequestId);
+        Assert.Equal(AetherOutcomeKind.Rejected, drained[0].Kind);
+        Assert.Equal("Actor sequence is missing.", drained[0].Reason);
+        Assert.Equal(accepted.RequestId, drained[1].RequestId);
+        Assert.Equal(AetherOutcomeKind.Applied, drained[1].Kind);
         Assert.Equal(1, host.PendingCount);
         Assert.Equal(1, store.Clock);
         Assert.Equal("ok", store.ResolveLww("entity-1", "label")?.Text);
@@ -202,20 +228,23 @@ public sealed class AetherHostTests
     {
         var store = NewStore();
         var host = new AetherHost(store, 4096, 8);
-        Assert.True(host.TryAcceptRemote(new AetherOperation(
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(new AetherOperation(
             "bad",
             "entity-1",
             "peer-B",
             "peer-B/s1",
             1,
             10,
-            new Dictionary<string, FieldValue> { ["label"] = FieldValue.FixedPoint(4) })));
-        Assert.True(host.TryAcceptRemote(Remote("yes")));
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.FixedPoint(4) })).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(Remote("yes")).Kind);
 
         var drained = host.Drain();
         host.Drain();
 
-        Assert.Single(drained);
+        Assert.Equal(2, drained.Count);
+        Assert.Equal(AetherOutcomeKind.Rejected, drained[0].Kind);
+        Assert.Equal("Field 'label' stores a label.", drained[0].Reason);
+        Assert.Equal(AetherOutcomeKind.Applied, drained[1].Kind);
         Assert.Equal(1, host.PendingCount);
         Assert.Equal(11, store.Clock);
         Assert.Equal("yes", store.ResolveLww("entity-1", "label")?.Text);
@@ -263,23 +292,196 @@ public sealed class AetherHostTests
             10,
             new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("taken") }), observeClock: true);
         var host = new AetherHost(store, 4096, 8);
-        Assert.True(host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        var rejected = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
         {
             ["label"] = FieldValue.Label("other"),
-        }));
-        Assert.True(host.TryAcceptLocal("entity-1", "peer-B", "peer-B/s1", new Dictionary<string, FieldValue>
+        });
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptLocal("entity-1", "peer-B", "peer-B/s1", new Dictionary<string, FieldValue>
         {
             ["label"] = FieldValue.Label("ok"),
-        }));
+        }).Kind);
 
         var drained = host.Drain();
-        host.Drain();
+        var again = host.Drain();
 
-        Assert.Single(drained);
+        Assert.Equal(AetherOutcomeKind.Rejected, drained[0].Kind);
+        Assert.Equal(rejected.RequestId, drained[0].RequestId);
+        Assert.Equal("Operation 'peer-A/s1/1' changed payload.", drained[0].Reason);
+        Assert.Equal(AetherOutcomeKind.Applied, drained[1].Kind);
+        Assert.Empty(again);
         Assert.Equal(12, store.Clock);
         Assert.Equal("ok", store.ResolveLww("entity-1", "label")?.Text);
         Assert.Equal("peer-B/s1", Assert.Single(store.ActorCursors).ActorId);
         Assert.Equal(1, store.ActorCursors[0].Sequence);
+    }
+
+    [Fact]
+    public void A_queued_write_is_applied_before_it_is_durable_and_results_are_not_kept()
+    {
+        using var dir = new TempDir();
+        var archive = new AetherArchive(dir.Path);
+        var store = NewStore();
+        archive.Save(store);
+        var host = new AetherHost(store, 4096, 1);
+        var queued = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("box"),
+        });
+        var full = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("later"),
+        });
+        Assert.Equal(AetherAdmitKind.Queued, queued.Kind);
+        Assert.Equal(1, queued.RequestId);
+        Assert.Equal(AetherAdmitKind.Full, full.Kind);
+        Assert.Equal(0, full.RequestId);
+
+        var logBefore = File.ReadAllBytes(archive.LogPath);
+        var drained = host.Drain();
+        Assert.Equal(logBefore, File.ReadAllBytes(archive.LogPath));
+        var applied = Assert.Single(drained);
+        Assert.Equal(queued.RequestId, applied.RequestId);
+        Assert.Equal(AetherOutcomeKind.Applied, applied.Kind);
+        Assert.Null(applied.Reason);
+        Assert.Empty(host.Drain());
+
+        var durable = host.Commit(archive);
+        Assert.Equal(queued.RequestId, Assert.Single(durable).RequestId);
+        Assert.NotEqual(logBefore, File.ReadAllBytes(archive.LogPath));
+
+        var next = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("next"),
+        });
+        Assert.Equal(2, next.RequestId);
+    }
+
+    [Fact]
+    public void A_commit_that_stops_after_a_durable_write_keeps_that_request_id()
+    {
+        using var dir = new TempDir();
+        var archive = new AetherArchive(dir.Path);
+        var store = NewStore();
+        archive.Save(store);
+        var host = new AetherHost(store, 4096, 8);
+        var first = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("one"),
+        });
+        var second = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("two"),
+        });
+        host.Drain();
+
+        var calls = 0;
+        var disk = new IOException("disk full");
+        var interrupted = Assert.Throws<AetherInterruptedException>(() => host.Commit(applied =>
+        {
+            if (calls++ > 0)
+                throw disk;
+            archive.Append(applied);
+        }));
+
+        Assert.Equal(first.RequestId, Assert.Single(interrupted.Durable).RequestId);
+        Assert.Empty(interrupted.Outcomes);
+        Assert.Same(disk, interrupted.InnerException);
+        Assert.Throws<NotSupportedException>(() =>
+            ((IList<AetherDurable>)interrupted.Durable)[0] = new AetherDurable(9));
+        Assert.Equal(1, host.PendingCount);
+
+        var rest = host.Commit(archive);
+        Assert.Equal(second.RequestId, Assert.Single(rest).RequestId);
+        var loaded = archive.Load();
+        Assert.Equal("two", loaded.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(2, loaded.Clock);
+
+        var fresh = new AetherHost(NewStore(), 4096, 8);
+        archive.Save(fresh.Reducer);
+        Assert.Equal(AetherAdmitKind.Queued, fresh.TryAcceptRemote(Remote("cube")).Kind);
+        fresh.Drain();
+        var io = Assert.Throws<IOException>(() => fresh.Commit(_ => throw new IOException("disk full")));
+        Assert.Equal("disk full", io.Message);
+        Assert.Equal(1, fresh.PendingCount);
+    }
+
+    [Fact]
+    public void A_drain_that_stops_after_a_success_keeps_that_outcome()
+    {
+        var store = NewStore();
+        var host = new AetherHost(store, 4096, 8);
+        var first = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("one"),
+        });
+        var second = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("two"),
+        });
+        host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("three"),
+        });
+
+        var seen = 0;
+        var interrupted = Assert.Throws<AetherInterruptedException>(() => host.Drain(requestId =>
+        {
+            if (seen++ == 1)
+                throw new InvalidOperationException("fold broke");
+            Assert.Equal(first.RequestId, requestId);
+        }));
+
+        var kept = Assert.Single(interrupted.Outcomes);
+        Assert.Equal(first.RequestId, kept.RequestId);
+        Assert.Equal(AetherOutcomeKind.Applied, kept.Kind);
+        Assert.Empty(interrupted.Durable);
+        Assert.IsType<InvalidOperationException>(interrupted.InnerException);
+        Assert.Equal(1, store.Clock);
+        Assert.Equal("one", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(3, host.PendingCount);
+
+        var rest = host.Drain();
+        Assert.Equal(second.RequestId, rest[0].RequestId);
+        Assert.Equal(2, rest.Count);
+        Assert.Equal(3, store.Clock);
+        Assert.Equal("three", store.ResolveLww("entity-1", "label")?.Text);
+    }
+
+    [Fact]
+    public void A_drain_retry_applies_a_stamp_that_already_moved_the_clock()
+    {
+        var store = NewStore();
+        var host = new AetherHost(store, 4096, 8);
+        var first = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("one"),
+        });
+        var second = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("two"),
+        });
+        var stamps = 0;
+        var broken = new InvalidOperationException("after stamp");
+        var interrupted = Assert.Throws<AetherInterruptedException>(() => host.Drain(null, () =>
+        {
+            if (++stamps == 2)
+                throw broken;
+        }));
+
+        Assert.Same(broken, interrupted.InnerException);
+        Assert.Equal(first.RequestId, Assert.Single(interrupted.Outcomes).RequestId);
+        Assert.Throws<NotSupportedException>(() =>
+            ((IList<AetherOutcome>)interrupted.Outcomes)[0] = default);
+        Assert.Equal(2, store.Clock);
+        Assert.Equal(1, store.RecordCount);
+        Assert.Equal(2, Assert.Single(store.ActorCursors).Sequence);
+
+        var rest = host.Drain();
+        Assert.Equal(second.RequestId, Assert.Single(rest).RequestId);
+        Assert.Equal(2, store.Clock);
+        Assert.Equal(1, store.RecordCount);
+        Assert.Equal(2, Assert.Single(store.ActorCursors).Sequence);
+        Assert.Equal("two", store.ResolveLww("entity-1", "label")?.Text);
     }
 
     private static AetherReducer NewStore()

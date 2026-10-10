@@ -24,6 +24,7 @@ public sealed class AetherArchive
     private long _logGeneration;
     private long? _saveThrough;
     private long? _loggedThrough;
+    private int _flushFailures;
 
     public AetherArchive(string directory)
     {
@@ -35,6 +36,13 @@ public sealed class AetherArchive
     public string SnapshotPath => Path.Combine(_directory, SnapshotFileName);
 
     public string LogPath => Path.Combine(_directory, LogFileName);
+
+    internal void FailNextFlushes(int count)
+    {
+        if (count < 0)
+            throw new ArgumentOutOfRangeException(nameof(count));
+        _flushFailures = count;
+    }
 
     public void Save(AetherReducer reducer) => Save(reducer, commitReplacement: true);
 
@@ -396,7 +404,7 @@ public sealed class AetherArchive
 
     private void AppendRecord(byte[] record, long generation)
     {
-        if (_logEnd is null || _logGeneration != generation || LogShorterThanRememberedEnd())
+        if (_logEnd is null || _logGeneration != generation || LogLengthDiffers())
             RememberLog(generation);
         _logGeneration = generation;
 
@@ -407,20 +415,20 @@ public sealed class AetherArchive
         end += record.Length;
         if (stream.Length != end)
             stream.SetLength(end);
-        stream.Flush(flushToDisk: true);
+        FlushToDisk(stream);
         _logEnd = end;
     }
 
-    private bool LogShorterThanRememberedEnd()
+    private bool LogLengthDiffers()
     {
         if (_logEnd is null || !File.Exists(LogPath))
             return true;
-        return new FileInfo(LogPath).Length < _logEnd.Value;
+        return new FileInfo(LogPath).Length != _logEnd.Value;
     }
 
     private void RememberLog(long generation)
     {
-        if (_logEnd is not null && _loggedThrough is not null && _logGeneration == generation && !LogShorterThanRememberedEnd())
+        if (_logEnd is not null && _loggedThrough is not null && _logGeneration == generation && !LogLengthDiffers())
             return;
 
         var repaired = RepairLog(generation);
@@ -474,13 +482,24 @@ public sealed class AetherArchive
             validEnd = stream.Position;
         }
 
-        if (stream.Length != validEnd)
-        {
+        var trimmed = stream.Length != validEnd;
+        if (trimmed)
             stream.SetLength(validEnd);
-            stream.Flush(flushToDisk: true);
-        }
+        if (trimmed || count > 0)
+            FlushToDisk(stream);
 
         return new LogTail(validEnd, count);
+    }
+
+    private void FlushToDisk(FileStream stream)
+    {
+        if (_flushFailures > 0)
+        {
+            _flushFailures--;
+            throw new IOException("Flush failed.");
+        }
+
+        stream.Flush(flushToDisk: true);
     }
 
     private static void WriteDurable(string path, byte[] bytes, bool commitReplacement)
