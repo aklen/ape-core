@@ -36,7 +36,20 @@ public static class AetherFrame
         public void Execute(ref AetherScratch scratch)
         {
             foreach (var op in scratch.Inbox)
-                scratch.Reducer.Apply(op, observeClock: true);
+            {
+                if (!AetherReducer.HasActorSequence(op))
+                    continue;
+                try
+                {
+                    scratch.Reducer.Apply(op, observeClock: true);
+                }
+                catch (AetherProtocolException)
+                {
+                    continue;
+                }
+
+                scratch.Reducer.RestoreActorSequence(op.ActorId, op.Sequence);
+            }
             scratch.Inbox.Clear();
         }
     }

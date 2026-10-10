@@ -12,7 +12,7 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    private const ushort FormatVersion = 1;
+    private const ushort FormatVersion = 3;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;
 
@@ -22,6 +22,8 @@ public sealed class AetherArchive
     private readonly string _directory;
     private long? _logEnd;
     private long _logGeneration;
+    private long? _saveThrough;
+    private long? _loggedThrough;
 
     public AetherArchive(string directory)
     {
@@ -45,24 +47,35 @@ public sealed class AetherArchive
         WriteDurable(SnapshotPath, Finish(SnapshotMagic, generation, body), commitReplacement);
         if (!commitReplacement)
             return;
+        _saveThrough = reducer.SaveThrough;
+        _loggedThrough = null;
         _logEnd = null;
         WriteDurable(LogPath, Finish(LogMagic, generation, []), commitReplacement: true);
     }
 
-    public void Append(AetherReducer reducer, AetherOperation op)
+    public void Append(AetherApplied applied)
     {
-        ArgumentNullException.ThrowIfNull(reducer);
-        ArgumentNullException.ThrowIfNull(op);
+        ArgumentNullException.ThrowIfNull(applied.Operation);
         if (!File.Exists(SnapshotPath))
             throw new AetherProtocolException("No snapshot to append after.");
+        if (applied.SaveSequence <= SaveThrough())
+            return;
 
         var generation = ReadGeneration(SnapshotPath);
-        var payload = EncodeOperation(op, reducer.Clock);
+        RememberLog(generation);
+        var logged = _loggedThrough ?? SaveThrough();
+        if (applied.SaveSequence <= logged)
+            return;
+        if (applied.SaveSequence != logged + 1)
+            throw new AetherProtocolException("Save sequence is out of order.");
+
+        var payload = EncodeOperation(applied.Operation, applied.Clock);
         var record = new byte[4 + payload.Length + 32];
         BinaryPrimitives.WriteUInt32BigEndian(record, (uint)payload.Length);
         payload.CopyTo(record.AsSpan(4));
         SHA256.HashData(payload).CopyTo(record.AsSpan(4 + payload.Length));
         AppendRecord(record, generation);
+        _loggedThrough = applied.SaveSequence;
     }
 
     public AetherReducer Load()
@@ -72,6 +85,9 @@ public sealed class AetherArchive
 
         var snapshot = ReadFramed(SnapshotPath, SnapshotMagic);
         var reader = new Reader(snapshot.Body);
+        var saveThrough = reader.I64();
+        if (saveThrough < 0)
+            throw new AetherProtocolException("Snapshot save sequence is invalid.");
         var capacity = checked((int)reader.U32());
         if (capacity < 1)
             throw new AetherProtocolException("Snapshot dedup capacity is invalid.");
@@ -103,6 +119,7 @@ public sealed class AetherArchive
         reader.End();
 
         reducer.MergeImage(new AetherImage(clock, fields, seen, deleted, visibility, membership));
+        reducer.RestoreSaveThrough(saveThrough);
         foreach (var cursor in cursors)
             reducer.RestoreActorSequence(cursor.ActorId, cursor.Sequence);
 
@@ -235,6 +252,7 @@ public sealed class AetherArchive
     {
         var image = reducer.Capture();
         using var buffer = new MemoryStream();
+        WriteI64(buffer, reducer.SaveThrough);
         WriteU32(buffer, (uint)reducer.DedupCapacity);
         WriteI64(buffer, image.Clock);
         WriteU32(buffer, (uint)reducer.Schema.Count);
@@ -379,7 +397,7 @@ public sealed class AetherArchive
     private void AppendRecord(byte[] record, long generation)
     {
         if (_logEnd is null || _logGeneration != generation || LogShorterThanRememberedEnd())
-            _logEnd = RepairLog(generation);
+            RememberLog(generation);
         _logGeneration = generation;
 
         using var stream = new FileStream(LogPath, FileMode.Open, FileAccess.Write, FileShare.Read);
@@ -400,7 +418,18 @@ public sealed class AetherArchive
         return new FileInfo(LogPath).Length < _logEnd.Value;
     }
 
-    private long RepairLog(long generation)
+    private void RememberLog(long generation)
+    {
+        if (_logEnd is not null && _loggedThrough is not null && _logGeneration == generation && !LogShorterThanRememberedEnd())
+            return;
+
+        var repaired = RepairLog(generation);
+        _logEnd = repaired.End;
+        _logGeneration = generation;
+        _loggedThrough = SaveThrough() + repaired.Count;
+    }
+
+    private LogTail RepairLog(long generation)
     {
         if (!File.Exists(LogPath))
             throw new AetherProtocolException("Recovery log does not match the snapshot.");
@@ -423,6 +452,7 @@ public sealed class AetherArchive
             throw new AetherProtocolException("Recovery log checksum failed.");
 
         long validEnd = records;
+        var count = 0;
         while (stream.Position < stream.Length)
         {
             if (stream.Length - stream.Position < 4)
@@ -440,6 +470,7 @@ public sealed class AetherArchive
             ReadExact(stream, hash);
             if (!SHA256.HashData(payload).AsSpan().SequenceEqual(hash))
                 throw new AetherProtocolException("Recovery log checksum failed.");
+            count++;
             validEnd = stream.Position;
         }
 
@@ -449,7 +480,7 @@ public sealed class AetherArchive
             stream.Flush(flushToDisk: true);
         }
 
-        return validEnd;
+        return new LogTail(validEnd, count);
     }
 
     private static void WriteDurable(string path, byte[] bytes, bool commitReplacement)
@@ -464,6 +495,23 @@ public sealed class AetherArchive
         if (!commitReplacement)
             return;
         File.Move(temporary, path, overwrite: true);
+    }
+
+    private long SaveThrough()
+    {
+        if (_saveThrough is long covered)
+            return covered;
+        using var stream = new FileStream(SnapshotPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        var header = ReadHeader(stream, SnapshotMagic);
+        if (header.BodyLength < 8)
+            throw new AetherProtocolException("Snapshot is truncated.");
+        var encoded = new byte[8];
+        ReadExact(stream, encoded);
+        var coveredThrough = BinaryPrimitives.ReadInt64BigEndian(encoded);
+        if (coveredThrough < 0)
+            throw new AetherProtocolException("Snapshot save sequence is invalid.");
+        _saveThrough = coveredThrough;
+        return coveredThrough;
     }
 
     private static long ReadGeneration(string path)
@@ -568,6 +616,8 @@ public sealed class AetherArchive
         BinaryPrimitives.WriteInt64BigEndian(encoded, value);
         buffer.Write(encoded);
     }
+
+    private readonly record struct LogTail(long End, int Count);
 
     private readonly record struct FileHeader(long Generation, uint BodyLength);
 

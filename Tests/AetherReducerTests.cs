@@ -477,6 +477,40 @@ public sealed class AetherReducerTests
     }
 
     [Fact]
+    public void An_empty_actor_id_is_rejected_before_any_change()
+    {
+        var store = NewStore();
+        Assert.Throws<AetherProtocolException>(() => store.StampLocal(
+            "entity-1",
+            "peer-A",
+            "",
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("nope") }));
+
+        Assert.Equal(0, store.Clock);
+        Assert.Equal(0, store.RecordCount);
+        Assert.Empty(store.ActorCursors);
+    }
+
+    [Fact]
+    public void A_local_stamp_that_reuses_an_operation_id_is_rejected_before_the_clock_moves()
+    {
+        var store = NewStore();
+        Apply(store, LabelOp("peer-A/s1/1", "peer-A", "peer-A/s1", 1, 10, "taken"));
+        Assert.Equal(11, store.Clock);
+
+        Assert.Throws<AetherProtocolException>(() => store.StampLocal(
+            "entity-1",
+            "peer-A",
+            "peer-A/s1",
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("other") }));
+
+        Assert.Equal(11, store.Clock);
+        Assert.Equal("taken", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.Empty(store.ActorCursors);
+        Assert.True(store.Remembers("peer-A/s1/1"));
+    }
+
+    [Fact]
     public void Delete_and_update_leave_the_entity_deleted_in_either_order()
     {
         foreach (var deleteFirst in new[] { true, false })

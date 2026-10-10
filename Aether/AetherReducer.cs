@@ -18,6 +18,7 @@ public sealed class AetherReducer
     private readonly Dictionary<string, VisibilityState> _visibility = new(StringComparer.Ordinal);
     private readonly Dictionary<MembershipKey, MembershipState> _membership = new();
     private long _clock;
+    private long _saveSequence;
 
     public AetherReducer(int dedupCapacity = DefaultDedupCapacity)
     {
@@ -73,34 +74,84 @@ public sealed class AetherReducer
             max);
     }
 
+    public bool CanStamp(IReadOnlyDictionary<string, FieldValue> changes)
+    {
+        ArgumentNullException.ThrowIfNull(changes);
+        foreach (var (fieldId, value) in changes)
+        {
+            if (!_fields.TryGetValue(fieldId, out var schema))
+                return false;
+            if (schema.Kind == FieldKind.Sum && value.IsText)
+                return false;
+            if (schema.Kind == FieldKind.Lww && !value.IsText)
+                return false;
+        }
+
+        return true;
+    }
+
+    public static bool HasActorSequence(AetherOperation op) =>
+        op is not null && !string.IsNullOrEmpty(op.ActorId) && op.Sequence >= 1;
+
     public AetherOperation StampLocal(
         string entityId,
         string writerId,
         string actorId,
         IReadOnlyDictionary<string, FieldValue> changes)
     {
+        if (string.IsNullOrEmpty(actorId))
+            throw new AetherProtocolException("Actor sequence is missing.");
+        foreach (var (fieldId, value) in changes)
+            RequireShape(fieldId, value);
         var nextClock = NextClock(_clock);
         var sequence = NextSequence(actorId);
-        _clock = nextClock;
-        _nextSequence[actorId] = sequence;
-
-        return new AetherOperation(
+        var stamped = new AetherOperation(
             $"{actorId}/{sequence.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
             entityId,
             writerId,
             actorId,
             sequence,
-            _clock,
+            nextClock,
             changes);
+        RejectBeforeAdmit(stamped);
+        _clock = nextClock;
+        _nextSequence[actorId] = sequence;
+        return stamped;
     }
 
     /// <summary>
     /// Fold an operation. A newly admitted remote op sets the clock to max(clock, lamport) + 1,
     /// including when the remote Lamport is older. An exact duplicate still in the window leaves the clock alone.
     /// Evicting an id from the window does not reject any other operation.
+    /// The returned clock is the clock after this call, paired with this operation.
     /// </summary>
-    public void Apply(AetherOperation op, bool observeClock)
+    public AetherApplied Apply(AetherOperation op, bool observeClock)
     {
+        ArgumentNullException.ThrowIfNull(op);
+        RejectBeforeAdmit(op);
+        if (_digests.ContainsKey(op.Id))
+            return Applied(op);
+
+        if (op.Effect != AetherEffect.Write)
+        {
+            ApplyLifecycle(op, observeClock);
+            return Applied(op);
+        }
+
+        var version = new FieldVersion(op.Lamport, op.ActorId);
+        Admit(op, observeClock);
+        foreach (var (fieldId, value) in op.Changes)
+            Upsert(new RecordKey(op.EntityId, op.WriterId, fieldId), value, version, op.WriterId, op.Id);
+        return Applied(op);
+    }
+
+    /// <summary>
+    /// Every protocol rejection Apply or StampLocal can raise. Nothing here writes the clock, the records, or the actor cursor.
+    /// </summary>
+    private void RejectBeforeAdmit(AetherOperation op)
+    {
+        if (_saveSequence == long.MaxValue)
+            throw new AetherProtocolException("Save sequence overflow.");
         if (_digests.TryGetValue(op.Id, out var prior))
         {
             if (!string.Equals(prior, op.Digest, StringComparison.Ordinal))
@@ -110,26 +161,52 @@ public sealed class AetherReducer
 
         if (op.Effect != AetherEffect.Write)
         {
-            ApplyLifecycle(op, observeClock);
-            return;
+            var version = new FieldVersion(op.Lamport, op.ActorId);
+            switch (op.Effect)
+            {
+                case AetherEffect.DeleteEntity:
+                    return;
+                case AetherEffect.HideShared:
+                    RejectVisibility(op.EntityId, version, hidden: true);
+                    return;
+                case AetherEffect.RestoreShared:
+                    RejectVisibility(op.EntityId, version, hidden: false);
+                    return;
+                case AetherEffect.WithdrawPublication:
+                    RejectMembership(op.EntityId, op.PublicationId!, version, published: false);
+                    return;
+                case AetherEffect.Publish:
+                    RejectMembership(op.EntityId, op.PublicationId!, version, published: true);
+                    return;
+                default:
+                    throw new AetherProtocolException($"Unknown effect '{op.Effect}'.");
+            }
         }
 
-        var version = new FieldVersion(op.Lamport, op.ActorId);
-        var admitted = new List<(RecordKey Key, FieldValue Value)>(op.Changes.Count);
+        var writeVersion = new FieldVersion(op.Lamport, op.ActorId);
         foreach (var (fieldId, value) in op.Changes)
         {
             RequireShape(fieldId, value);
-
             var key = new RecordKey(op.EntityId, op.WriterId, fieldId);
-            if (_records.TryGetValue(key, out var existing) && existing.Version.CompareTo(version) == 0 && existing.Value != value)
+            if (_records.TryGetValue(key, out var existing) && existing.Version.CompareTo(writeVersion) == 0 && existing.Value != value)
                 throw new AetherProtocolException($"Version collision on '{fieldId}'.");
-
-            admitted.Add((key, value));
         }
+    }
 
-        Admit(op, observeClock);
-        foreach (var (key, value) in admitted)
-            Upsert(key, value, version, op.WriterId, op.Id);
+    /// <summary>How far the save sequence has moved. A snapshot covers every application up to this place.</summary>
+    public long SaveThrough => _saveSequence;
+
+    internal void RestoreSaveThrough(long saveSequence)
+    {
+        if (saveSequence < 0 || saveSequence < _saveSequence)
+            throw new AetherProtocolException("Save sequence moved backwards.");
+        _saveSequence = saveSequence;
+    }
+
+    private AetherApplied Applied(AetherOperation op)
+    {
+        _saveSequence++;
+        return new AetherApplied(op, _clock, _saveSequence);
     }
 
     public void MergeImage(AetherImage image)
@@ -445,7 +522,7 @@ public sealed class AetherReducer
             if (compared == 0)
             {
                 if (existing.Hidden != hidden)
-                    throw new AetherProtocolException($"Version collision on visibility for '{entityId}'.");
+                    throw new InvalidOperationException($"Version collision on visibility for '{entityId}'.");
                 return;
             }
         }
@@ -463,7 +540,7 @@ public sealed class AetherReducer
             if (compared == 0)
             {
                 if (existing.Published != published)
-                    throw new AetherProtocolException($"Version collision on membership '{key.PublicationId}'.");
+                    throw new InvalidOperationException($"Version collision on membership '{key.PublicationId}'.");
                 return;
             }
         }
@@ -508,7 +585,7 @@ public sealed class AetherReducer
             if (compared == 0)
             {
                 if (existing.Value != value)
-                    throw new AetherProtocolException($"Version collision on '{key.FieldId}'.");
+                    throw new InvalidOperationException($"Version collision on '{key.FieldId}'.");
                 return;
             }
         }
@@ -563,6 +640,11 @@ public sealed record StoredField(
     string OperationId);
 
 public readonly record struct SeenOperation(string Id, string Digest, long Lamport);
+
+/// <summary>
+/// One application and the clock after that application. A later write does not change this pair.
+/// </summary>
+public readonly record struct AetherApplied(AetherOperation Operation, long Clock, long SaveSequence);
 
 public readonly record struct MembershipKey(string EntityId, string PublicationId);
 
