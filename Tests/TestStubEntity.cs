@@ -16,4 +16,7 @@ internal sealed partial class TestStubEntity : Entity
 
     [Key(103)]
     public int Counter { get; set; }
+
+    [Key(104)]
+    public string? Label { get; set; }
 }

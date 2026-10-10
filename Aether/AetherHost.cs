@@ -56,14 +56,41 @@ public sealed class AetherHost
         return TryEnqueue(new Pending(null, new LocalWrite(entityId, writerId, actorId, stored), bytes));
     }
 
-    public IReadOnlyList<AetherOutcome> Drain() => Drain(beforeFold: null);
+    public IReadOnlyList<AetherOutcome> Drain() => Drain(int.MaxValue, int.MaxValue, beforeFold: null);
 
-    internal IReadOnlyList<AetherOutcome> Drain(Action<long>? beforeFold, Action? afterLocalStamp = null)
+    /// <summary>
+    /// Folds until the inbox is empty or the next request would pass <paramref name="maxOperations"/>
+    /// or <paramref name="maxBytes"/>. That request stays queued. The first request of the call is folded
+    /// even when it alone is larger than <paramref name="maxBytes"/>, so one accepted request cannot stall.
+    /// </summary>
+    public IReadOnlyList<AetherOutcome> Drain(int maxOperations, int maxBytes) =>
+        Drain(maxOperations, maxBytes, beforeFold: null);
+
+    internal IReadOnlyList<AetherOutcome> Drain(Action<long>? beforeFold, Action? afterLocalStamp = null) =>
+        Drain(int.MaxValue, int.MaxValue, beforeFold, afterLocalStamp);
+
+    private IReadOnlyList<AetherOutcome> Drain(
+        int maxOperations,
+        int maxBytes,
+        Action<long>? beforeFold,
+        Action? afterLocalStamp = null)
     {
-        var outcomes = new List<AetherOutcome>(_inbox.Count);
+        if (maxOperations < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxOperations));
+        if (maxBytes < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxBytes));
+
+        var outcomes = new List<AetherOutcome>();
+        var spentOperations = 0;
+        long spentBytes = 0;
         while (_inbox.Count > 0)
         {
             var pending = _inbox.Peek();
+            if (spentOperations >= maxOperations)
+                break;
+            if (spentOperations > 0 && spentBytes + pending.Bytes > maxBytes)
+                break;
+
             bool foldedOk;
             AetherApplied folded = default;
             string? reason = null;
@@ -82,14 +109,18 @@ public sealed class AetherHost
                 _inbox.Dequeue();
                 _inboxBytes -= pending.Bytes;
                 outcomes.Add(AetherOutcome.Rejected(pending.RequestId, reason!));
-                continue;
+            }
+            else
+            {
+                _inbox.Dequeue();
+                _inboxBytes -= pending.Bytes;
+                _outbox.Enqueue(pending.With(folded));
+                _outboxBytes += pending.Bytes;
+                outcomes.Add(AetherOutcome.Applied(pending.RequestId, folded));
             }
 
-            _inbox.Dequeue();
-            _inboxBytes -= pending.Bytes;
-            _outbox.Enqueue(pending.With(folded));
-            _outboxBytes += pending.Bytes;
-            outcomes.Add(AetherOutcome.Applied(pending.RequestId, folded));
+            spentOperations++;
+            spentBytes += pending.Bytes;
         }
 
         return outcomes;

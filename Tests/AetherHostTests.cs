@@ -484,6 +484,99 @@ public sealed class AetherHostTests
         Assert.Equal("two", store.ResolveLww("entity-1", "label")?.Text);
     }
 
+    [Fact]
+    public void A_byte_budget_leaves_the_next_request_queued()
+    {
+        var store = NewStore();
+        var first = Remote("one");
+        var second = new AetherOperation(
+            "peer-C/s1/two",
+            "entity-1",
+            "peer-C",
+            "peer-C/s1",
+            1,
+            11,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("two") });
+        var host = new AetherHost(store, 4096, 8);
+        host.TryAcceptRemote(first);
+        host.TryAcceptRemote(second);
+
+        var drained = host.Drain(8, AetherHost.Measure(first));
+        Assert.Equal(first.Id, Assert.Single(drained).Result!.Value.Operation.Id);
+        Assert.Equal("one", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(11, store.Clock);
+        Assert.Equal(2, host.PendingCount);
+
+        var rest = host.Drain();
+        Assert.Equal(second.Id, Assert.Single(rest).Result!.Value.Operation.Id);
+        Assert.Equal("two", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(12, store.Clock);
+    }
+
+    [Fact]
+    public void A_request_larger_than_the_byte_budget_still_drains_once()
+    {
+        var store = NewStore();
+        var wide = Remote("wide-label-value");
+        var next = new AetherOperation(
+            "peer-C/s1/next",
+            "entity-1",
+            "peer-C",
+            "peer-C/s1",
+            1,
+            11,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("next") });
+        var host = new AetherHost(store, AetherHost.Measure(wide) + AetherHost.Measure(next), 8);
+        host.TryAcceptRemote(wide);
+        host.TryAcceptRemote(next);
+
+        var drained = host.Drain(8, 1);
+        Assert.Equal(wide.Id, Assert.Single(drained).Result!.Value.Operation.Id);
+        Assert.Equal("wide-label-value", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(2, host.PendingCount);
+    }
+
+    [Fact]
+    public void A_rejected_request_spends_the_operation_budget()
+    {
+        var store = NewStore();
+        var host = new AetherHost(store, 4096, 8);
+        host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.FixedPoint(1),
+        });
+        var good = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("ok"),
+        });
+
+        var drained = host.Drain(1, 1_000_000);
+        var rejected = Assert.Single(drained);
+        Assert.Equal(AetherOutcomeKind.Rejected, rejected.Kind);
+        Assert.Equal("Field 'label' stores a label.", rejected.Reason);
+        Assert.Equal(0, store.Clock);
+        Assert.Equal(0, store.RecordCount);
+        Assert.Equal(1, host.PendingCount);
+
+        var rest = host.Drain(1, 1_000_000);
+        Assert.Equal(good.RequestId, Assert.Single(rest).RequestId);
+        Assert.Equal("ok", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(1, store.Clock);
+    }
+
+    [Fact]
+    public void A_zero_budget_is_refused_before_the_queue_moves()
+    {
+        var store = NewStore();
+        var host = new AetherHost(store, 4096, 8);
+        host.TryAcceptRemote(Remote("one"));
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => host.Drain(0, 8));
+        Assert.Throws<ArgumentOutOfRangeException>(() => host.Drain(1, 0));
+        Assert.Equal(0, store.Clock);
+        Assert.Equal(1, host.PendingCount);
+    }
+
     private static AetherReducer NewStore()
     {
         var store = new AetherReducer();
