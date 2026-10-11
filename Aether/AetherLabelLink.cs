@@ -77,6 +77,7 @@ public sealed class AetherLabelLink : IDisposable
         };
         network.OnDataReceived += OnData;
         network.OnPeerConnected += OnPeerConnected;
+        RememberOwn();
     }
 
     public AetherAdmit? LastRemoteAdmit { get; private set; }
@@ -190,6 +191,44 @@ public sealed class AetherLabelLink : IDisposable
 
             _held.Enqueue(operation);
         }
+    }
+
+    private void RememberOwn()
+    {
+        foreach (var field in _host.Reducer.Capture().Fields)
+        {
+            if (!string.Equals(field.Key.EntityId, _entityId, StringComparison.Ordinal)
+                || !string.Equals(field.Key.WriterId, _writerId, StringComparison.Ordinal)
+                || !string.Equals(field.Key.FieldId, _fieldId, StringComparison.Ordinal)
+                || !field.Value.IsText
+                || !TryStampedSequence(field.OperationId, field.Version.ActorId, out var sequence))
+                continue;
+
+            _own = new AetherOperation(
+                field.OperationId,
+                _entityId,
+                _writerId,
+                field.Version.ActorId,
+                sequence,
+                field.Version.Lamport,
+                new Dictionary<string, FieldValue> { [_fieldId] = field.Value });
+            return;
+        }
+    }
+
+    private static bool TryStampedSequence(string operationId, string actorId, out long sequence)
+    {
+        sequence = 0;
+        var prefix = actorId + "/";
+        if (string.IsNullOrEmpty(actorId)
+            || !operationId.StartsWith(prefix, StringComparison.Ordinal))
+            return false;
+        return long.TryParse(
+                operationId.AsSpan(prefix.Length),
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out sequence)
+            && sequence >= 1;
     }
 
     private void Note(AetherOperation operation)

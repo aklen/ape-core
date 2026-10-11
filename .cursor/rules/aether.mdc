@@ -30,11 +30,21 @@ An old delete must not drop a handled entity unless the reducer stores the
 tombstone. A subscription may filter transport. It does not grant publication
 membership or authority.
 
-The label of an existing entity is on the wire. Reconnect sends this peer's
-own current contribution for that label, and only after the reducer applied it.
-Do not relay another writer's contribution. Do not fold creation, deletion, or
-owner into that packet. A full queue is a visible refusal, not a silent send,
-and catch-up stays retryable. Projecting the resolved label is not a local edit.
+The label of an existing entity is on the wire. Reconnect of the same link
+sends this peer's own current contribution for that label, and only after the
+reducer applied it. Restart is separate: loading the reducer does not rebuild
+the link. A new link sends the saved own contribution when the stamped id still
+carries the sequence, and does not invent one. That rebuild is this one label
+only. Do not rebuild a multi-field operation from one stored field: the same id
+would get a different digest. The next slice keeps an unchanged envelope
+separate from a state catch-up that carries its own version and explicit actor
+and sequence data beside the current record. Do not add a full history for that.
+Do not relay another writer's
+contribution. Do not fold creation, deletion, or owner into that packet. A full
+queue is a visible refusal, not a silent send. Catch-up advances only while the
+connection works, a pump runs, and a slot frees. A packet dropped because the
+held queue is full needs another send. Projecting the resolved label is not a
+local edit.
 An outgoing label stays queued until the transport accepts it. Stopping the
 link unsubscribes it from the network.
 
@@ -46,6 +56,16 @@ the reducer, the dedup window, or the scene log. Store an identifier, a hash,
 and the metadata the field needs. Give file copy, scene updates, and live
 audio separate limits. A file retries missing pieces. Live media drops samples
 that are already too old.
+
+## State sync is not a command
+
+Guarantee and fault model version 1 in `Docs/AETHER.md` is the label
+state-sync contract. Do not treat it as a sensor, machine-control, or
+critical-configuration contract, and do not generalize the label wire into
+those until that model names the fault, the guarantee, and the refusal.
+A greater actor id is not a safety decision. Transport handoff is not
+execution. A Lamport value is not freshness. An applied write is not durable
+and not remotely applied.
 
 ## Keep the scope small
 

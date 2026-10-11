@@ -109,7 +109,9 @@ A delete on the old path must not drop an entity this reducer handles unless the
 
 The label of an existing entity is the one field on the wire. A local edit is queued on the host. After the frame drains it, wire version `1` carries the rule id `lww`, the writer, the actor, the sequence, the Lamport, and the label text. A checksum covers that packet. The receiver does not invent a missing version from arrival order. A version it does not know is refused and is not queued. The receiver's host queue then takes the operation. The frame resolves it and the scene commit writes the property. That write is not submitted again. A full queue returns a full result, for a local edit and for a packet that does not fit, and the refused label is not treated as sent. An applied label waits in a bounded outgoing queue until `Broadcast` returns. A throw leaves it there for the next pump. That return means the transport took the packet, not that the other peer applied it. Stopping the link unsubscribes it, so a later packet does not enter the old queue.
 
-A broken connection does not drop the label or this peer's own contribution. While the peers are apart, both may edit. Reconnect sends that peer's own current contribution for this label, not another writer's, and not an older one it has replaced. A contribution is remembered only after the reducer has applied it. The same packet is used. The greater version wins on both sides. An older contribution does not replace it. If the receiver's queue is full, that contribution stays held and the next pump tries again. If the outgoing queue has no room, the missed own contribution stays due and a later pump sends it. A later reconnect can send the current contribution again.
+A broken connection does not drop the label or this peer's own contribution. While the peers are apart, both may edit. Reconnect, on that same link, sends that peer's own current contribution for this label, not another writer's, and not an older one it has replaced. A contribution is remembered only after the reducer has applied it. The same packet is used. The greater version wins on both sides. An older contribution does not replace it. If the receiver's host queue is full, that contribution stays held and the next pump tries again. If the outgoing queue has no room, the missed own contribution stays due and a later pump sends it. A later reconnect can send the current contribution again. Catch-up advances only while the connection works, a pump runs, and a slot frees. A packet dropped because the held queue is full is not kept. It arrives only when the sender transmits it again.
+
+Restart is a different case. Loading the reducer does not rebuild the link. A new link sends this peer's own saved contribution when the stamped operation id still carries that actor and sequence. It does not invent a sequence. A write that was not applied is not in the save, so the new link cannot send it. The sequence is read from that id, and the packet is rebuilt from the one stored label. That matches the original envelope only while the operation changed this single field. Rebuilding a wider operation from one remaining field would keep the id and change the digest, so the receiver would reject it. This slice does not keep the original envelope.
 
 Still not on this packet:
 
@@ -118,11 +120,49 @@ Still not on this packet:
 - Owner and authority
 - Subscription and publication
 
+## Guarantee and fault model, version 1
+
+This version names the label path only. A guarantee holds only for the fault named beside it. Anything else is a refusal or a separate contract. Sensor samples, machine-control commands, and critical configuration are not this version.
+
+| Word | Means | Does not mean |
+| --- | --- | --- |
+| Queued | The host accepted the request into its bounded queue. | The reducer has changed. |
+| Applied | The reducer took the write. | The archive has it, or another peer has it. |
+| Durable | `Commit` or `Save` returned that request id. | A peer received it. |
+| Handed off | `Broadcast` returned. | The other peer queued, applied, or executed it. |
+| Remotely queued | The receiver's host accepted it. | It has been applied or executed. |
+| Executed | A command's effect was confirmed by its own contract. | A result this version can produce. |
+
+| Fault | Label path | Refusal |
+| --- | --- | --- |
+| Connection loss | The same link keeps the label and its own applied contribution. Reconnect sends that contribution again. | The sender does not learn that the other peer applied it. This row is not a restart. |
+| Delay and reordering | The greater `(lamport, actorId)` wins. The same valid writes converge in either order. | Arrival order is not the rule. |
+| Duplication | The same id and digest, while the id is in the window, leaves the store unchanged. | After the id leaves the window, a rewritten payload is not detected. |
+| Overload | Catch-up advances only while the connection works, a pump runs, and a slot frees. A contribution held for a full host queue, and a due own send, are tried on a later pump. | A packet dropped because the held queue is full is not kept. It arrives only when the sender transmits it again. A refused label is not treated as sent. |
+| Restart | `Load` rebuilds a reducer from the snapshot and the log. A new link sends this peer's own saved contribution when the stamped operation id still carries that actor and sequence. The packet is rebuilt from this one stored label. | `Load` does not rebuild the link. The link does not invent a sequence. A write that was not applied is not in the save, so it cannot be sent. Rebuilding from one remaining field is not valid for an operation that changed more than this label: the same id would not keep the original digest. An applied result is not durable until `Commit` or `Save` returns. A torn tail is dropped. |
+| Corrupt data | A bad checksum, an unknown wire or archive version, or the wrong field shape is rejected before the clock, the queue, or a record changes. | The packet is not repaired into a write. |
+| Unauthorized sender | None. | This version does not authenticate the sender. `writerId` is whoever built the operation. |
+
+| Data | Contract it needs | This version |
+| --- | --- | --- |
+| Shared scene state | Convergent resolution, offline edits, and catch-up. | The label rows above. |
+| Sensor sample | Source, order, a validity interval, quality, and freshness. | Not started. A Lamport value does not show that a sample is still fresh. |
+| Machine-control command | An authorized issuer, a deadline, replay protection, and an execution acknowledgement. | Not started. The greater actor id is not that decision. Transport handoff is not execution. |
+| Critical configuration | Checked, coordinated activation, with several fields changing together when the configuration requires it. | Not started. One frame is not that transaction. |
+
+The bounds this version names are the host byte cap and count cap, the frame operation budget and byte budget, the outgoing and held-catch-up count caps, and the dedup-window capacity. Tests exercise those caps. Memory, message size, processing time, and overload behavior on the target hardware are not measured here.
+
+A claim is accepted only when the requirement, the invariant, the code, and a test name the same fault and the same result. The evidence for this version is those handwritten tests. Model checking, fuzzing, and fault injection are not evidence yet. A green suite does not extend a guarantee past the tests that name it. Suitability for a safety-critical system needs system-level evidence and an independent review. This version does not claim that review.
+
+While communication is uncertain, the label path keeps the last applied local state, refuses a corrupt or unknown packet, and retries a full queue. It does not invent a command fallback. A control system names its own predetermined behavior before a command exists. That behavior is outside this version.
+
+The next slice separates two sends. Resending an operation sends the original envelope unchanged. Catching up state sends the current contribution with its own version, and with the actor and sequence stored beside that record. Neither send needs a full history. This version does not store that actor and sequence beside the record.
+
 ## What this slice does not do
 
-- No relay or authentication yet. The label packet above is the only state sync on the wire. `writerId` is whoever built the operation. The scene commit projects the resolved view. Disk save stays outside the tick.
+- No relay or authentication yet. The label packet above is the only state sync on the wire. `writerId` is whoever built the operation. The scene commit projects the resolved view. Disk save stays outside the tick. Sensor samples, machine-control commands, and critical configuration are outside guarantee and fault model version 1.
 - No retired-id table outside the snapshot. A load installs the tombstones the snapshot holds.
 - No owner, delete, or hide lists, policy cutover, or parent edges.
 - `keepConflicts`, `coordinate`, and `treeMove` are rejected at field definition.
 - No shared checkpoint yet. After an id leaves the dedup window, a rewritten payload is not detected. A checkpoint later proves coverage and can reject a covered id without the original digest. An unchanged replay is still held by the field version.
-- No retained operation payloads, so `CanReplay` is false. Digest memory does not become a delta.
+- No retained operation payloads, so `CanReplay` is false. Digest memory does not become a delta. Restart of this one label rebuilds the packet from the stamped id and the stored field. It does not keep the original envelope, and it does not store the actor and sequence beside the current record.
