@@ -24,6 +24,9 @@ public sealed class AetherLabelLink : IDisposable
     private readonly int _maxOutgoing;
     private readonly HashSet<long> _localIds = new();
     private readonly Queue<AetherOperation> _outgoing = new();
+    private readonly Queue<AetherOperation> _held = new();
+    private AetherOperation? _own;
+    private bool _catchUpPending;
     private readonly FrozenPlan<AetherScratch> _plan;
     private PlanRuntime _runtime;
     private AetherScratch _scratch;
@@ -73,6 +76,7 @@ public sealed class AetherLabelLink : IDisposable
             LabelPropertyName = labelPropertyName,
         };
         network.OnDataReceived += OnData;
+        network.OnPeerConnected += OnPeerConnected;
     }
 
     public AetherAdmit? LastRemoteAdmit { get; private set; }
@@ -94,9 +98,20 @@ public sealed class AetherLabelLink : IDisposable
         return admit;
     }
 
+    public void CatchUp()
+    {
+        ObjectDisposedException.ThrowIf(_stopped, this);
+        if (_own is null)
+            return;
+        _catchUpPending = true;
+        ScheduleCatchUp();
+        Flush();
+    }
+
     public void Pump()
     {
         ObjectDisposedException.ThrowIf(_stopped, this);
+        AdmitHeld();
         _plan.Tick(ref _scratch, ref _runtime);
         if (_scratch.SceneCommits is not null)
         {
@@ -113,15 +128,14 @@ public sealed class AetherLabelLink : IDisposable
                 _localIds.Remove(outcome.RequestId);
                 if (outcome.Kind != AetherOutcomeKind.Applied || outcome.Result is null)
                     continue;
+                Note(outcome.Result.Value.Operation);
                 _outgoing.Enqueue(outcome.Result.Value.Operation);
             }
         }
 
-        while (_outgoing.Count > 0)
-        {
-            _network.Broadcast(AetherWire.Encode(_outgoing.Peek()), reliable: true);
-            _outgoing.Dequeue();
-        }
+        Flush();
+        ScheduleCatchUp();
+        Flush();
     }
 
     public void Dispose()
@@ -129,6 +143,7 @@ public sealed class AetherLabelLink : IDisposable
         if (_stopped)
             return;
         _stopped = true;
+        _network.OnPeerConnected -= OnPeerConnected;
         _network.OnDataReceived -= OnData;
     }
 
@@ -144,6 +159,73 @@ public sealed class AetherLabelLink : IDisposable
         }
 
         LastRemoteFault = null;
-        LastRemoteAdmit = _host.TryAcceptRemote(operation!);
+        var admit = _host.TryAcceptRemote(operation!);
+        LastRemoteAdmit = admit;
+        if (admit.Kind == AetherAdmitKind.Queued)
+            return;
+
+        if (_held.Any(held => held.Id == operation!.Id))
+            return;
+        if (_held.Count >= _maxOutgoing)
+        {
+            LastRemoteFault = "Catch-up does not fit.";
+            return;
+        }
+
+        _held.Enqueue(operation!);
+    }
+
+    private void OnPeerConnected(string peerId) => CatchUp();
+
+    private void AdmitHeld()
+    {
+        var waiting = _held.Count;
+        for (var i = 0; i < waiting; i++)
+        {
+            var operation = _held.Dequeue();
+            var admit = _host.TryAcceptRemote(operation);
+            LastRemoteAdmit = admit;
+            if (admit.Kind == AetherAdmitKind.Queued)
+                continue;
+
+            _held.Enqueue(operation);
+        }
+    }
+
+    private void Note(AetherOperation operation)
+    {
+        if (!string.Equals(operation.WriterId, _writerId, StringComparison.Ordinal)
+            || operation.Effect != AetherEffect.Write
+            || !operation.Changes.TryGetValue(_fieldId, out var value)
+            || !value.IsText)
+            return;
+
+        var version = new FieldVersion(operation.Lamport, operation.ActorId);
+        if (_own is not null && new FieldVersion(_own.Lamport, _own.ActorId).CompareTo(version) >= 0)
+            return;
+        _own = operation;
+    }
+
+    private void ScheduleCatchUp()
+    {
+        if (!_catchUpPending || _own is null)
+            return;
+        if (_outgoing.Any(queued => queued.Id == _own.Id))
+            return;
+        if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
+            return;
+        _outgoing.Enqueue(_own);
+    }
+
+    private void Flush()
+    {
+        while (_outgoing.Count > 0)
+        {
+            var operation = _outgoing.Peek();
+            _network.Broadcast(AetherWire.Encode(operation), reliable: true);
+            _outgoing.Dequeue();
+            if (_catchUpPending && _own is not null && operation.Id == _own.Id)
+                _catchUpPending = false;
+        }
     }
 }

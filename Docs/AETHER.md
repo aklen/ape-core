@@ -109,14 +109,14 @@ A delete on the old path must not drop an entity this reducer handles unless the
 
 The label of an existing entity is the one field on the wire. A local edit is queued on the host. After the frame drains it, wire version `1` carries the rule id `lww`, the writer, the actor, the sequence, the Lamport, and the label text. A checksum covers that packet. The receiver does not invent a missing version from arrival order. A version it does not know is refused and is not queued. The receiver's host queue then takes the operation. The frame resolves it and the scene commit writes the property. That write is not submitted again. A full queue returns a full result, for a local edit and for a packet that does not fit, and the refused label is not treated as sent. An applied label waits in a bounded outgoing queue until `Broadcast` returns. A throw leaves it there for the next pump. That return means the transport took the packet, not that the other peer applied it. Stopping the link unsubscribes it, so a later packet does not enter the old queue.
 
+A broken connection does not drop the label or this peer's own contribution. While the peers are apart, both may edit. Reconnect sends that peer's own current contribution for this label, not another writer's, and not an older one it has replaced. A contribution is remembered only after the reducer has applied it. The same packet is used. The greater version wins on both sides. An older contribution does not replace it. If the receiver's queue is full, that contribution stays held and the next pump tries again. If the outgoing queue has no room, the missed own contribution stays due and a later pump sends it. A later reconnect can send the current contribution again.
+
 Still not on this packet:
 
 - Registration and creation
-- Initial sync and catch-up
 - Deletion
 - Owner and authority
 - Subscription and publication
-- Reconnect
 
 ## What this slice does not do
 

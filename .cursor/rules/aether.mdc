@@ -30,9 +30,11 @@ An old delete must not drop a handled entity unless the reducer stores the
 tombstone. A subscription may filter transport. It does not grant publication
 membership or authority.
 
-The label of an existing entity is on the wire. Do not fold creation, deletion,
-catch-up, owner, or reconnect into that same packet. A full queue is a visible
-refusal, not a silent send. Projecting the resolved label is not a local edit.
+The label of an existing entity is on the wire. Reconnect sends this peer's
+own current contribution for that label, and only after the reducer applied it.
+Do not relay another writer's contribution. Do not fold creation, deletion, or
+owner into that packet. A full queue is a visible refusal, not a silent send,
+and catch-up stays retryable. Projecting the resolved label is not a local edit.
 An outgoing label stays queued until the transport accepts it. Stopping the
 link unsubscribes it from the network.
 

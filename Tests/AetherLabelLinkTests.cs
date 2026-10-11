@@ -151,6 +151,127 @@ public sealed class AetherLabelLinkTests
     }
 
     [Fact]
+    public void Reconnect_exchanges_the_current_label_and_an_older_one_does_not_win()
+    {
+        using var left = Peer("peer-a");
+        using var right = Peer("peer-b");
+
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.Submit("alpha").Kind);
+        left.Link.Pump();
+        Assert.Equal(AetherAdmitKind.Queued, right.Link.Submit("mid").Kind);
+        right.Link.Pump();
+        Assert.Equal(AetherAdmitKind.Queued, right.Link.Submit("beta").Kind);
+        right.Link.Pump();
+        Assert.Equal("alpha", left.Label);
+        Assert.Equal("beta", right.Label);
+        Assert.Empty(left.Transport.Sent);
+        Assert.Empty(right.Transport.Sent);
+
+        left.Transport.AddPeer(right.Transport.LocalPeerId);
+        right.Transport.AddPeer(left.Transport.LocalPeerId);
+        var alpha = Assert.Single(left.Transport.Sent);
+        var beta = Assert.Single(right.Transport.Sent);
+        Assert.Equal("alpha", LabelOf(alpha));
+        Assert.Equal("beta", LabelOf(beta));
+
+        right.Transport.Deliver(left.Transport.LocalPeerId, alpha);
+        left.Transport.Deliver(right.Transport.LocalPeerId, beta);
+        left.Link.Pump();
+        right.Link.Pump();
+
+        Assert.Equal("beta", left.Label);
+        Assert.Equal("beta", right.Label);
+        Assert.Equal("beta", left.LinkHostLabel);
+        Assert.Equal("beta", right.LinkHostLabel);
+        Assert.Single(left.Transport.Sent);
+        Assert.Single(right.Transport.Sent);
+
+        left.Transport.Sent.Clear();
+        right.Transport.Sent.Clear();
+        left.Link.CatchUp();
+        right.Link.CatchUp();
+        Assert.Equal("alpha", LabelOf(Assert.Single(left.Transport.Sent)));
+        Assert.Equal("beta", LabelOf(Assert.Single(right.Transport.Sent)));
+    }
+
+    [Fact]
+    public void A_rejected_remote_write_is_not_forwarded_on_catch_up()
+    {
+        using var left = Peer("peer-a");
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.Submit("alpha").Kind);
+        left.Link.Pump();
+
+        var stolen = AetherWire.Encode(new AetherOperation(
+            "peer-a/2",
+            "entity-1",
+            "peer-a",
+            "peer-a",
+            2,
+            99,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("stolen") }));
+        left.Transport.Deliver("peer-b", stolen);
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.LastRemoteAdmit!.Value.Kind);
+        left.Link.Pump();
+        Assert.Equal("alpha", left.Label);
+        Assert.Equal("alpha", left.LinkHostLabel);
+
+        left.Transport.AddPeer("peer-b");
+        Assert.Equal("alpha", LabelOf(Assert.Single(left.Transport.Sent)));
+    }
+
+    [Fact]
+    public void Catch_up_blocked_by_a_full_outgoing_queue_resumes_on_the_next_pump()
+    {
+        using var left = Peer("peer-a", maxOutgoing: 1);
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.Submit("alpha").Kind);
+        left.Link.Pump();
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.Submit("beta").Kind);
+        left.Store.RestoreActorSequence("peer-a", long.MaxValue);
+
+        left.Transport.AddPeer("peer-b");
+        Assert.Empty(left.Transport.Sent);
+
+        left.Link.Pump();
+        Assert.Equal("alpha", left.Label);
+        Assert.Equal("alpha", LabelOf(Assert.Single(left.Transport.Sent)));
+    }
+
+    [Fact]
+    public void A_full_receiver_keeps_catch_up_until_the_queue_has_room()
+    {
+        using var left = Peer("peer-a");
+        using var right = Peer("peer-b", maxCount: 1);
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.Submit("old").Kind);
+        left.Link.Pump();
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.Submit("newer").Kind);
+        left.Link.Pump();
+        Assert.Equal(AetherAdmitKind.Queued, right.Link.Submit("held").Kind);
+        right.Link.Pump();
+        Assert.Equal("newer", left.Label);
+        Assert.Equal("held", right.Label);
+
+        left.Transport.AddPeer(right.Transport.LocalPeerId);
+        right.Transport.AddPeer(left.Transport.LocalPeerId);
+        var newer = Assert.Single(left.Transport.Sent);
+        Assert.Equal("newer", LabelOf(newer));
+        right.Transport.Deliver(left.Transport.LocalPeerId, newer);
+        Assert.Equal(AetherAdmitKind.Full, right.Link.LastRemoteAdmit!.Value.Kind);
+        Assert.Equal("held", right.Label);
+        Assert.Equal("held", right.LinkHostLabel);
+
+        using var dir = new TempDir();
+        right.Host.Save(new AetherArchive(dir.Path));
+        Assert.Equal(0, right.Host.PendingCount);
+        right.Link.Pump();
+
+        Assert.Equal("newer", right.Label);
+        Assert.Equal("newer", right.LinkHostLabel);
+        left.Transport.Deliver(right.Transport.LocalPeerId, Assert.Single(right.Transport.Sent));
+        left.Link.Pump();
+        Assert.Equal("newer", left.Label);
+    }
+
+    [Fact]
     public void A_yielded_label_is_not_written_by_replica_deserialize_and_does_not_look_changed()
     {
         var kept = new TestStubEntity();
@@ -173,7 +294,13 @@ public sealed class AetherLabelLinkTests
         Assert.True(kept.HasChanges());
     }
 
-    private static PeerPeer Peer(string actor, int maxCount = 8)
+    private static string? LabelOf(byte[] packet)
+    {
+        Assert.True(AetherWire.TryDecode(packet, "entity-1", "label", out var operation, out _));
+        return operation!.Changes["label"].Text;
+    }
+
+    private static PeerPeer Peer(string actor, int maxCount = 8, int maxOutgoing = 64)
     {
         var transport = new ScriptedTransport(actor);
         var network = new NetworkManager(transport);
@@ -199,7 +326,16 @@ public sealed class AetherLabelLinkTests
         store.Apply(published, observeClock: true);
         store.RestoreActorSequence(actor, 1);
         var host = new AetherHost(store, 4096, maxCount);
-        var link = new AetherLabelLink(network, host, scene, log, "entity-1", actor, actor, "catalog");
+        var link = new AetherLabelLink(
+            network,
+            host,
+            scene,
+            log,
+            "entity-1",
+            actor,
+            actor,
+            "catalog",
+            maxOutgoing: maxOutgoing);
         return new PeerPeer(transport, link, scene, store, host);
     }
 
@@ -262,7 +398,11 @@ public sealed class AetherLabelLinkTests
         public event Action<string, Guid, int, long, string[]>? OnFileManifestReceived;
         public event Action<string, Guid, int>? OnFileChunkRequested;
 
-        public void AddPeer(string peerId) => _peers.Add(peerId);
+        public void AddPeer(string peerId)
+        {
+            _peers.Add(peerId);
+            OnPeerConnected?.Invoke(peerId);
+        }
 
         public void Deliver(string fromPeerId, byte[] data) =>
             OnDataReceived?.Invoke(fromPeerId, data, data.Length);
@@ -299,6 +439,19 @@ public sealed class AetherLabelLinkTests
         public void RequestFileChunk(string peerId, Guid fileId, int chunkIndex) { }
 
         public void Dispose() { }
+    }
+
+    private sealed class TempDir : IDisposable
+    {
+        public TempDir()
+        {
+            Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ape-aether-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(Path);
+        }
+
+        public string Path { get; }
+
+        public void Dispose() => Directory.Delete(Path, recursive: true);
     }
 #pragma warning restore CS0067
 }
