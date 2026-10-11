@@ -1,6 +1,6 @@
 # Aether reducer
 
-Normative for the code under `Aether/`. Trees, checkpoints, and transport are not implemented here. Local save is outside the frame. Working notes outside this repository are not the contract.
+Normative for the code under `Aether/`. Trees and checkpoints are not implemented here. Local save is outside the frame. One existing entity's label can travel on the network. Working notes outside this repository are not the contract.
 
 ## What this slice does
 
@@ -73,9 +73,54 @@ After the snapshot is in place, the log for the previous generation is replaced.
 
 `Load` builds a fresh reducer. It does not merge into a live one. The frame does not read or write these files.
 
+## Replacing Replica sync
+
+The code stays under `Aether/` until the current Replica sync path is gone. A rename can wait until then. The engine name and the module name do not have to match.
+
+```text
+Existing Ape scene objects
+        ↕
+Aether: field versions, membership, lifecycle, media references
+        ↕
+Network: state sync, resumable file transfer, live audio and video
+```
+
+Scene commit stays the boundary that applies a resolved value. The contribution store stays too. It holds each writer's versioned value, which is not the displayed object.
+
+Replacing Replica sync does not remove the other two paths. They stay beside the state engine:
+
+| Path | What it carries |
+| --- | --- |
+| State sync | Scene fields, versions, membership, lifecycle, and references to media. |
+| File transfer | A full or partial download, chunks, a checksum, and resume after a break. |
+| Live byte stream | Audio and video, with ordering, buffering, delay, and rules for dropping data. |
+
+A video object records which media it uses, who may read it, and any durable playback state. The file service carries the bytes. The stream path carries live frames. Those payloads do not enter the reducer, the dedup window, or the scene log. Those stores keep an identifier, a hash, and the metadata the field needs.
+
+The same network gives each path its own limit and schedule. A large file copy must not starve a scene update or live audio. A file asks again for the missing pieces. Live media drops samples that are already too old.
+
+New work serves this replacement and writes those same scene objects. It does not grow a second scene graph.
+
+A field or entity that has moved is handled only here. The old deserialize path must not write it. Projecting a resolved value into the scene is not a local edit, so that write must not be sent again.
+
+A current Create, Update, or FullSync blob is not an operation. It does not carry field versions, the original writer, or the rule version. Those travel in a versioned wire format. The receiver does not invent them from arrival order.
+
+A delete on the old path must not drop an entity this reducer handles unless the reducer also stores the tombstone. A subscription may still filter what the transport delivers. It does not grant publication membership or authority.
+
+The label of an existing entity is the one field on the wire. A local edit is queued on the host. After the frame drains it, wire version `1` carries the rule id `lww`, the writer, the actor, the sequence, the Lamport, and the label text. A checksum covers that packet. The receiver does not invent a missing version from arrival order. A version it does not know is refused and is not queued. The receiver's host queue then takes the operation. The frame resolves it and the scene commit writes the property. That write is not submitted again. A full queue returns a full result, for a local edit and for a packet that does not fit, and the refused label is not treated as sent. An applied label waits in a bounded outgoing queue until `Broadcast` returns. A throw leaves it there for the next pump. That return means the transport took the packet, not that the other peer applied it. Stopping the link unsubscribes it, so a later packet does not enter the old queue.
+
+Still not on this packet:
+
+- Registration and creation
+- Initial sync and catch-up
+- Deletion
+- Owner and authority
+- Subscription and publication
+- Reconnect
+
 ## What this slice does not do
 
-- No network, relay, or authentication. `writerId` is whoever built the operation. The scene commit projects the resolved view. Disk save stays outside the tick.
+- No relay or authentication yet. The label packet above is the only state sync on the wire. `writerId` is whoever built the operation. The scene commit projects the resolved view. Disk save stays outside the tick.
 - No retired-id table outside the snapshot. A load installs the tombstones the snapshot holds.
 - No owner, delete, or hide lists, policy cutover, or parent edges.
 - `keepConflicts`, `coordinate`, and `treeMove` are rejected at field definition.

@@ -1,3 +1,4 @@
+using Ape.Core.Aether;
 using Ape.Core.Runtime.Service;
 using Ape.Core.Event;
 using Ape.Core.Event.Models;
@@ -280,6 +281,8 @@ public class ReplicaManager : IReplicaManager, ICoreService
         try
         {
             if (ReplicaPacketBuilder.IsPluginHandledPacket(data))
+                return;
+            if (AetherWire.IsStatePacket(data))
                 return;
 
             // Parse packet type

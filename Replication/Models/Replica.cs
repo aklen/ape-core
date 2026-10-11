@@ -79,6 +79,9 @@ public abstract class Replica : IReplica
     
     [IgnoreMember]
     private bool _suppressEvents = false;
+
+    [IgnoreMember]
+    private readonly HashSet<string> _yieldedToAether = new(StringComparer.Ordinal);
     
     /// <summary>
     /// Internal setter for EventManager dependency.
@@ -133,6 +136,9 @@ public abstract class Replica : IReplica
         
         foreach (var prop in properties)
         {
+            if (_yieldedToAether.Contains(prop.Name))
+                continue;
+
             var newValue = prop.GetValue(deserialized);
             var oldValue = prop.GetValue(this);
             
@@ -281,6 +287,16 @@ public abstract class Replica : IReplica
     /// Example: After updating DeviceData dictionary, call NotifyPropertyChanged("DeviceData") to sync changes.
     /// </summary>
     /// <param name="propertyName">Name of the property that changed</param>
+    /// <summary>
+    /// This property is no longer written by a Replica update.
+    /// Aether projects it, and that projection is not a local edit to send.
+    /// </summary>
+    public void YieldPropertyToAether(string propertyName)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(propertyName);
+        _yieldedToAether.Add(propertyName);
+    }
+
     public void NotifyPropertyChanged(string propertyName)
     {
         OnPropertyChanged(propertyName);
@@ -297,6 +313,9 @@ public abstract class Replica : IReplica
         
         foreach (var prop in properties)
         {
+            if (_yieldedToAether.Contains(prop.Name))
+                continue;
+
             if (!_previousValues.TryGetValue(prop.Name, out var previousValue))
                 return true; // Property not snapshotted yet
             

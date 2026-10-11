@@ -1,6 +1,6 @@
 ---
 description: Aether distributed scene invariants; apply when changing reducers, projections, lifecycle, persistence, sync, or their integration with the host frame
-globs: Aether/**/*.cs,Tests/Aether*.cs,Docs/AETHER.md
+globs: Aether/**/*.cs,Tests/Aether*.cs,Docs/AETHER.md,Replication/**/*.cs
 alwaysApply: false
 ---
 
@@ -12,6 +12,38 @@ for implemented behavior. Local plans and research notes are design references,
 not an implicit extension of the implemented protocol. Keep the contract,
 implementation, and meaningful tests aligned in the same change. Clearly mark
 unsupported behavior; do not silently approximate it with another resolver.
+
+## Replace the Replica sync path
+
+`Aether/` stays until that path is gone. A rename waits. New work replaces
+Replica sync and writes the existing scene objects. Do not grow a second scene
+graph. The contribution store remains: it holds writer versions, not the
+displayed object.
+
+A field or entity that has moved has one path. The old deserialize path must
+not write it. Projecting a resolved value is not a local edit and must not be
+sent again. A Create, Update, or FullSync blob is not an operation. Field
+versions, the original writer, and the rule version need a versioned wire
+format. Do not invent them from arrival order.
+
+An old delete must not drop a handled entity unless the reducer stores the
+tombstone. A subscription may filter transport. It does not grant publication
+membership or authority.
+
+The label of an existing entity is on the wire. Do not fold creation, deletion,
+catch-up, owner, or reconnect into that same packet. A full queue is a visible
+refusal, not a silent send. Projecting the resolved label is not a local edit.
+An outgoing label stays queued until the transport accepts it. Stopping the
+link unsubscribes it from the network.
+
+File transfer and live audio or video stay beside state sync. Keep full,
+partial, and resumable downloads, and live byte streams. Aether records the
+media reference, access, and durable playback state. The file service carries
+the bytes. The stream path carries live frames. Do not put those payloads in
+the reducer, the dedup window, or the scene log. Store an identifier, a hash,
+and the metadata the field needs. Give file copy, scene updates, and live
+audio separate limits. A file retries missing pieces. Live media drops samples
+that are already too old.
 
 ## Keep the scope small
 

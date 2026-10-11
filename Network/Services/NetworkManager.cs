@@ -56,26 +56,36 @@ public class NetworkManager : INetworkManager, ICoreService
         var tempLogger = new LogManager("console");
 
         // Factory pattern for transport selection ("none" = no sockets; use when network.enabled is false)
-        _transport = transportType.ToLowerInvariant() switch
+        var transport = transportType.ToLowerInvariant() switch
         {
             "quic" => new QuicTransport(tempLogger),
-            "litenetlib" => new LiteNetLibTransport(tempLogger),
+            "litenetlib" => (INetworkTransport)new LiteNetLibTransport(tempLogger),
             "none" or "noop" or "empty" => new NullNetworkTransport(),
             _ => throw new ArgumentException($"Unknown transport type: {transportType}")
         };
+        _transport = transport;
+        Wire();
 
-        // Forward events from transport
+        tempLogger.LogDebug($"NetworkManager initialized with {transportType} transport");
+    }
+
+    internal NetworkManager(INetworkTransport transport)
+    {
+        ArgumentNullException.ThrowIfNull(transport);
+        _transport = transport;
+        Wire();
+    }
+
+    private void Wire()
+    {
         _transport.OnDataReceived += (peerId, data, length) =>
         {
             var buffer = new byte[length];
             Array.Copy(data, buffer, length);
             OnDataReceived?.Invoke(peerId, buffer);
         };
-
         _transport.OnPeerConnected += peerId => OnPeerConnected?.Invoke(peerId);
         _transport.OnPeerDisconnected += peerId => OnPeerDisconnected?.Invoke(peerId);
-
-        tempLogger.LogDebug($"NetworkManager initialized with {transportType} transport");
     }
 
     // ICoreService implementation
