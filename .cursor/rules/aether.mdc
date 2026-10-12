@@ -69,8 +69,10 @@ A remote state packet is admitted only from an authenticated peer.
 An unauthenticated claim is a development switch and stays off unless requested.
 A failed handshake does not enter the queue. A replay fails because the
 transcript includes this connection's fresh nonce. A send the transport does
-not accept stays pending as the same bytes. The proof is not create, owner,
-or delete authority.
+not accept stays pending as the same bytes. The proof authenticates a principal's
+initial self-create: writer, actor peer, creator, and initial owner must all be that
+principal before the request enters the queue. It does not grant later owner
+transfer or delete authority.
 A loaded record does not need a live connection.
 A local write is rejected before it is applied when its fields would not fit in
 one contribution packet, or when its one label would not fit in one state packet.
@@ -83,7 +85,9 @@ The actor and the sequence are on the record, not parsed from the operation id.
 An operation is resent only from an envelope this process still holds.
 Do not rebuild a multi-field operation from one stored field.
 Do not relay another writer's
-contribution. Do not fold creation, deletion, or owner into that packet. A full
+contribution. Create uses its original operation envelope and an immutable stored
+record; do not rebuild it from a field contribution. Do not fold creation, deletion,
+or owner into the contribution packet. A full
 queue is a visible refusal, not a silent send. Catch-up advances only while the
 connection works, a pump runs, and a slot frees. A packet dropped because the
 held queue is full needs another send. Projecting the resolved label is not a
@@ -164,6 +168,10 @@ counter, deletion, or sync semantics match Aether's contracts.
 
 - Creator, owner, original writer, actor session, and carrier are different roles.
   Preserve their meaning when adding authentication, relay, or recovery.
+- Create records the registered type, creator, initial owner, version, operation id,
+  and actor sequence. The creator is who issued Create, not who first appeared in a
+  local scene. A conflicting natural-key Create is rejected before mutation. An
+  Update may wait as raw state for Create; it never becomes Create.
 - Delete is terminal for an entity ID. Hide changes shared visibility. Withdraw
   changes one publication membership. Field writes and heartbeat do not restore them.
 - Compose the actual shared projection from deletion, visibility, and relevant

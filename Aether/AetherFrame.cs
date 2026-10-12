@@ -23,6 +23,7 @@ public struct AetherScratch
     public bool ResolvedDeleted;
     public bool ResolvedSharedVisible;
     public bool ResolvedMember;
+    public StoredEntity? ResolvedEntity;
     public string? SceneEntityKey;
     public string? LabelPropertyName;
     public string? SumPropertyName;
@@ -81,6 +82,7 @@ public static class AetherFrame
         public void Execute(ref AetherScratch scratch)
         {
             scratch.ResolvedDeleted = scratch.Reducer.IsDeleted(scratch.EntityId);
+            scratch.ResolvedEntity = scratch.Reducer.GetEntity(scratch.EntityId);
             scratch.ResolvedSharedVisible = scratch.Reducer.IsSharedVisible(scratch.EntityId);
             var publicationChosen = !string.IsNullOrEmpty(scratch.PublicationId);
             scratch.ResolvedMember = publicationChosen
@@ -108,6 +110,15 @@ public static class AetherFrame
             scratch.SceneCommits.Clear();
             if (string.IsNullOrEmpty(scratch.SceneEntityKey))
                 return;
+
+            if (scratch.ResolvedEntity is { } entity && !scratch.ResolvedDeleted)
+            {
+                scratch.SceneCommits.Add(new EnsureAetherEntityCommitRequest(
+                    entity.EntityTypeId,
+                    entity.EntityId,
+                    entity.CreatorId,
+                    entity.OwnerId));
+            }
 
             if (!string.IsNullOrEmpty(scratch.LabelPropertyName))
             {

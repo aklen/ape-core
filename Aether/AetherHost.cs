@@ -45,6 +45,10 @@ public sealed class AetherHost
         ArgumentNullException.ThrowIfNull(op);
         if (!BindsToPeer(op.WriterId, op.ActorId, principalId))
             return AetherAdmit.Refused("Actor is not on this connection.");
+        if (op.Effect == AetherEffect.CreateEntity
+            && (!string.Equals(op.CreatorId, principalId, StringComparison.Ordinal)
+                || !string.Equals(op.OwnerId, principalId, StringComparison.Ordinal)))
+            return AetherAdmit.Refused("Create is not owned by this connection.");
         return TryEnqueue(new Pending(op, null, Measure(op)));
     }
 
@@ -84,6 +88,19 @@ public sealed class AetherHost
         foreach (var (fieldId, value) in stored)
             bytes += Utf8(fieldId) + Utf8(value.Text) + 8;
         return TryEnqueue(new Pending(null, new LocalWrite(entityId, writerId, actorId, stored), bytes));
+    }
+
+    public AetherAdmit TryAcceptLocalCreate(
+        string entityId,
+        string entityTypeId,
+        string writerId,
+        string actorId)
+    {
+        var bytes = BaseBytes + Utf8(entityId) + Utf8(entityTypeId) + Utf8(writerId) + Utf8(actorId) + 16;
+        return TryEnqueue(new Pending(
+            null,
+            new LocalWrite(entityId, writerId, actorId, new Dictionary<string, FieldValue>(), entityTypeId),
+            bytes));
     }
 
     public IReadOnlyList<AetherOutcome> Drain() => Drain(int.MaxValue, int.MaxValue, beforeFold: null);
@@ -206,7 +223,16 @@ public sealed class AetherHost
 
     public static int Measure(AetherOperation op)
     {
-        var bytes = BaseBytes + Utf8(op.Id) + Utf8(op.EntityId) + Utf8(op.WriterId) + Utf8(op.ActorId) + Utf8(op.PublicationId) + 16;
+        var bytes = BaseBytes
+            + Utf8(op.Id)
+            + Utf8(op.EntityId)
+            + Utf8(op.WriterId)
+            + Utf8(op.ActorId)
+            + Utf8(op.PublicationId)
+            + Utf8(op.EntityTypeId)
+            + Utf8(op.CreatorId)
+            + Utf8(op.OwnerId)
+            + 16;
         foreach (var (fieldId, value) in op.Changes)
             bytes += Utf8(fieldId) + Utf8(value.Text) + 8;
         return bytes;
@@ -294,7 +320,9 @@ public sealed class AetherHost
                 var write = pending.Local!;
                 try
                 {
-                    stamped = Reducer.StampLocal(write.EntityId, write.WriterId, write.ActorId, write.Changes);
+                    stamped = write.EntityTypeId is null
+                        ? Reducer.StampLocal(write.EntityId, write.WriterId, write.ActorId, write.Changes)
+                        : Reducer.StampLocalCreate(write.EntityId, write.EntityTypeId, write.WriterId, write.ActorId);
                 }
                 catch (AetherProtocolException ex)
                 {
@@ -325,12 +353,18 @@ public sealed class AetherHost
 
     private static int Utf8(string? value) => value is null ? 0 : Encoding.UTF8.GetByteCount(value);
 
-    private sealed class LocalWrite(string entityId, string writerId, string actorId, Dictionary<string, FieldValue> changes)
+    private sealed class LocalWrite(
+        string entityId,
+        string writerId,
+        string actorId,
+        Dictionary<string, FieldValue> changes,
+        string? entityTypeId = null)
     {
         public string EntityId { get; } = entityId;
         public string WriterId { get; } = writerId;
         public string ActorId { get; } = actorId;
         public Dictionary<string, FieldValue> Changes { get; } = changes;
+        public string? EntityTypeId { get; } = entityTypeId;
     }
 
     private sealed class Pending

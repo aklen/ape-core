@@ -33,8 +33,11 @@ public sealed class AetherLabelLink : IDisposable
     private readonly Queue<UnidentifiedPacket> _unidentified = new();
     private int _unidentifiedBytes;
     private AetherOperation? _own;
+    private AetherOperation? _ownCreate;
     private byte[]? _contribution;
     private bool _catchUpPending;
+    private bool _createCatchUpSent;
+    private bool _labelCatchUpSent;
     private readonly FrozenPlan<AetherScratch> _plan;
     private PlanRuntime _runtime;
     private AetherScratch _scratch;
@@ -76,9 +79,12 @@ public sealed class AetherLabelLink : IDisposable
         _writerId = writerId ?? throw new ArgumentNullException(nameof(writerId));
         _actorId = AetherActorId.Format(writerId, sessionId);
         _fieldId = fieldId ?? throw new ArgumentNullException(nameof(fieldId));
-        if (scene.GetEntity(entityId) is not Replica replica)
-            throw new InvalidOperationException("The scene entity must already exist.");
-        replica.YieldPropertyToAether(labelPropertyName);
+        if (scene.GetEntity(entityId) is Replica replica)
+            replica.YieldPropertyToAether(labelPropertyName);
+
+        var storedCreate = host.Reducer.GetEntity(entityId);
+        if (storedCreate is not null && string.Equals(storedCreate.CreatorId, writerId, StringComparison.Ordinal))
+            _ownCreate = CreationOperation(storedCreate);
 
         _plan = AetherFrame.Compile();
         _runtime = new PlanRuntime();
@@ -120,17 +126,25 @@ public sealed class AetherLabelLink : IDisposable
         return admit;
     }
 
+    public AetherAdmit SubmitCreate(string entityTypeId)
+    {
+        ObjectDisposedException.ThrowIf(_stopped, this);
+        if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
+            return AetherAdmit.Full;
+        var admit = _host.TryAcceptLocalCreate(_entityId, entityTypeId, _writerId, _actorId);
+        if (admit.Kind == AetherAdmitKind.Queued)
+            _localIds.Add(admit.RequestId);
+        return admit;
+    }
+
     public void CatchUp()
     {
         ObjectDisposedException.ThrowIf(_stopped, this);
         _catchUpPending = true;
-        if (_own is not null)
-        {
-            ScheduleCatchUp();
-            Flush();
-            return;
-        }
-
+        _createCatchUpSent = _ownCreate is null;
+        _labelCatchUpSent = _own is null && OwnRecords().Count == 0;
+        ScheduleCatchUp();
+        Flush();
         ScheduleContribution();
         FlushContribution();
     }
@@ -147,6 +161,8 @@ public sealed class AetherLabelLink : IDisposable
             foreach (var request in _scratch.SceneCommits)
                 SceneCommitApplicator.Apply(_scene, request, _logger);
         }
+        if (_scene.GetEntity(_entityId) is Replica projected)
+            projected.YieldPropertyToAether(_scratch.LabelPropertyName ?? "Label");
 
         if (_scratch.Outcomes is not null)
         {
@@ -442,9 +458,17 @@ public sealed class AetherLabelLink : IDisposable
     private void Note(AetherOperation operation)
     {
         if (!string.Equals(operation.WriterId, _writerId, StringComparison.Ordinal)
-            || operation.Effect != AetherEffect.Write
-            || !operation.Changes.TryGetValue(_fieldId, out var value)
-            || !value.IsText)
+            || operation.Effect is not (AetherEffect.Write or AetherEffect.CreateEntity))
+            return;
+
+        if (operation.Effect == AetherEffect.CreateEntity)
+        {
+            if (_ownCreate is null
+                || new FieldVersion(operation.Lamport, operation.ActorId) > new FieldVersion(_ownCreate.Lamport, _ownCreate.ActorId))
+                _ownCreate = operation;
+            return;
+        }
+        if (!operation.Changes.TryGetValue(_fieldId, out var value) || !value.IsText)
             return;
 
         var version = new FieldVersion(operation.Lamport, operation.ActorId);
@@ -455,13 +479,16 @@ public sealed class AetherLabelLink : IDisposable
 
     private void ScheduleCatchUp()
     {
-        if (!_catchUpPending || _own is null)
+        if (!_catchUpPending)
             return;
-        if (_outgoing.Any(queued => queued.Id == _own.Id))
-            return;
-        if (_localIds.Count + _outgoing.Count + (_contribution is null ? 0 : 1) >= _maxOutgoing)
-            return;
-        _outgoing.Enqueue(_own);
+        if (!_createCatchUpSent && _ownCreate is not null
+            && !_outgoing.Any(queued => queued.Id == _ownCreate.Id)
+            && _localIds.Count + _outgoing.Count + (_contribution is null ? 0 : 1) < _maxOutgoing)
+            _outgoing.Enqueue(_ownCreate);
+        if (!_labelCatchUpSent && _own is not null
+            && !_outgoing.Any(queued => queued.Id == _own.Id)
+            && _localIds.Count + _outgoing.Count + (_contribution is null ? 0 : 1) < _maxOutgoing)
+            _outgoing.Enqueue(_own);
     }
 
     private void Flush()
@@ -471,7 +498,11 @@ public sealed class AetherLabelLink : IDisposable
             var operation = _outgoing.Peek();
             _network.Broadcast(AetherWire.Encode(operation), reliable: true);
             _outgoing.Dequeue();
+            if (_catchUpPending && _ownCreate is not null && operation.Id == _ownCreate.Id)
+                _createCatchUpSent = true;
             if (_catchUpPending && _own is not null && operation.Id == _own.Id)
+                _labelCatchUpSent = true;
+            if (_catchUpPending && _createCatchUpSent && _labelCatchUpSent)
                 _catchUpPending = false;
         }
     }
@@ -521,6 +552,19 @@ public sealed class AetherLabelLink : IDisposable
 
         return records;
     }
+
+    private static AetherOperation CreationOperation(StoredEntity entity) => new(
+        entity.OperationId,
+        entity.EntityId,
+        entity.CreatorId,
+        entity.Version.ActorId,
+        entity.Sequence,
+        entity.Version.Lamport,
+        new Dictionary<string, FieldValue>(),
+        AetherEffect.CreateEntity,
+        entityTypeId: entity.EntityTypeId,
+        creatorId: entity.CreatorId,
+        ownerId: entity.OwnerId);
 
     private readonly record struct HeldOperation(string PrincipalId, AetherOperation Operation);
 

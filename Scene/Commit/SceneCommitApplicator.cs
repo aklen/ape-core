@@ -1,6 +1,8 @@
 using Ape.Core.Determinism;
 using Ape.Core.Logging;
 using Ape.Core.Scene;
+using Ape.Core.Scene.Models;
+using Ape.Core.Replication;
 
 namespace Ape.Core.Scene.Commit;
 
@@ -76,6 +78,23 @@ public static class SceneCommitApplicator
                 scene.CreateRegisteredEntity(e.TypeId, e.Name, e.OwnerId);
                 logger?.LogDebug($"[SceneCommit] CreateRegisteredEntity typeId={e.TypeId} name={e.Name}");
                 break;
+            case EnsureAetherEntityCommitRequest e:
+            {
+                var existing = scene.GetEntity(e.Name);
+                if (existing is null)
+                {
+                    scene.CreateRegisteredEntity(e.TypeId, e.Name, e.OwnerId);
+                    logger?.LogDebug($"[SceneCommit] EnsureAetherEntity typeId={e.TypeId} name={e.Name}");
+                    break;
+                }
+
+                if (existing is not Entity entity
+                    || !string.Equals(entity.TypeId, e.TypeId, StringComparison.Ordinal)
+                    || existing is not Replica replica
+                    || !string.Equals(replica.OwnerId, e.OwnerId, StringComparison.Ordinal))
+                    throw new InvalidOperationException($"Scene entity '{e.Name}' conflicts with Aether creation metadata.");
+                break;
+            }
             case RemoveRegisteredEntityCommitRequest x:
                 scene.RemoveEntity(x.Name);
                 logger?.LogDebug($"[SceneCommit] RemoveEntity name={x.Name}");

@@ -12,7 +12,7 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    private const ushort FormatVersion = 5;
+    private const ushort FormatVersion = 6;
     private const byte ContributionRecord = 0x10;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;
@@ -127,10 +127,11 @@ public sealed class AetherArchive
         var deleted = ReadTexts(reader);
         var visibility = ReadVisibility(reader);
         var membership = ReadMembership(reader);
+        var entities = ReadEntities(reader);
         var cursors = ReadCursors(reader);
         reader.End();
 
-        reducer.MergeImage(new AetherImage(clock, fields, seen, deleted, visibility, membership));
+        reducer.MergeImage(new AetherImage(clock, fields, seen, deleted, visibility, membership, entities));
         reducer.RestoreSaveThrough(saveThrough);
         foreach (var cursor in cursors)
             reducer.RestoreActorSequence(cursor.ActorId, cursor.Sequence, cursor.Lamport, cursor.OperationId);
@@ -263,6 +264,32 @@ public sealed class AetherArchive
         return marks;
     }
 
+    private static List<StoredEntity> ReadEntities(Reader reader)
+    {
+        var count = reader.U32();
+        var entities = new List<StoredEntity>(checked((int)count));
+        for (var i = 0; i < count; i++)
+        {
+            var entityId = reader.Text();
+            var entityTypeId = reader.Text();
+            var creatorId = reader.Text();
+            var ownerId = reader.Text();
+            var version = new FieldVersion(reader.I64(), reader.Text());
+            var operationId = reader.Text();
+            var sequence = reader.I64();
+            entities.Add(new StoredEntity(
+                entityId,
+                entityTypeId,
+                creatorId,
+                ownerId,
+                version,
+                operationId,
+                sequence));
+        }
+
+        return entities;
+    }
+
     private static List<ActorCursor> ReadCursors(Reader reader)
     {
         var count = reader.U32();
@@ -331,6 +358,19 @@ public sealed class AetherArchive
             buffer.WriteByte(mark.Published ? (byte)1 : (byte)0);
         }
 
+        WriteU32(buffer, (uint)(image.Entities?.Count ?? 0));
+        foreach (var entity in image.Entities ?? [])
+        {
+            WriteText(buffer, entity.EntityId);
+            WriteText(buffer, entity.EntityTypeId);
+            WriteText(buffer, entity.CreatorId);
+            WriteText(buffer, entity.OwnerId);
+            WriteI64(buffer, entity.Version.Lamport);
+            WriteText(buffer, entity.Version.ActorId);
+            WriteText(buffer, entity.OperationId);
+            WriteI64(buffer, entity.Sequence);
+        }
+
         WriteU32(buffer, (uint)reducer.ActorCursors.Count);
         foreach (var cursor in reducer.ActorCursors)
         {
@@ -352,6 +392,9 @@ public sealed class AetherArchive
         WriteText(buffer, op.WriterId);
         WriteText(buffer, op.ActorId);
         WriteText(buffer, op.PublicationId ?? "");
+        WriteText(buffer, op.EntityTypeId ?? "");
+        WriteText(buffer, op.CreatorId ?? "");
+        WriteText(buffer, op.OwnerId ?? "");
         WriteI64(buffer, op.Sequence);
         WriteI64(buffer, op.Lamport);
         WriteU32(buffer, (uint)op.Changes.Count);
@@ -438,6 +481,9 @@ public sealed class AetherArchive
         var writerId = reader.Text();
         var actorId = reader.Text();
         var publicationId = reader.Text();
+        var entityTypeId = reader.Text();
+        var creatorId = reader.Text();
+        var ownerId = reader.Text();
         var sequence = reader.I64();
         var lamport = reader.I64();
         var count = reader.U32();
@@ -467,7 +513,10 @@ public sealed class AetherArchive
             lamport,
             changes,
             effect,
-            effect is AetherEffect.Publish or AetherEffect.WithdrawPublication ? publicationId : null), clock);
+            effect is AetherEffect.Publish or AetherEffect.WithdrawPublication ? publicationId : null,
+            effect == AetherEffect.CreateEntity ? entityTypeId : null,
+            effect == AetherEffect.CreateEntity ? creatorId : null,
+            effect == AetherEffect.CreateEntity ? ownerId : null), clock);
     }
 
     private static byte[] Finish(ReadOnlySpan<byte> magic, long generation, byte[] body)

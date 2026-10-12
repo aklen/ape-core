@@ -28,6 +28,11 @@ public sealed record SetSceneNodePropertyCommitRequest(string SceneKey, string P
 /// </summary>
 public sealed record CreateRegisteredEntityCommitRequest(string TypeId, string Name, string? OwnerId = null) : ISceneCommitRequest;
 
+/// <summary>
+/// Idempotently project an Aether entity. An existing entity must have the same immutable type and owner.
+/// </summary>
+public sealed record EnsureAetherEntityCommitRequest(string TypeId, string Name, string CreatorId, string OwnerId) : ISceneCommitRequest;
+
 /// <summary>Remove an entity by unique name (see <see cref="ISceneManager.RemoveEntity"/>).</summary>
 public sealed record RemoveRegisteredEntityCommitRequest(string Name) : ISceneCommitRequest;
 

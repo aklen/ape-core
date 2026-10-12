@@ -18,6 +18,7 @@ public sealed class AetherReducer
     private readonly HashSet<string> _deleted = new(StringComparer.Ordinal);
     private readonly Dictionary<string, VisibilityState> _visibility = new(StringComparer.Ordinal);
     private readonly Dictionary<MembershipKey, MembershipState> _membership = new();
+    private readonly Dictionary<string, StoredEntity> _entities = new(StringComparer.Ordinal);
     private long _clock;
     private long _saveSequence;
 
@@ -51,6 +52,9 @@ public sealed class AetherReducer
     public int RecordCount => _records.Count;
 
     public int DedupCount => _digests.Count;
+
+    public IReadOnlyList<StoredEntity> Entities =>
+        _entities.Values.OrderBy(entity => entity.EntityId, StringComparer.Ordinal).ToArray();
 
     public bool Remembers(string operationId) => _digests.ContainsKey(operationId);
 
@@ -122,6 +126,36 @@ public sealed class AetherReducer
         return stamped;
     }
 
+    public AetherOperation StampLocalCreate(
+        string entityId,
+        string entityTypeId,
+        string writerId,
+        string actorId)
+    {
+        if (string.IsNullOrEmpty(actorId))
+            throw new AetherProtocolException("Actor sequence is missing.");
+        var nextClock = NextClock(_clock);
+        var sequence = NextSequence(actorId);
+        var stamped = new AetherOperation(
+            $"{actorId}/{sequence.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
+            entityId,
+            writerId,
+            actorId,
+            sequence,
+            nextClock,
+            new Dictionary<string, FieldValue>(),
+            AetherEffect.CreateEntity,
+            entityTypeId: entityTypeId,
+            creatorId: writerId,
+            ownerId: writerId);
+        RejectBeforeAdmit(stamped);
+        AetherWire.Encode(stamped);
+        _clock = nextClock;
+        _nextSequence[actorId] = sequence;
+        _frontiers[actorId] = new ActorFrontier(sequence, nextClock, stamped.Id);
+        return stamped;
+    }
+
     /// <summary>
     /// Fold an operation. A newly admitted remote op sets the clock to max(clock, lamport) + 1,
     /// including when the remote Lamport is older. An exact duplicate still in the window leaves the clock alone.
@@ -184,6 +218,9 @@ public sealed class AetherReducer
                     return;
                 case AetherEffect.Publish:
                     RejectMembership(op.EntityId, op.PublicationId!, version, published: true);
+                    return;
+                case AetherEffect.CreateEntity:
+                    RejectCreation(op);
                     return;
                 default:
                     throw new AetherProtocolException($"Unknown effect '{op.Effect}'.");
@@ -362,6 +399,8 @@ public sealed class AetherReducer
             UpsertVisibility(mark.EntityId, mark.Version, mark.Hidden);
         foreach (var mark in folded.Membership)
             UpsertMembership(new MembershipKey(mark.EntityId, mark.PublicationId), mark.Version, mark.Published);
+        foreach (var entity in folded.Entities)
+            UpsertEntity(entity);
     }
 
     public AetherImage Capture()
@@ -381,7 +420,8 @@ public sealed class AetherReducer
             .ThenBy(pair => pair.Key.PublicationId, StringComparer.Ordinal)
             .Select(pair => new MembershipMark(pair.Key.EntityId, pair.Key.PublicationId, pair.Value.Version, pair.Value.Published))
             .ToArray();
-        return new AetherImage(_clock, fields, _seenOrder.ToArray(), deleted, visibility, membership);
+        var entities = _entities.Values.OrderBy(entity => entity.EntityId, StringComparer.Ordinal).ToArray();
+        return new AetherImage(_clock, fields, _seenOrder.ToArray(), deleted, visibility, membership, entities);
     }
 
     public void RestoreActorSequence(string actorId, long sequence, long lamport = 0, string? operationId = null)
@@ -404,6 +444,9 @@ public sealed class AetherReducer
     internal void RestoreClock(long clock) => _clock = clock;
 
     public bool IsDeleted(string entityId) => _deleted.Contains(entityId);
+
+    public StoredEntity? GetEntity(string entityId) =>
+        _entities.TryGetValue(entityId, out var entity) ? entity : null;
 
     public bool IsSharedVisible(string entityId) =>
         !_visibility.TryGetValue(entityId, out var state) || !state.Hidden;
@@ -484,6 +527,11 @@ public sealed class AetherReducer
                 Admit(op, observeClock);
                 UpsertMembership(new MembershipKey(op.EntityId, op.PublicationId!), version, published: true);
                 return;
+            case AetherEffect.CreateEntity:
+                RejectCreation(op);
+                Admit(op, observeClock);
+                UpsertEntity(EntityFrom(op));
+                return;
             default:
                 throw new AetherProtocolException($"Unknown effect '{op.Effect}'.");
         }
@@ -543,7 +591,95 @@ public sealed class AetherReducer
             folded.Add(winner!);
         }
 
-        return new FoldedImage(folded, FoldDeleted(image.Deleted), FoldVisibility(image.Visibility), FoldMembership(image.Membership));
+        return new FoldedImage(
+            folded,
+            FoldDeleted(image.Deleted),
+            FoldVisibility(image.Visibility),
+            FoldMembership(image.Membership),
+            FoldEntities(image.Entities));
+    }
+
+    private List<StoredEntity> FoldEntities(IReadOnlyList<StoredEntity>? rows)
+    {
+        var folded = new Dictionary<string, StoredEntity>(StringComparer.Ordinal);
+        foreach (var row in rows ?? [])
+        {
+            RequireCreation(row);
+            if (_entities.TryGetValue(row.EntityId, out var existing))
+                RejectEntityConflict(existing, row);
+            if (folded.TryGetValue(row.EntityId, out var prior))
+            {
+                RejectEntityConflict(prior, row);
+                if (row.Version > prior.Version)
+                    folded[row.EntityId] = row;
+            }
+            else
+            {
+                folded[row.EntityId] = row;
+            }
+        }
+
+        return folded.Values.ToList();
+    }
+
+    private void RejectCreation(AetherOperation op)
+    {
+        if (!string.Equals(op.WriterId, op.CreatorId, StringComparison.Ordinal)
+            || !string.Equals(op.WriterId, op.OwnerId, StringComparison.Ordinal))
+            throw new AetherProtocolException("Create creator and owner must be its writer.");
+        var candidate = EntityFrom(op);
+        RequireCreation(candidate);
+        if (_entities.TryGetValue(op.EntityId, out var existing))
+            RejectEntityConflict(existing, candidate);
+    }
+
+    private static StoredEntity EntityFrom(AetherOperation op) => new(
+        op.EntityId,
+        op.EntityTypeId!,
+        op.CreatorId!,
+        op.OwnerId!,
+        new FieldVersion(op.Lamport, op.ActorId),
+        op.Id,
+        op.Sequence);
+
+    private static void RequireCreation(StoredEntity entity)
+    {
+        if (string.IsNullOrEmpty(entity.EntityId)
+            || string.IsNullOrEmpty(entity.EntityTypeId)
+            || string.IsNullOrEmpty(entity.CreatorId)
+            || string.IsNullOrEmpty(entity.OwnerId)
+            || string.IsNullOrEmpty(entity.Version.ActorId)
+            || string.IsNullOrEmpty(entity.OperationId)
+            || entity.Sequence < 1)
+            throw new AetherProtocolException("Creation metadata is missing.");
+        if (!string.Equals(entity.CreatorId, entity.OwnerId, StringComparison.Ordinal))
+            throw new AetherProtocolException("Create creator and owner must match.");
+        if (!AetherActorId.TryParse(entity.Version.ActorId, out var actor)
+            || !string.Equals(actor.PeerId, entity.CreatorId, StringComparison.Ordinal))
+            throw new AetherProtocolException("Create actor is not its creator.");
+    }
+
+    private static void RejectEntityConflict(StoredEntity existing, StoredEntity candidate)
+    {
+        if (!string.Equals(existing.EntityTypeId, candidate.EntityTypeId, StringComparison.Ordinal)
+            || !string.Equals(existing.CreatorId, candidate.CreatorId, StringComparison.Ordinal)
+            || !string.Equals(existing.OwnerId, candidate.OwnerId, StringComparison.Ordinal))
+            throw new AetherProtocolException($"Entity '{candidate.EntityId}' has conflicting creation metadata.");
+        if (existing.Version.CompareTo(candidate.Version) == 0
+            && (existing.Sequence != candidate.Sequence
+                || !string.Equals(existing.OperationId, candidate.OperationId, StringComparison.Ordinal)))
+            throw new AetherProtocolException($"Entity '{candidate.EntityId}' has a creation version collision.");
+    }
+
+    private void UpsertEntity(StoredEntity entity)
+    {
+        if (_entities.TryGetValue(entity.EntityId, out var existing))
+        {
+            RejectEntityConflict(existing, entity);
+            if (entity.Version.CompareTo(existing.Version) <= 0)
+                return;
+        }
+        _entities[entity.EntityId] = entity;
     }
 
     private static List<string> FoldDeleted(IReadOnlyList<string>? deleted)
@@ -877,7 +1013,8 @@ public sealed class AetherReducer
         List<StoredField> Fields,
         List<string> Deleted,
         List<VisibilityMark> Visibility,
-        List<MembershipMark> Membership);
+        List<MembershipMark> Membership,
+        List<StoredEntity> Entities);
 }
 
 public readonly record struct FieldDefinition(string Id, string Resolver, long Min, long Max);
@@ -891,6 +1028,15 @@ public sealed record StoredField(
     FieldValue Value,
     FieldVersion Version,
     string WriterId,
+    string OperationId,
+    long Sequence);
+
+public sealed record StoredEntity(
+    string EntityId,
+    string EntityTypeId,
+    string CreatorId,
+    string OwnerId,
+    FieldVersion Version,
     string OperationId,
     long Sequence);
 
@@ -920,4 +1066,5 @@ public sealed record AetherImage(
     IReadOnlyList<SeenOperation> Seen,
     IReadOnlyList<string>? Deleted = null,
     IReadOnlyList<VisibilityMark>? Visibility = null,
-    IReadOnlyList<MembershipMark>? Membership = null);
+    IReadOnlyList<MembershipMark>? Membership = null,
+    IReadOnlyList<StoredEntity>? Entities = null);

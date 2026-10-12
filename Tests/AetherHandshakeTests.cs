@@ -20,6 +20,77 @@ namespace Ape.Core.Tests;
 public sealed class AetherHandshakeTests
 {
     [Fact]
+    public void Authenticated_create_builds_the_registered_entity_on_the_remote_scene()
+    {
+        var time = new ManualTime();
+        using var leftDir = new TempDir();
+        using var rightDir = new TempDir();
+        using var left = Side.Create(leftDir.Path, time);
+        using var right = Side.Create(rightDir.Path, time);
+        var leftServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var rightServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var leftScene = leftServices.GetRequiredService<ISceneManager>();
+        var rightScene = rightServices.GetRequiredService<ISceneManager>();
+        var leftStore = Store();
+        var rightStore = Store();
+        var leftHost = new AetherHost(leftStore, 4096, 8);
+        var rightHost = new AetherHost(rightStore, 4096, 8);
+        using var leftLink = new AetherLabelLink(
+            left.Network,
+            leftHost,
+            leftScene,
+            leftServices.GetRequiredService<ILogger>(),
+            "entity-1",
+            left.Principal.Id,
+            "session-1",
+            "catalog");
+        using var rightLink = new AetherLabelLink(
+            right.Network,
+            rightHost,
+            rightScene,
+            rightServices.GetRequiredService<ILogger>(),
+            "entity-1",
+            right.Principal.Id,
+            "session-1",
+            "catalog");
+        Exchange(left, right);
+
+        Assert.Equal(AetherAdmitKind.Queued, leftLink.SubmitCreate(TestStubEntity.RegistryTypeId).Kind);
+        leftLink.Pump();
+        var packet = Assert.Single(left.Transport.Sent);
+        Assert.Equal(AetherWire.CreateType, packet[0]);
+        right.Receive(packet);
+        Assert.Equal(AetherAdmitKind.Queued, rightLink.LastRemoteAdmit!.Value.Kind);
+        rightLink.Pump();
+
+        var projected = Assert.IsType<TestStubEntity>(rightScene.GetEntity("entity-1"));
+        Assert.Equal(left.Principal.Id, ((Ape.Core.Replication.Replica)projected).OwnerId);
+        var stored = Assert.Single(rightStore.Entities);
+        Assert.Equal(left.Principal.Id, stored.CreatorId);
+        Assert.Equal(left.Principal.Id, stored.OwnerId);
+        Assert.True(right.Network.TryGetPeer(right.Slot, out var peer));
+        Assert.True(peer.IsAuthenticated);
+
+        using var archiveDir = new TempDir();
+        var archive = new AetherArchive(archiveDir.Path);
+        archive.Save(leftStore);
+        leftLink.Dispose();
+        left.Transport.Sent.Clear();
+        var restartedHost = new AetherHost(archive.Load(), 4096, 8);
+        using var restartedLink = new AetherLabelLink(
+            left.Network,
+            restartedHost,
+            leftScene,
+            leftServices.GetRequiredService<ILogger>(),
+            "entity-1",
+            left.Principal.Id,
+            "session-2",
+            "catalog");
+        restartedLink.CatchUp();
+        Assert.Equal(packet, Assert.Single(left.Transport.Sent));
+    }
+
+    [Fact]
     public void A_mutual_handshake_authenticates_both_peers()
     {
         var time = new ManualTime();
@@ -776,6 +847,13 @@ public sealed class AetherHandshakeTests
         left.Receive(rightProof);
         right.Receive(leftProof);
         return new Completed(leftSlot, leftHello, rightHello, leftProof, rightProof);
+    }
+
+    private static AetherReducer Store()
+    {
+        var reducer = new AetherReducer();
+        reducer.DefineField("label", "lww");
+        return reducer;
     }
 
     private static byte[] Proof(DurablePrincipal signer, byte[] peerHello, byte[] signerNonce)
