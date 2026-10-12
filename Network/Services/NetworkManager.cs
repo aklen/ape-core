@@ -20,7 +20,7 @@ namespace Ape.Core.Network.Services;
 [SupportedOSPlatform("linux")]
 [SupportedOSPlatform("macos")]
 [SupportedOSPlatform("windows")]
-public class NetworkManager : INetworkManager, ICoreService
+public class NetworkManager : INetworkManager, ICoreService, IDisposable
 {
     public string ServiceId => "core-network-manager";
     public string Name => "Network Manager";
@@ -28,17 +28,26 @@ public class NetworkManager : INetworkManager, ICoreService
     private ILogger? _logger;
     private IEventManager _eventManager = null!;      // Set in Initialize()
     private readonly INetworkTransport _transport;
+    private readonly object _peersGate = new();
+    private readonly Dictionary<string, PeerConnectionContext> _peers = new(StringComparer.Ordinal);
+    private readonly DurablePrincipal? _profile;
     private string _role = String.Empty;
 
     public event Action<string, byte[]>? OnDataReceived;
     public event Action<string>? OnPeerConnected;
     public event Action<string>? OnPeerDisconnected;
+    public event Action<PeerConnectionContext>? OnPeerIdentified;
 
     /// <summary>
     /// Local peer ID for this instance.
     /// Unique identifier (GUID or transport-assigned). Used for replica ownership tracking.
     /// </summary>
     public string LocalPeerId => _transport.LocalPeerId;
+
+    /// <summary>
+    /// Durable writer id. The hello sends this. <see cref="LocalPeerId"/> stays the process instance.
+    /// </summary>
+    public string PrincipalId { get; }
 
     /// <summary>
     /// Network role of this instance ("server", "client", "peer").
@@ -50,7 +59,7 @@ public class NetworkManager : INetworkManager, ICoreService
     /// Transport must be created at construction time (not in Initialize).
     /// Logger will be resolved from DI in Initialize().
     /// </summary>
-    public NetworkManager(string transportType = "litenetlib")
+    public NetworkManager(string transportType = "litenetlib", string? profileDirectory = null)
     {
         // Temporary logger until DI provides the real one
         var tempLogger = new LogManager("console");
@@ -64,28 +73,91 @@ public class NetworkManager : INetworkManager, ICoreService
             _ => throw new ArgumentException($"Unknown transport type: {transportType}")
         };
         _transport = transport;
+        if (string.IsNullOrEmpty(profileDirectory))
+            PrincipalId = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(DurablePrincipal.ByteLength)).ToLowerInvariant();
+        else
+        {
+            _profile = DurablePrincipal.Open(profileDirectory);
+            PrincipalId = _profile.Id;
+        }
+
         Wire();
 
         tempLogger.LogDebug($"NetworkManager initialized with {transportType} transport");
     }
 
-    internal NetworkManager(INetworkTransport transport)
+    internal NetworkManager(INetworkTransport transport, string? principalId = null)
     {
         ArgumentNullException.ThrowIfNull(transport);
         _transport = transport;
+        PrincipalId = string.IsNullOrEmpty(principalId) ? transport.LocalPeerId : principalId;
         Wire();
     }
 
     private void Wire()
     {
-        _transport.OnDataReceived += (peerId, data, length) =>
+        _transport.OnDataReceived += (connectionId, data, length) =>
         {
+            if (length >= 2 && PeerHello.HasMarker(data.AsSpan(0, length)))
+            {
+                if (length > PeerHello.MaxBytes)
+                    return;
+                var hello = new byte[length];
+                Array.Copy(data, hello, length);
+                if (PeerHello.TryDecode(hello, out var principal))
+                    Bind(connectionId, principal);
+                return;
+            }
+
             var buffer = new byte[length];
             Array.Copy(data, buffer, length);
-            OnDataReceived?.Invoke(peerId, buffer);
+            OnDataReceived?.Invoke(connectionId, buffer);
         };
-        _transport.OnPeerConnected += peerId => OnPeerConnected?.Invoke(peerId);
-        _transport.OnPeerDisconnected += peerId => OnPeerDisconnected?.Invoke(peerId);
+        _transport.OnPeerConnected += connectionId =>
+        {
+            try
+            {
+                _transport.SendReliable(connectionId, PeerHello.Encode(PrincipalId));
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning($"[NetworkManager] Peer hello was not sent: {ex.Message}");
+            }
+
+            OnPeerConnected?.Invoke(connectionId);
+        };
+        _transport.OnPeerDisconnected += connectionId =>
+        {
+            lock (_peersGate)
+                _peers.Remove(connectionId);
+            OnPeerDisconnected?.Invoke(connectionId);
+        };
+    }
+
+    public bool TryGetPeer(string connectionId, out PeerConnectionContext peer)
+    {
+        lock (_peersGate)
+            return _peers.TryGetValue(connectionId, out peer);
+    }
+
+    private void Bind(string connectionId, string principal)
+    {
+        PeerConnectionContext bound;
+        lock (_peersGate)
+        {
+            if (_peers.TryGetValue(connectionId, out var existing))
+                return;
+            foreach (var peer in _peers.Values)
+            {
+                if (string.Equals(peer.PrincipalId, principal, StringComparison.Ordinal))
+                    return;
+            }
+
+            bound = new PeerConnectionContext(connectionId, principal, IsAuthenticated: false);
+            _peers[connectionId] = bound;
+        }
+
+        OnPeerIdentified?.Invoke(bound);
     }
 
     // ICoreService implementation
@@ -126,6 +198,13 @@ public class NetworkManager : INetworkManager, ICoreService
     public void Stop()
     {
         _transport.Stop();
+        lock (_peersGate)
+            _peers.Clear();
+    }
+
+    public void Dispose()
+    {
+        _profile?.Dispose();
     }
 
     public void Broadcast(byte[] data, bool reliable = true)

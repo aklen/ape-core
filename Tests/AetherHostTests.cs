@@ -12,7 +12,7 @@ public sealed class AetherHostTests
         var remote = Remote("cube");
         var host = new AetherHost(store, AetherHost.Measure(remote) - 1, 8);
 
-        var refused = host.TryAcceptRemote(remote);
+        var refused = host.TryAcceptRemote(remote, remote.WriterId);
         Assert.Equal(AetherAdmitKind.Full, refused.Kind);
         Assert.Equal(0, refused.RequestId);
         Assert.Equal(0, host.PendingBytes);
@@ -20,8 +20,8 @@ public sealed class AetherHostTests
         Assert.Equal(0, store.RecordCount);
 
         var room = new AetherHost(store, AetherHost.Measure(remote), 8);
-        Assert.Equal(AetherAdmitKind.Queued, room.TryAcceptRemote(remote).Kind);
-        var later = room.TryAcceptRemote(Remote("later"));
+        Assert.Equal(AetherAdmitKind.Queued, room.TryAcceptRemote(remote, remote.WriterId).Kind);
+        var later = room.TryAcceptRemote(Remote("later"), "peer-B");
         Assert.Equal(AetherAdmitKind.Full, later.Kind);
         Assert.Equal(0, later.RequestId);
         Assert.Equal(AetherHost.Measure(remote), room.PendingBytes);
@@ -37,7 +37,7 @@ public sealed class AetherHostTests
         archive.Save(store);
         var remote = Remote("cube");
         var host = new AetherHost(store, 4096, 8);
-        var remoteId = host.TryAcceptRemote(remote);
+        var remoteId = host.TryAcceptRemote(remote, remote.WriterId);
         var localId = host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
         {
             ["label"] = FieldValue.Label("box"),
@@ -52,7 +52,7 @@ public sealed class AetherHostTests
         Assert.All(drained, outcome => Assert.Equal(AetherOutcomeKind.Applied, outcome.Kind));
         Assert.Equal(12, store.Clock);
         Assert.Equal("box", store.ResolveLww("entity-1", "label")?.Text);
-        Assert.Equal(1, store.ActorCursors.Single(cursor => cursor.ActorId == "peer-B/s1").Sequence);
+        Assert.Equal(1, store.ActorCursors.Single(cursor => cursor.ActorId == AetherActorId.Format("peer-B", "s1")).Sequence);
         Assert.Equal(1, store.ActorCursors.Single(cursor => cursor.ActorId == "peer-A/s1").Sequence);
 
         var durable = host.Commit(archive);
@@ -76,7 +76,7 @@ public sealed class AetherHostTests
         var archive = new AetherArchive(dir.Path);
         var store = NewStore();
         var host = new AetherHost(store, 4096, 8);
-        var queued = host.TryAcceptRemote(Remote("cube"));
+        var queued = host.TryAcceptRemote(Remote("cube"), "peer-B");
         var drained = host.Drain();
         Assert.Equal(AetherOutcomeKind.Applied, Assert.Single(drained).Kind);
         var durable = host.Save(archive);
@@ -149,11 +149,11 @@ public sealed class AetherHostTests
             "bad",
             "entity-1",
             "peer-B",
-            "peer-B/s1",
+            AetherActorId.Format("peer-B", "s1"),
             0,
             10,
-            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("nope") })).Kind);
-        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(Remote("yes")).Kind);
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("nope") }), "peer-B").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(Remote("yes"), "peer-B").Kind);
 
         var drained = host.Drain();
         Assert.Equal("Actor sequence is missing.", drained[0].Reason);
@@ -232,11 +232,11 @@ public sealed class AetherHostTests
             "bad",
             "entity-1",
             "peer-B",
-            "peer-B/s1",
+            AetherActorId.Format("peer-B", "s1"),
             1,
             10,
-            new Dictionary<string, FieldValue> { ["label"] = FieldValue.FixedPoint(4) })).Kind);
-        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(Remote("yes")).Kind);
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.FixedPoint(4) }), "peer-B").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(Remote("yes"), "peer-B").Kind);
 
         var drained = host.Drain();
         host.Drain();
@@ -398,7 +398,7 @@ public sealed class AetherHostTests
 
         var fresh = new AetherHost(NewStore(), 4096, 8);
         archive.Save(fresh.Reducer);
-        Assert.Equal(AetherAdmitKind.Queued, fresh.TryAcceptRemote(Remote("cube")).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, fresh.TryAcceptRemote(Remote("cube"), "peer-B").Kind);
         fresh.Drain();
         var io = Assert.Throws<IOException>(() => fresh.Commit(_ => throw new IOException("disk full")));
         Assert.Equal("disk full", io.Message);
@@ -448,6 +448,37 @@ public sealed class AetherHostTests
     }
 
     [Fact]
+    public void A_multi_field_write_over_the_packet_limit_is_rejected_before_apply()
+    {
+        var store = NewStore();
+        store.DefineField("note", "lww");
+        var host = new AetherHost(store, 1_000_000, 8);
+        var huge = new string('x', 70_000);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label(huge),
+            ["note"] = FieldValue.Label("n"),
+        }).Kind);
+        var rejected = Assert.Single(host.Drain());
+        Assert.Equal(AetherOutcomeKind.Rejected, rejected.Kind);
+        Assert.Equal(AetherWire.PacketTooLarge, rejected.Reason);
+        Assert.Equal(0, store.Clock);
+        Assert.Equal(0, store.RecordCount);
+        Assert.Empty(store.ActorCursors);
+
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
+        {
+            ["label"] = FieldValue.Label("ok"),
+            ["note"] = FieldValue.Label("n"),
+        }).Kind);
+        Assert.Equal(AetherOutcomeKind.Applied, Assert.Single(host.Drain()).Kind);
+        Assert.Equal(1, store.Clock);
+        Assert.Equal(2, store.RecordCount);
+        Assert.Equal("ok", store.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal("n", store.ResolveLww("entity-1", "note")?.Text);
+    }
+
+    [Fact]
     public void A_drain_retry_applies_a_stamp_that_already_moved_the_clock()
     {
         var store = NewStore();
@@ -493,13 +524,13 @@ public sealed class AetherHostTests
             "peer-C/s1/two",
             "entity-1",
             "peer-C",
-            "peer-C/s1",
+            AetherActorId.Format("peer-C", "s1"),
             1,
             11,
             new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("two") });
         var host = new AetherHost(store, 4096, 8);
-        host.TryAcceptRemote(first);
-        host.TryAcceptRemote(second);
+        host.TryAcceptRemote(first, "peer-B");
+        host.TryAcceptRemote(second, "peer-C");
 
         var drained = host.Drain(8, AetherHost.Measure(first));
         Assert.Equal(first.Id, Assert.Single(drained).Result!.Value.Operation.Id);
@@ -522,13 +553,13 @@ public sealed class AetherHostTests
             "peer-C/s1/next",
             "entity-1",
             "peer-C",
-            "peer-C/s1",
+            AetherActorId.Format("peer-C", "s1"),
             1,
             11,
             new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("next") });
         var host = new AetherHost(store, AetherHost.Measure(wide) + AetherHost.Measure(next), 8);
-        host.TryAcceptRemote(wide);
-        host.TryAcceptRemote(next);
+        host.TryAcceptRemote(wide, "peer-B");
+        host.TryAcceptRemote(next, "peer-C");
 
         var drained = host.Drain(8, 1);
         Assert.Equal(wide.Id, Assert.Single(drained).Result!.Value.Operation.Id);
@@ -569,7 +600,7 @@ public sealed class AetherHostTests
     {
         var store = NewStore();
         var host = new AetherHost(store, 4096, 8);
-        host.TryAcceptRemote(Remote("one"));
+        host.TryAcceptRemote(Remote("one"), "peer-B");
 
         Assert.Throws<ArgumentOutOfRangeException>(() => host.Drain(0, 8));
         Assert.Throws<ArgumentOutOfRangeException>(() => host.Drain(1, 0));
@@ -585,7 +616,7 @@ public sealed class AetherHostTests
     }
 
     private static AetherOperation Remote(string label) =>
-        new($"peer-B/s1/{label}", "entity-1", "peer-B", "peer-B/s1", 1, 10, new Dictionary<string, FieldValue>
+        new($"peer-B/s1/{label}", "entity-1", "peer-B", AetherActorId.Format("peer-B", "s1"), 1, 10, new Dictionary<string, FieldValue>
         {
             ["label"] = FieldValue.Label(label),
         });

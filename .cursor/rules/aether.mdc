@@ -44,7 +44,21 @@ An inconsistent claim is rejected before the clock, the records, or the frontier
 An admitted operation records that same frontier. The check happens before the write.
 A missing actor id or a sequence below 1 is rejected before any change.
 A sequence-only restore does not replace a recorded frontier.
-Authenticating the actor is not this slice.
+A remote write or contribution is admitted only when its writer and its actor peer
+are the principal bound to the delivering connection. The actor text is length-prefixed
+principal and session. A prefix match is not enough. Relay is refused. The check
+happens before the queue. The socket slot only routes. The process instance id can
+change on every start. The durable principal is a 256-bit id in an explicit profile
+directory. One process holds that profile. One profile is the whole configuration
+directory. The file has a magic, a version, and a checksum. A damaged file does
+not open. It is not a signature, so create, owner, and delete do not use it yet.
+A loaded record does not need a live connection.
+A local write is rejected before it is applied when its fields would not fit in
+one contribution packet, or when its one label would not fit in one state packet.
+The encoded size is counted before the payload is copied.
+A state packet and a contribution count are rejected before a field array is built
+when they pass the protocol maximum. Packets waiting for a principal are capped
+by count and by bytes.
 An unchanged merge is not appended.
 The actor and the sequence are on the record, not parsed from the operation id.
 An operation is resent only from an envelope this process still holds.

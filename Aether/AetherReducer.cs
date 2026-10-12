@@ -115,6 +115,7 @@ public sealed class AetherReducer
             nextClock,
             changes);
         RejectBeforeAdmit(stamped);
+        RejectOversizedWrite(stamped);
         _clock = nextClock;
         _nextSequence[actorId] = sequence;
         _frontiers[actorId] = new ActorFrontier(sequence, nextClock, stamped.Id);
@@ -197,6 +198,28 @@ public sealed class AetherReducer
             if (_records.TryGetValue(key, out var existing) && existing.Version.CompareTo(writeVersion) == 0 && existing.Value != value)
                 throw new AetherProtocolException($"Version collision on '{fieldId}'.");
         }
+    }
+
+    private static void RejectOversizedWrite(AetherOperation op)
+    {
+        if (op.Effect != AetherEffect.Write || op.Changes.Count == 0)
+            return;
+        var fields = new StoredField[op.Changes.Count];
+        var index = 0;
+        foreach (var (fieldId, value) in op.Changes)
+        {
+            fields[index++] = new StoredField(
+                new RecordKey(op.EntityId, op.WriterId, fieldId),
+                value,
+                new FieldVersion(op.Lamport, op.ActorId),
+                op.WriterId,
+                op.Id,
+                op.Sequence);
+        }
+
+        AetherWire.EncodeContributions(fields);
+        if (op.Changes.Count == 1 && fields[0].Value.IsText)
+            AetherWire.Encode(op);
     }
 
     /// <summary>How far the save sequence has moved. A snapshot covers every application up to this place.</summary>

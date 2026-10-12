@@ -7,11 +7,15 @@ namespace Ape.Core.Network;
 public interface INetworkManager
 {
     /// <summary>
-    /// Local peer ID for this instance.
-    /// Unique identifier for this peer in the network. Can be a GUID, or assigned by transport (e.g., RakNet PeerID).
-    /// Used for replica ownership tracking. Server generates this on startup, clients may receive from STUN server.
+    /// Process instance id. It can change on every start and is not the writer id.
     /// </summary>
     string LocalPeerId { get; }
+
+    /// <summary>
+    /// Durable writer id loaded from disk. The hello sends this, not <see cref="LocalPeerId"/>.
+    /// A stored 256-bit id is not a signature. Create, owner, and delete authority do not use it.
+    /// </summary>
+    string PrincipalId { get; }
 
     /// <summary>
     /// Network role of this instance ("server", "client", "peer").
@@ -75,6 +79,18 @@ public interface INetworkManager
     /// Fired when a peer disconnects.
     /// </summary>
     event Action<string>? OnPeerDisconnected;
+
+    /// <summary>
+    /// Fired when a connection first binds the remote durable principal.
+    /// A later claim on that same connection does not fire.
+    /// </summary>
+    event Action<PeerConnectionContext>? OnPeerIdentified;
+
+    /// <summary>
+    /// The principal claimed for a live connection.
+    /// The connection id remains the socket slot used for sending.
+    /// </summary>
+    bool TryGetPeer(string connectionId, out PeerConnectionContext peer);
 
     /// <summary>
     /// Get all currently connected peer IDs.

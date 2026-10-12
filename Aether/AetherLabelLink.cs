@@ -22,10 +22,13 @@ public sealed class AetherLabelLink : IDisposable
     private readonly string _actorId;
     private readonly string _fieldId;
     private readonly int _maxOutgoing;
+    private readonly int _maxUnidentifiedBytes;
     private readonly HashSet<long> _localIds = new();
     private readonly Queue<AetherOperation> _outgoing = new();
-    private readonly Queue<AetherOperation> _held = new();
-    private readonly Queue<IReadOnlyList<StoredField>> _heldContributions = new();
+    private readonly Queue<HeldOperation> _held = new();
+    private readonly Queue<HeldContribution> _heldContributions = new();
+    private readonly Queue<UnidentifiedPacket> _unidentified = new();
+    private int _unidentifiedBytes;
     private AetherOperation? _own;
     private byte[]? _contribution;
     private bool _catchUpPending;
@@ -41,22 +44,26 @@ public sealed class AetherLabelLink : IDisposable
         ILogger logger,
         string entityId,
         string writerId,
-        string actorId,
+        string sessionId,
         string publicationId,
         string fieldId = "label",
         string labelPropertyName = "Label",
-        int maxOutgoing = 64)
+        int maxOutgoing = 64,
+        int maxUnidentifiedBytes = 65_536)
     {
         if (maxOutgoing < 1)
             throw new ArgumentOutOfRangeException(nameof(maxOutgoing));
+        if (maxUnidentifiedBytes < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxUnidentifiedBytes));
         _maxOutgoing = maxOutgoing;
+        _maxUnidentifiedBytes = maxUnidentifiedBytes;
         _network = network ?? throw new ArgumentNullException(nameof(network));
         _host = host ?? throw new ArgumentNullException(nameof(host));
         _scene = scene ?? throw new ArgumentNullException(nameof(scene));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _entityId = entityId ?? throw new ArgumentNullException(nameof(entityId));
         _writerId = writerId ?? throw new ArgumentNullException(nameof(writerId));
-        _actorId = actorId ?? throw new ArgumentNullException(nameof(actorId));
+        _actorId = AetherActorId.Format(writerId, sessionId);
         _fieldId = fieldId ?? throw new ArgumentNullException(nameof(fieldId));
         if (scene.GetEntity(entityId) is not Replica replica)
             throw new InvalidOperationException("The scene entity must already exist.");
@@ -79,6 +86,8 @@ public sealed class AetherLabelLink : IDisposable
         };
         network.OnDataReceived += OnData;
         network.OnPeerConnected += OnPeerConnected;
+        network.OnPeerDisconnected += OnPeerDisconnected;
+        network.OnPeerIdentified += OnPeerIdentified;
     }
 
     public AetherAdmit? LastRemoteAdmit { get; private set; }
@@ -154,32 +163,156 @@ public sealed class AetherLabelLink : IDisposable
             return;
         _stopped = true;
         _network.OnPeerConnected -= OnPeerConnected;
+        _network.OnPeerDisconnected -= OnPeerDisconnected;
+        _network.OnPeerIdentified -= OnPeerIdentified;
         _network.OnDataReceived -= OnData;
     }
 
-    private void OnData(string peerId, byte[] data)
+    private void OnData(string connectionId, byte[] data)
     {
         if (_stopped || !AetherWire.IsStatePacket(data))
             return;
-        if (AetherWire.IsContributionPacket(data))
+        if (data.Length > AetherWire.MaxPacketBytes)
         {
-            HoldContribution(data);
+            LastRemoteFault = AetherWire.PacketTooLarge;
+            LastRemoteAdmit = null;
             return;
         }
-        if (!AetherWire.TryDecode(data, _entityId, _fieldId, out var operation, out var fault))
+        if (!TryReadRemote(data, out var operation, out var fields))
+            return;
+        if (!_network.TryGetPeer(connectionId, out var peer))
         {
-            LastRemoteFault = fault;
-            LastRemoteAdmit = null;
+            HoldUntilIdentified(connectionId, data);
+            return;
+        }
+
+        AcceptRemote(peer.PrincipalId, operation, fields);
+    }
+
+    private void OnPeerConnected(string peerId) => CatchUp();
+
+    private void OnPeerDisconnected(string connectionId)
+    {
+        if (_stopped)
+            return;
+        var kept = new Queue<UnidentifiedPacket>();
+        while (_unidentified.Count > 0)
+        {
+            var held = _unidentified.Dequeue();
+            if (string.Equals(held.ConnectionId, connectionId, StringComparison.Ordinal))
+            {
+                _unidentifiedBytes -= held.Data.Length;
+                continue;
+            }
+
+            kept.Enqueue(held);
+        }
+
+        while (kept.Count > 0)
+            _unidentified.Enqueue(kept.Dequeue());
+    }
+
+    private void OnPeerIdentified(PeerConnectionContext peer)
+    {
+        if (_stopped)
+            return;
+        var waiting = _unidentified.Count;
+        for (var i = 0; i < waiting; i++)
+        {
+            var held = _unidentified.Dequeue();
+            if (!string.Equals(held.ConnectionId, peer.ConnectionId, StringComparison.Ordinal))
+            {
+                _unidentified.Enqueue(held);
+                continue;
+            }
+
+            _unidentifiedBytes -= held.Data.Length;
+            if (!TryReadRemote(held.Data, out var operation, out var fields))
+                continue;
+            AcceptRemote(peer.PrincipalId, operation, fields);
+        }
+    }
+
+    private void HoldUntilIdentified(string connectionId, byte[] data)
+    {
+        if (_unidentified.Count >= _maxOutgoing
+            || data.Length > _maxUnidentifiedBytes
+            || _unidentifiedBytes > _maxUnidentifiedBytes - data.Length)
+        {
+            LastRemoteFault = "Catch-up does not fit.";
             return;
         }
 
         LastRemoteFault = null;
-        var admit = _host.TryAcceptRemote(operation!);
+        _unidentifiedBytes += data.Length;
+        _unidentified.Enqueue(new UnidentifiedPacket(connectionId, data));
+    }
+
+    private bool TryReadRemote(byte[] data, out AetherOperation? operation, out IReadOnlyList<StoredField>? fields)
+    {
+        operation = null;
+        fields = null;
+        if (AetherWire.IsContributionPacket(data))
+        {
+            if (!AetherWire.TryDecodeContributions(data, out var decoded, out var fault))
+            {
+                LastRemoteFault = fault;
+                LastRemoteAdmit = null;
+                return false;
+            }
+
+            if (!string.Equals(decoded[0].Key.EntityId, _entityId, StringComparison.Ordinal))
+            {
+                LastRemoteFault = "Entity is not on this link.";
+                LastRemoteAdmit = null;
+                return false;
+            }
+
+            foreach (var field in decoded)
+            {
+                if (!string.Equals(field.Key.FieldId, _fieldId, StringComparison.Ordinal))
+                {
+                    LastRemoteFault = "Field is not on this link.";
+                    LastRemoteAdmit = null;
+                    return false;
+                }
+            }
+
+            fields = decoded;
+            return true;
+        }
+
+        if (!AetherWire.TryDecode(data, _entityId, _fieldId, out operation, out var operationFault))
+        {
+            LastRemoteFault = operationFault;
+            LastRemoteAdmit = null;
+            return false;
+        }
+
+        return true;
+    }
+
+    private void AcceptRemote(string principalId, AetherOperation? operation, IReadOnlyList<StoredField>? fields)
+    {
+        if (fields is not null)
+        {
+            QueueContribution(principalId, fields);
+            return;
+        }
+
+        LastRemoteFault = null;
+        var admit = _host.TryAcceptRemote(operation!, principalId);
         LastRemoteAdmit = admit;
+        if (admit.Kind == AetherAdmitKind.Refused)
+        {
+            LastRemoteFault = admit.Reason;
+            return;
+        }
+
         if (admit.Kind == AetherAdmitKind.Queued)
             return;
 
-        if (_held.Any(held => held.Id == operation!.Id))
+        if (_held.Any(held => held.Operation.Id == operation!.Id))
             return;
         if (_held.Count >= _maxOutgoing)
         {
@@ -187,52 +320,32 @@ public sealed class AetherLabelLink : IDisposable
             return;
         }
 
-        _held.Enqueue(operation!);
+        _held.Enqueue(new HeldOperation(principalId, operation!));
     }
-
-    private void OnPeerConnected(string peerId) => CatchUp();
 
     private void AdmitHeld()
     {
         var waiting = _held.Count;
         for (var i = 0; i < waiting; i++)
         {
-            var operation = _held.Dequeue();
-            var admit = _host.TryAcceptRemote(operation);
+            var held = _held.Dequeue();
+            var admit = _host.TryAcceptRemote(held.Operation, held.PrincipalId);
             LastRemoteAdmit = admit;
+            if (admit.Kind == AetherAdmitKind.Refused)
+            {
+                LastRemoteFault = admit.Reason;
+                continue;
+            }
+
             if (admit.Kind == AetherAdmitKind.Queued)
                 continue;
 
-            _held.Enqueue(operation);
+            _held.Enqueue(held);
         }
     }
 
-    private void HoldContribution(byte[] data)
+    private void QueueContribution(string principalId, IReadOnlyList<StoredField> fields)
     {
-        if (!AetherWire.TryDecodeContributions(data, out var fields, out var fault))
-        {
-            LastRemoteFault = fault;
-            LastRemoteAdmit = null;
-            return;
-        }
-
-        if (!string.Equals(fields[0].Key.EntityId, _entityId, StringComparison.Ordinal))
-        {
-            LastRemoteFault = "Entity is not on this link.";
-            LastRemoteAdmit = null;
-            return;
-        }
-
-        foreach (var field in fields)
-        {
-            if (!string.Equals(field.Key.FieldId, _fieldId, StringComparison.Ordinal))
-            {
-                LastRemoteFault = "Field is not on this link.";
-                LastRemoteAdmit = null;
-                return;
-            }
-        }
-
         if (_heldContributions.Count >= _maxOutgoing)
         {
             LastRemoteFault = "Catch-up does not fit.";
@@ -240,7 +353,7 @@ public sealed class AetherLabelLink : IDisposable
         }
 
         LastRemoteFault = null;
-        _heldContributions.Enqueue(fields);
+        _heldContributions.Enqueue(new HeldContribution(principalId, fields));
     }
 
     private void AdmitContributions()
@@ -248,13 +361,19 @@ public sealed class AetherLabelLink : IDisposable
         var waiting = _heldContributions.Count;
         for (var i = 0; i < waiting; i++)
         {
-            var fields = _heldContributions.Dequeue();
-            var admit = _host.TryAcceptContribution(fields);
+            var held = _heldContributions.Dequeue();
+            var admit = _host.TryAcceptContribution(held.Fields, held.PrincipalId);
             LastRemoteAdmit = admit;
+            if (admit.Kind == AetherAdmitKind.Refused)
+            {
+                LastRemoteFault = admit.Reason;
+                continue;
+            }
+
             if (admit.Kind == AetherAdmitKind.Queued)
                 continue;
 
-            _heldContributions.Enqueue(fields);
+            _heldContributions.Enqueue(held);
         }
     }
 
@@ -304,7 +423,15 @@ public sealed class AetherLabelLink : IDisposable
             return;
         if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
             return;
-        _contribution = AetherWire.EncodeContributions(records);
+        try
+        {
+            _contribution = AetherWire.EncodeContributions(records);
+        }
+        catch (AetherProtocolException ex) when (ex.Message == AetherWire.PacketTooLarge)
+        {
+            LastRemoteFault = ex.Message;
+            _catchUpPending = false;
+        }
     }
 
     private void FlushContribution()
@@ -332,4 +459,10 @@ public sealed class AetherLabelLink : IDisposable
 
         return records;
     }
+
+    private readonly record struct HeldOperation(string PrincipalId, AetherOperation Operation);
+
+    private readonly record struct HeldContribution(string PrincipalId, IReadOnlyList<StoredField> Fields);
+
+    private readonly record struct UnidentifiedPacket(string ConnectionId, byte[] Data);
 }

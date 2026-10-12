@@ -158,7 +158,7 @@ public static class ApeSystem
 
         bootstrap.Add(new EventManager());
         bootstrap.Add(new ConfigManager());
-        bootstrap.Add(new NetworkManager(networkTransportType));
+        bootstrap.Add(new NetworkManager(networkTransportType, ProfileDirectory(configPath)));
         bootstrap.Add(new ReplicaAccessControlService(replicaSection));
         bootstrap.Add(new ReplicaManager());
         bootstrap.Add(new SceneManager());
@@ -382,6 +382,20 @@ public static class ApeSystem
             _started = false;
             _blocking = false;
         }
+    }
+
+    /// <summary>
+    /// One profile is the whole configuration directory.
+    /// Two configuration files in that directory share one principal, so only one process can hold it.
+    /// </summary>
+    private static string? ProfileDirectory(string? configPath)
+    {
+        if (string.IsNullOrEmpty(configPath))
+            return null;
+        var directory = Path.GetDirectoryName(Path.GetFullPath(configPath));
+        if (string.IsNullOrEmpty(directory))
+            return null;
+        return Path.Combine(directory, "profile");
     }
 
     private static IEnumerable<IPluggableService> LoadModulePluggableServices(

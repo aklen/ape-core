@@ -26,7 +26,7 @@ public sealed class AetherFrameIntegrationTests
 
         var host = new AetherHost(store, 4096, 8);
         foreach (var op in Queued())
-            Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(op).Kind);
+            Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(op, "peer-A").Kind);
 
         var plan = AetherFrame.Compile();
         var runtime = new PlanRuntime();
@@ -215,7 +215,7 @@ public sealed class AetherFrameIntegrationTests
             "pub",
             "entity-1",
             "peer-A",
-            "peer-A/s1",
+            AetherActorId.Format("peer-A", "s1"),
             1,
             10,
             new Dictionary<string, FieldValue>(),
@@ -227,14 +227,14 @@ public sealed class AetherFrameIntegrationTests
             "sum-id",
             "entity-1",
             "peer-A",
-            "peer-A/s1",
+            AetherActorId.Format("peer-A", "s1"),
             4,
             13,
             new Dictionary<string, FieldValue> { ["offset"] = FieldValue.FixedPoint(4) });
     }
 
     private static AetherOperation Label(string id, long sequence, long lamport, string text) =>
-        new(id, "entity-1", "peer-A", "peer-A/s1", sequence, lamport, new Dictionary<string, FieldValue>
+        new(id, "entity-1", "peer-A", AetherActorId.Format("peer-A", "s1"), sequence, lamport, new Dictionary<string, FieldValue>
         {
             ["label"] = FieldValue.Label(text),
         });

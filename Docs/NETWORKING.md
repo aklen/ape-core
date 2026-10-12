@@ -430,7 +430,7 @@ Subscribe and Unsubscribe are **control plane commands** – either:
 **Recommendation:** Prefer **string** for the subscription/auth layer and long-term API:
 - ReplicaAccessControlService: `TrySubscribe(string peerId, ...)`, `GetSubscribedPeers(path)` → `IReadOnlyList<string>`
 - Transport keeps internal int; NetworkManager/ReplicaManager use string
-- Handshake: client sends its LocalPeerId; server uses that as peerId (string) and maps to transport connection
+- Handshake: each side sends its durable principal, a 256-bit id stored in an explicit profile directory. One process holds that profile. One profile is the whole configuration directory, so two configuration files in that folder share it. The file has a magic, a version, and a checksum, and a damaged file does not open. The process instance id stays separate. The receiver binds the claimed principal to the socket slot and does not change the binding for the life of the connection. Sending still addresses the slot. The claim is not cryptographic authentication.
 
 **Migration:** If transport stays int for now, add `peerIdToString` / `stringToPeerId` mapping in NetworkManager or ReplicaAccessControlService. Later, transport can expose string directly.
 

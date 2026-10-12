@@ -36,17 +36,40 @@ public sealed class AetherHost
 
     public int PendingCount => _inbox.Count + _outbox.Count;
 
-    public AetherAdmit TryAcceptRemote(AetherOperation op)
+    /// <summary>
+    /// Queues a remote write when its writer and actor peer are <paramref name="principalId"/>.
+    /// The socket slot is not a writer. Refusal happens before the queue.
+    /// </summary>
+    public AetherAdmit TryAcceptRemote(AetherOperation op, string principalId)
     {
         ArgumentNullException.ThrowIfNull(op);
+        if (!BindsToPeer(op.WriterId, op.ActorId, principalId))
+            return AetherAdmit.Refused("Actor is not on this connection.");
         return TryEnqueue(new Pending(op, null, Measure(op)));
     }
 
-    public AetherAdmit TryAcceptContribution(IReadOnlyList<StoredField> fields)
+    public AetherAdmit TryAcceptContribution(IReadOnlyList<StoredField> fields, string principalId)
     {
         ArgumentNullException.ThrowIfNull(fields);
         var copy = fields.ToArray();
+        foreach (var field in copy)
+        {
+            if (!BindsToPeer(field.WriterId, field.Version.ActorId, principalId)
+                || !string.Equals(field.Key.WriterId, principalId, StringComparison.Ordinal))
+                return AetherAdmit.Refused("Actor is not on this connection.");
+        }
+
         return TryEnqueue(new Pending(null, null, Measure(copy), copy));
+    }
+
+    private static bool BindsToPeer(string writerId, string actorId, string principalId)
+    {
+        if (string.IsNullOrEmpty(principalId))
+            return false;
+        if (!string.Equals(writerId, principalId, StringComparison.Ordinal))
+            return false;
+        return AetherActorId.TryParse(actorId, out var actor)
+            && string.Equals(actor.PeerId, principalId, StringComparison.Ordinal);
     }
 
     public AetherAdmit TryAcceptLocal(
@@ -342,14 +365,20 @@ public enum AetherAdmitKind : byte
 {
     Queued = 1,
     Full = 2,
+    Refused = 3,
 }
 
-/// <summary>A request entered the queue, or the queue refused it. Refusal is not a protocol rejection.</summary>
-public readonly record struct AetherAdmit(AetherAdmitKind Kind, long RequestId)
+/// <summary>
+/// A request entered the queue, the queue was full, or the connection rejected the actor.
+/// Full does not take a request id. Refused does not enter the queue.
+/// </summary>
+public readonly record struct AetherAdmit(AetherAdmitKind Kind, long RequestId, string? Reason = null)
 {
     public static AetherAdmit Full => new(AetherAdmitKind.Full, 0);
 
     public static AetherAdmit Queued(long requestId) => new(AetherAdmitKind.Queued, requestId);
+
+    public static AetherAdmit Refused(string reason) => new(AetherAdmitKind.Refused, 0, reason);
 }
 
 public enum AetherOutcomeKind : byte

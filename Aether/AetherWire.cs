@@ -13,6 +13,9 @@ public static class AetherWire
     public const byte ContributionType = 0x31;
     public const ushort WireVersion = 1;
     public const string LabelRule = "lww";
+    public const int MaxPacketBytes = 65_536;
+    public const int MaxFieldCount = 64;
+    public const string PacketTooLarge = "State packet is too large.";
 
     public static bool IsStatePacket(ReadOnlySpan<byte> data) =>
         !data.IsEmpty && (data[0] == PacketType || data[0] == ContributionType);
@@ -29,7 +32,18 @@ public static class AetherWire
         if (!field.Value.IsText)
             throw new AetherProtocolException("This packet carries one label write.");
 
-        using var body = new MemoryStream();
+        var size = 0;
+        Reserve(ref size, 1 + 2);
+        ReserveText(ref size, LabelRule);
+        ReserveText(ref size, op.Id);
+        ReserveText(ref size, op.EntityId);
+        ReserveText(ref size, op.WriterId);
+        ReserveText(ref size, op.ActorId);
+        Reserve(ref size, 8 + 8);
+        ReserveText(ref size, field.Key);
+        ReserveText(ref size, field.Value.Text!);
+
+        using var body = new MemoryStream(size);
         body.WriteByte(PacketType);
         WriteU16(body, WireVersion);
         WriteText(body, LabelRule);
@@ -46,10 +60,14 @@ public static class AetherWire
 
     private static byte[] WithChecksum(byte[] bytes)
     {
+        if (bytes.Length > MaxPacketBytes - 32)
+            throw new AetherProtocolException(PacketTooLarge);
         var hash = SHA256.HashData(bytes);
         var packet = new byte[bytes.Length + hash.Length];
         bytes.CopyTo(packet, 0);
         hash.CopyTo(packet, bytes.Length);
+        if (packet.Length > MaxPacketBytes)
+            throw new AetherProtocolException(PacketTooLarge);
         return packet;
     }
 
@@ -58,6 +76,8 @@ public static class AetherWire
         ArgumentNullException.ThrowIfNull(fields);
         if (fields.Count == 0)
             throw new AetherProtocolException("Contribution packet is empty.");
+        if (fields.Count > MaxFieldCount)
+            throw new AetherProtocolException("Contribution packet has too many fields.");
         var entityId = fields[0].Key.EntityId;
         var writerId = fields[0].WriterId;
         foreach (var field in fields)
@@ -67,7 +87,23 @@ public static class AetherWire
                 throw new AetherProtocolException("Contribution packet has one writer.");
         }
 
-        using var body = new MemoryStream();
+        var size = 0;
+        Reserve(ref size, 1 + 2);
+        ReserveText(ref size, entityId);
+        ReserveText(ref size, writerId);
+        Reserve(ref size, 4);
+        foreach (var field in fields)
+        {
+            ReserveText(ref size, field.Key.FieldId);
+            Reserve(ref size, 1 + 8);
+            ReserveText(ref size, field.Value.Text ?? "");
+            Reserve(ref size, 8);
+            ReserveText(ref size, field.Version.ActorId);
+            Reserve(ref size, 8);
+            ReserveText(ref size, field.OperationId);
+        }
+
+        using var body = new MemoryStream(size);
         body.WriteByte(ContributionType);
         WriteU16(body, WireVersion);
         WriteText(body, entityId);
@@ -130,8 +166,10 @@ public static class AetherWire
 
     private static AetherOperation Decode(byte[] data, string entityId, string fieldId)
     {
-        if (data.Length < 33 || data[0] != PacketType)
-            throw new AetherProtocolException("State packet is truncated.");
+        if (data.Length < 33 || data.Length > MaxPacketBytes || data[0] != PacketType)
+            throw new AetherProtocolException(data.Length > MaxPacketBytes
+                ? PacketTooLarge
+                : "State packet is truncated.");
         var body = data.AsSpan(0, data.Length - 32);
         var hash = data.AsSpan(data.Length - 32);
         if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(body), hash))
@@ -171,8 +209,10 @@ public static class AetherWire
 
     private static IReadOnlyList<StoredField> DecodeContributions(byte[] data)
     {
-        if (data.Length < 33 || !IsContributionPacket(data))
-            throw new AetherProtocolException("Contribution packet is truncated.");
+        if (data.Length < 33 || data.Length > MaxPacketBytes || !IsContributionPacket(data))
+            throw new AetherProtocolException(data.Length > MaxPacketBytes
+                ? PacketTooLarge
+                : "Contribution packet is truncated.");
         var body = data.AsSpan(0, data.Length - 32);
         var hash = data.AsSpan(data.Length - 32);
         if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(body), hash))
@@ -186,7 +226,10 @@ public static class AetherWire
         var entityId = reader.Text();
         var writerId = reader.Text();
         var rawCount = reader.U32();
-        if (rawCount == 0 || rawCount > int.MaxValue)
+        if (rawCount == 0 || rawCount > MaxFieldCount)
+            throw new AetherProtocolException("Contribution packet has too many fields.");
+        const int MinFieldBytes = 41;
+        if ((long)rawCount * MinFieldBytes > reader.Remaining)
             throw new AetherProtocolException("Contribution packet is truncated.");
         var count = (int)rawCount;
         var fields = new StoredField[count];
@@ -217,6 +260,19 @@ public static class AetherWire
 
         reader.End();
         return fields;
+    }
+
+    private static void Reserve(ref int size, int count)
+    {
+        if (count < 0 || size > MaxPacketBytes - 32 - count)
+            throw new AetherProtocolException(PacketTooLarge);
+        size += count;
+    }
+
+    private static void ReserveText(ref int size, string value)
+    {
+        Reserve(ref size, 4);
+        Reserve(ref size, Encoding.UTF8.GetByteCount(value));
     }
 
     private static void WriteU16(Stream buffer, ushort value)
@@ -264,11 +320,13 @@ public static class AetherWire
 
         public long I64() => BinaryPrimitives.ReadInt64BigEndian(Take(8));
 
+        public int Remaining => _data.Length - _offset;
+
         public string Text()
         {
             var length = BinaryPrimitives.ReadUInt32BigEndian(Take(4));
-            if (length > int.MaxValue)
-                throw new AetherProtocolException("State packet is truncated.");
+            if (length > MaxPacketBytes)
+                throw new AetherProtocolException(PacketTooLarge);
             return Encoding.UTF8.GetString(Take((int)length));
         }
 

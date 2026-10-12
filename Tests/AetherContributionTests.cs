@@ -1,9 +1,87 @@
+using System.Buffers.Binary;
+using System.Security.Cryptography;
 using Ape.Core.Aether;
 
 namespace Ape.Core.Tests;
 
 public sealed class AetherContributionTests
 {
+    [Fact]
+    public void A_contribution_count_is_rejected_before_a_huge_field_array()
+    {
+        var counted = ContributionHeader(1_000_000);
+        Assert.False(AetherWire.TryDecodeContributions(counted, out var fields, out var fault));
+        Assert.Empty(fields);
+        Assert.Equal("Contribution packet has too many fields.", fault);
+
+        var shortBody = ContributionHeader(2);
+        Assert.False(AetherWire.TryDecodeContributions(shortBody, out var partial, out var truncated));
+        Assert.Empty(partial);
+        Assert.Equal("Contribution packet is truncated.", truncated);
+
+        var oversized = new byte[AetherWire.MaxPacketBytes + 1];
+        oversized[0] = AetherWire.ContributionType;
+        Assert.False(AetherWire.TryDecodeContributions(oversized, out var ignored, out var tooLarge));
+        Assert.Empty(ignored);
+        Assert.Equal("State packet is too large.", tooLarge);
+    }
+
+    [Fact]
+    public void Encode_refuses_a_label_the_decoder_would_reject()
+    {
+        var huge = new string('x', 70_000);
+        var operation = new AetherOperation(
+            "too-big",
+            "entity-1",
+            "peer-a",
+            "peer-a",
+            1,
+            1,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label(huge) });
+        var encode = Assert.Throws<AetherProtocolException>(() => AetherWire.Encode(operation));
+        Assert.Equal(AetherWire.PacketTooLarge, encode.Message);
+        var contribution = Assert.Throws<AetherProtocolException>(() => AetherWire.EncodeContributions(
+        [
+            new StoredField(
+                new RecordKey("entity-1", "peer-a", "label"),
+                FieldValue.Label(huge),
+                new FieldVersion(1, "peer-a"),
+                "peer-a",
+                "too-big",
+                1),
+        ]));
+        Assert.Equal(AetherWire.PacketTooLarge, contribution.Message);
+    }
+
+    private static byte[] ContributionHeader(uint count)
+    {
+        using var body = new MemoryStream();
+        body.WriteByte(AetherWire.ContributionType);
+        Span<byte> version = stackalloc byte[2];
+        BinaryPrimitives.WriteUInt16BigEndian(version, AetherWire.WireVersion);
+        body.Write(version);
+        WriteText(body, "entity-1");
+        WriteText(body, "peer-a");
+        Span<byte> encoded = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(encoded, count);
+        body.Write(encoded);
+        var raw = body.ToArray();
+        var hash = SHA256.HashData(raw);
+        var packet = new byte[raw.Length + hash.Length];
+        raw.CopyTo(packet, 0);
+        hash.CopyTo(packet, raw.Length);
+        return packet;
+    }
+
+    private static void WriteText(Stream body, string value)
+    {
+        var bytes = System.Text.Encoding.UTF8.GetBytes(value);
+        Span<byte> length = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(length, (uint)bytes.Length);
+        body.Write(length);
+        body.Write(bytes);
+    }
+
     [Fact]
     public void Restart_catch_up_merges_both_current_fields_without_replaying_the_old_operation()
     {
@@ -201,18 +279,18 @@ public sealed class AetherContributionTests
         var durable = NewStore();
         var host = new AetherHost(durable, 4096, 8);
         var archive = new AetherArchive(dir.Path);
+        durable.MergeContributions([prior]);
         host.Save(archive);
-        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([prior]).Kind);
-        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([label, note]).Kind);
-        var outcomes = host.Drain();
-        Assert.Equal(2, outcomes.Count);
-        Assert.All(outcomes, outcome => Assert.Equal(AetherOutcomeKind.Applied, outcome.Kind));
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([Bind(label), Bind(note)], "actor-a").Kind);
+        var outcome = Assert.Single(host.Drain());
+        Assert.Equal(AetherOutcomeKind.Applied, outcome.Kind);
         host.Commit(archive);
         var loaded = new AetherArchive(dir.Path).Load();
         Assert.Equal("won", loaded.ResolveLww("entity-1", "note")?.Text);
         Assert.Equal("kept", loaded.ResolveLww("entity-1", "label")?.Text);
-        Assert.Equal(6, loaded.ActorCursors.Single(item => item.ActorId == "actor-a").Sequence);
-        Assert.Equal(7, loaded.StampLocal("entity-1", "actor-a", "actor-a", Note("next")).Sequence);
+        var loadedActor = AetherActorId.Format("actor-a", "s1");
+        Assert.Equal(6, loaded.ActorCursors.Single(item => item.ActorId == loadedActor).Sequence);
+        Assert.Equal(7, loaded.StampLocal("entity-1", "actor-a", loadedActor, Note("next")).Sequence);
     }
 
     [Fact]
@@ -220,17 +298,18 @@ public sealed class AetherContributionTests
     {
         var store = NewStore();
         var host = new AetherHost(store, 4096, 8);
+        var actor = AetherActorId.Format("actor-a", "s1");
         var op = new AetherOperation(
             "actor-a/6",
             "entity-1",
             "actor-a",
-            "actor-a",
+            actor,
             6,
             20,
             new Dictionary<string, FieldValue> { ["note"] = FieldValue.Label("real") });
-        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(op).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(op, "actor-a").Kind);
         Assert.Equal(AetherOutcomeKind.Applied, Assert.Single(host.Drain()).Kind);
-        var cursor = Assert.Single(store.ActorCursors, item => item.ActorId == "actor-a");
+        var cursor = Assert.Single(store.ActorCursors, item => item.ActorId == actor);
         Assert.Equal(6, cursor.Sequence);
         Assert.Equal(20, cursor.Lamport);
         Assert.Equal("actor-a/6", cursor.OperationId);
@@ -241,7 +320,7 @@ public sealed class AetherContributionTests
             "different-operation",
             "entity-1",
             "actor-a",
-            "actor-a",
+            actor,
             6,
             999,
             new Dictionary<string, FieldValue> { ["note"] = FieldValue.Label("forged") });
@@ -251,12 +330,12 @@ public sealed class AetherContributionTests
         Assert.Equal("real", store.ResolveLww("entity-1", "note")?.Text);
 
         Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution(
-            [Claim("note", 999, "different-operation", 6, "forged", "actor-a")]).Kind);
+            [Bind(Claim("note", 999, "different-operation", 6, "forged", "actor-a"))], "actor-a").Kind);
         var rejected = Assert.Single(host.Drain());
         Assert.Equal(AetherOutcomeKind.Rejected, rejected.Kind);
         Assert.Equal("real", store.ResolveLww("entity-1", "note")?.Text);
-        Assert.Equal(20, store.ActorCursors.Single(item => item.ActorId == "actor-a").Lamport);
-        Assert.Equal("actor-a/6", store.ActorCursors.Single(item => item.ActorId == "actor-a").OperationId);
+        Assert.Equal(20, store.ActorCursors.Single(item => item.ActorId == actor).Lamport);
+        Assert.Equal("actor-a/6", store.ActorCursors.Single(item => item.ActorId == actor).OperationId);
 
         var deleted = NewStore();
         deleted.Apply(
@@ -286,13 +365,13 @@ public sealed class AetherContributionTests
         var host = new AetherHost(store, 4096, 8);
         var archive = new AetherArchive(dir.Path);
         host.Save(archive);
-        var row = Label(3, "caught-up", sequence: 2);
-        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([row]).Kind);
+        var row = Bind(Label(3, "caught-up", sequence: 2));
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([row], "peer-a").Kind);
         Assert.Equal(AetherOutcomeKind.Applied, Assert.Single(host.Drain()).Kind);
         var through = store.SaveThrough;
         var clock = store.Clock;
 
-        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([row]).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([row], "peer-a").Kind);
         var again = Assert.Single(host.Drain());
         Assert.Equal(AetherOutcomeKind.NoChange, again.Kind);
         Assert.Null(again.Result);
@@ -359,13 +438,13 @@ public sealed class AetherContributionTests
         var archive = new AetherArchive(dir.Path);
         host.Save(archive);
         var tiny = new AetherHost(NewStore(), 4096, 1);
-        Assert.Equal(AetherAdmitKind.Queued, tiny.TryAcceptContribution([Label(3, "held")]).Kind);
-        Assert.Equal(AetherAdmitKind.Full, tiny.TryAcceptContribution([Label(4, "second")]).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, tiny.TryAcceptContribution([Bind(Label(3, "held"))], "peer-a").Kind);
+        Assert.Equal(AetherAdmitKind.Full, tiny.TryAcceptContribution([Bind(Label(4, "second"))], "peer-a").Kind);
         Assert.Null(tiny.Reducer.ResolveLww("entity-1", "label")?.Text);
 
-        var caughtUp = Label(3, "caught-up", sequence: 2);
-        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([caughtUp]).Kind);
-        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([Label(4, "later", sequence: 3)]).Kind);
+        var caughtUp = Bind(Label(3, "caught-up", sequence: 2));
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([caughtUp], "peer-a").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([Bind(Label(4, "later", sequence: 3))], "peer-a").Kind);
         var drained = host.Drain(1, int.MaxValue);
         var outcome = Assert.Single(drained);
         Assert.Equal(AetherOutcomeKind.Applied, outcome.Kind);
@@ -383,6 +462,12 @@ public sealed class AetherContributionTests
         Assert.False(loaded.Remembers("src"));
         Assert.Equal(store.Clock, loaded.Clock);
     }
+
+    private static StoredField Bind(StoredField field) =>
+        field with
+        {
+            Version = new FieldVersion(field.Version.Lamport, AetherActorId.Format(field.WriterId, "s1")),
+        };
 
     private static StoredField Label(long lamport, string text, long sequence = 1) =>
         Claim("label", lamport, "src", sequence, text);
