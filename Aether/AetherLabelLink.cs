@@ -34,9 +34,11 @@ public sealed class AetherLabelLink : IDisposable
     private int _unidentifiedBytes;
     private AetherOperation? _own;
     private AetherOperation? _ownCreate;
+    private AetherOperation? _ownDelete;
     private byte[]? _contribution;
     private bool _catchUpPending;
     private bool _createCatchUpSent;
+    private bool _deleteCatchUpSent;
     private bool _labelCatchUpSent;
     private readonly FrozenPlan<AetherScratch> _plan;
     private PlanRuntime _runtime;
@@ -85,6 +87,9 @@ public sealed class AetherLabelLink : IDisposable
         var storedCreate = host.Reducer.GetEntity(entityId);
         if (storedCreate is not null && string.Equals(storedCreate.CreatorId, writerId, StringComparison.Ordinal))
             _ownCreate = CreationOperation(storedCreate);
+        var storedDelete = host.Reducer.GetDeletion(entityId);
+        if (storedDelete is not null && string.Equals(storedDelete.WriterId, writerId, StringComparison.Ordinal))
+            _ownDelete = DeletionOperation(storedDelete);
 
         _plan = AetherFrame.Compile();
         _runtime = new PlanRuntime();
@@ -137,11 +142,23 @@ public sealed class AetherLabelLink : IDisposable
         return admit;
     }
 
+    public AetherAdmit SubmitDelete()
+    {
+        ObjectDisposedException.ThrowIf(_stopped, this);
+        if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
+            return AetherAdmit.Full;
+        var admit = _host.TryAcceptLocalDelete(_entityId, _writerId, _actorId);
+        if (admit.Kind == AetherAdmitKind.Queued)
+            _localIds.Add(admit.RequestId);
+        return admit;
+    }
+
     public void CatchUp()
     {
         ObjectDisposedException.ThrowIf(_stopped, this);
         _catchUpPending = true;
         _createCatchUpSent = _ownCreate is null;
+        _deleteCatchUpSent = _ownDelete is null;
         _labelCatchUpSent = _own is null && OwnRecords().Count == 0;
         ScheduleCatchUp();
         Flush();
@@ -384,13 +401,20 @@ public sealed class AetherLabelLink : IDisposable
         if (admit.Kind == AetherAdmitKind.Refused)
         {
             LastRemoteFault = admit.Reason;
+            if (string.Equals(admit.Reason, "Delete entity owner is unknown.", StringComparison.Ordinal))
+                HoldOperation(principalId, operation!);
             return;
         }
 
         if (admit.Kind == AetherAdmitKind.Queued)
             return;
 
-        if (_held.Any(held => held.Operation.Id == operation!.Id))
+        HoldOperation(principalId, operation!);
+    }
+
+    private void HoldOperation(string principalId, AetherOperation operation)
+    {
+        if (_held.Any(held => held.Operation.Id == operation.Id))
             return;
         if (_held.Count >= _maxOutgoing)
         {
@@ -398,7 +422,7 @@ public sealed class AetherLabelLink : IDisposable
             return;
         }
 
-        _held.Enqueue(new HeldOperation(principalId, operation!));
+        _held.Enqueue(new HeldOperation(principalId, operation));
     }
 
     private void AdmitHeld()
@@ -412,11 +436,16 @@ public sealed class AetherLabelLink : IDisposable
             if (admit.Kind == AetherAdmitKind.Refused)
             {
                 LastRemoteFault = admit.Reason;
+                if (string.Equals(admit.Reason, "Delete entity owner is unknown.", StringComparison.Ordinal))
+                    _held.Enqueue(held);
                 continue;
             }
 
             if (admit.Kind == AetherAdmitKind.Queued)
+            {
+                LastRemoteFault = null;
                 continue;
+            }
 
             _held.Enqueue(held);
         }
@@ -458,7 +487,7 @@ public sealed class AetherLabelLink : IDisposable
     private void Note(AetherOperation operation)
     {
         if (!string.Equals(operation.WriterId, _writerId, StringComparison.Ordinal)
-            || operation.Effect is not (AetherEffect.Write or AetherEffect.CreateEntity))
+            || operation.Effect is not (AetherEffect.Write or AetherEffect.CreateEntity or AetherEffect.DeleteEntity))
             return;
 
         if (operation.Effect == AetherEffect.CreateEntity)
@@ -466,6 +495,11 @@ public sealed class AetherLabelLink : IDisposable
             if (_ownCreate is null
                 || new FieldVersion(operation.Lamport, operation.ActorId) > new FieldVersion(_ownCreate.Lamport, _ownCreate.ActorId))
                 _ownCreate = operation;
+            return;
+        }
+        if (operation.Effect == AetherEffect.DeleteEntity)
+        {
+            _ownDelete = operation;
             return;
         }
         if (!operation.Changes.TryGetValue(_fieldId, out var value) || !value.IsText)
@@ -485,6 +519,10 @@ public sealed class AetherLabelLink : IDisposable
             && !_outgoing.Any(queued => queued.Id == _ownCreate.Id)
             && _localIds.Count + _outgoing.Count + (_contribution is null ? 0 : 1) < _maxOutgoing)
             _outgoing.Enqueue(_ownCreate);
+        if (!_deleteCatchUpSent && _ownDelete is not null
+            && !_outgoing.Any(queued => queued.Id == _ownDelete.Id)
+            && _localIds.Count + _outgoing.Count + (_contribution is null ? 0 : 1) < _maxOutgoing)
+            _outgoing.Enqueue(_ownDelete);
         if (!_labelCatchUpSent && _own is not null
             && !_outgoing.Any(queued => queued.Id == _own.Id)
             && _localIds.Count + _outgoing.Count + (_contribution is null ? 0 : 1) < _maxOutgoing)
@@ -500,16 +538,22 @@ public sealed class AetherLabelLink : IDisposable
             _outgoing.Dequeue();
             if (_catchUpPending && _ownCreate is not null && operation.Id == _ownCreate.Id)
                 _createCatchUpSent = true;
+            if (_catchUpPending && _ownDelete is not null && operation.Id == _ownDelete.Id)
+                _deleteCatchUpSent = true;
             if (_catchUpPending && _own is not null && operation.Id == _own.Id)
                 _labelCatchUpSent = true;
-            if (_catchUpPending && _createCatchUpSent && _labelCatchUpSent)
+            if (_catchUpPending && _createCatchUpSent && _deleteCatchUpSent && _labelCatchUpSent)
                 _catchUpPending = false;
         }
     }
 
     private void ScheduleContribution()
     {
-        if (!_catchUpPending || _own is not null || _contribution is not null)
+        if (!_catchUpPending
+            || !_createCatchUpSent
+            || !_deleteCatchUpSent
+            || _own is not null
+            || _contribution is not null)
             return;
         var records = OwnRecords();
         if (records.Count == 0)
@@ -534,7 +578,9 @@ public sealed class AetherLabelLink : IDisposable
         var packet = _contribution;
         _network.Broadcast(packet, reliable: true);
         _contribution = null;
-        _catchUpPending = false;
+        _labelCatchUpSent = true;
+        if (_createCatchUpSent && _deleteCatchUpSent)
+            _catchUpPending = false;
     }
 
     private List<StoredField> OwnRecords()
@@ -565,6 +611,16 @@ public sealed class AetherLabelLink : IDisposable
         entityTypeId: entity.EntityTypeId,
         creatorId: entity.CreatorId,
         ownerId: entity.OwnerId);
+
+    private static AetherOperation DeletionOperation(StoredDeletion deletion) => new(
+        deletion.OperationId,
+        deletion.EntityId,
+        deletion.WriterId,
+        deletion.Version.ActorId,
+        deletion.Sequence,
+        deletion.Version.Lamport,
+        new Dictionary<string, FieldValue>(),
+        AetherEffect.DeleteEntity);
 
     private readonly record struct HeldOperation(string PrincipalId, AetherOperation Operation);
 

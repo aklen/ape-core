@@ -111,7 +111,13 @@ public static class AetherFrame
             if (string.IsNullOrEmpty(scratch.SceneEntityKey))
                 return;
 
-            if (scratch.ResolvedEntity is { } entity && !scratch.ResolvedDeleted)
+            if (scratch.ResolvedDeleted)
+            {
+                scratch.SceneCommits.Add(new RemoveRegisteredEntityCommitRequest(scratch.SceneEntityKey));
+                return;
+            }
+
+            if (scratch.ResolvedEntity is { } entity)
             {
                 scratch.SceneCommits.Add(new EnsureAetherEntityCommitRequest(
                     entity.EntityTypeId,

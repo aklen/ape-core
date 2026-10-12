@@ -49,6 +49,14 @@ public sealed class AetherHost
             && (!string.Equals(op.CreatorId, principalId, StringComparison.Ordinal)
                 || !string.Equals(op.OwnerId, principalId, StringComparison.Ordinal)))
             return AetherAdmit.Refused("Create is not owned by this connection.");
+        if (op.Effect == AetherEffect.DeleteEntity)
+        {
+            var entity = Reducer.GetEntity(op.EntityId);
+            if (entity is null)
+                return AetherAdmit.Refused("Delete entity owner is unknown.");
+            if (!string.Equals(entity.OwnerId, principalId, StringComparison.Ordinal))
+                return AetherAdmit.Refused("Delete is not issued by the entity owner.");
+        }
         return TryEnqueue(new Pending(op, null, Measure(op)));
     }
 
@@ -100,6 +108,20 @@ public sealed class AetherHost
         return TryEnqueue(new Pending(
             null,
             new LocalWrite(entityId, writerId, actorId, new Dictionary<string, FieldValue>(), entityTypeId),
+            bytes));
+    }
+
+    public AetherAdmit TryAcceptLocalDelete(string entityId, string writerId, string actorId)
+    {
+        var bytes = BaseBytes + Utf8(entityId) + Utf8(writerId) + Utf8(actorId) + 16;
+        return TryEnqueue(new Pending(
+            null,
+            new LocalWrite(
+                entityId,
+                writerId,
+                actorId,
+                new Dictionary<string, FieldValue>(),
+                effect: AetherEffect.DeleteEntity),
             bytes));
     }
 
@@ -320,9 +342,19 @@ public sealed class AetherHost
                 var write = pending.Local!;
                 try
                 {
-                    stamped = write.EntityTypeId is null
-                        ? Reducer.StampLocal(write.EntityId, write.WriterId, write.ActorId, write.Changes)
-                        : Reducer.StampLocalCreate(write.EntityId, write.EntityTypeId, write.WriterId, write.ActorId);
+                    stamped = write.Effect switch
+                    {
+                        AetherEffect.CreateEntity => Reducer.StampLocalCreate(
+                            write.EntityId,
+                            write.EntityTypeId!,
+                            write.WriterId,
+                            write.ActorId),
+                        AetherEffect.DeleteEntity => Reducer.StampLocalDelete(
+                            write.EntityId,
+                            write.WriterId,
+                            write.ActorId),
+                        _ => Reducer.StampLocal(write.EntityId, write.WriterId, write.ActorId, write.Changes),
+                    };
                 }
                 catch (AetherProtocolException ex)
                 {
@@ -358,13 +390,15 @@ public sealed class AetherHost
         string writerId,
         string actorId,
         Dictionary<string, FieldValue> changes,
-        string? entityTypeId = null)
+        string? entityTypeId = null,
+        AetherEffect effect = AetherEffect.Write)
     {
         public string EntityId { get; } = entityId;
         public string WriterId { get; } = writerId;
         public string ActorId { get; } = actorId;
         public Dictionary<string, FieldValue> Changes { get; } = changes;
         public string? EntityTypeId { get; } = entityTypeId;
+        public AetherEffect Effect { get; } = entityTypeId is null ? effect : AetherEffect.CreateEntity;
     }
 
     private sealed class Pending

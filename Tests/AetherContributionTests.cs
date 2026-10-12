@@ -416,19 +416,42 @@ public sealed class AetherContributionTests
         Assert.Equal("actor-a/6", store.ActorCursors.Single(item => item.ActorId == actor).OperationId);
 
         var deleted = NewStore();
+        deleted.MergeImage(new AetherImage(
+            0,
+            [],
+            [],
+            Entities:
+            [
+                new StoredEntity(
+                    "entity-1",
+                    "tests.stub.v1",
+                    "actor-a",
+                    "actor-a",
+                    new FieldVersion(0, AetherActorId.Format("actor-a", "create")),
+                    "create",
+                    1),
+            ]));
         deleted.Apply(
             new AetherOperation(
                 "actor-a/4",
                 "entity-1",
                 "actor-a",
-                "actor-a",
+                AetherActorId.Format("actor-a", "s1"),
                 4,
                 8,
                 new Dictionary<string, FieldValue>(),
                 AetherEffect.DeleteEntity),
             observeClock: true);
         Assert.Throws<AetherProtocolException>(() => deleted.MergeContributions(
-            [Claim("label", 3, "other", 4, "forged", "actor-a")]));
+            [
+                new StoredField(
+                    new RecordKey("entity-1", "actor-a", "label"),
+                    FieldValue.Label("forged"),
+                    new FieldVersion(3, AetherActorId.Format("actor-a", "s1")),
+                    "actor-a",
+                    "other",
+                    4),
+            ]));
         Assert.True(deleted.IsDeleted("entity-1"));
         Assert.Equal(0, deleted.RecordCount);
         Assert.Equal(8, Assert.Single(deleted.ActorCursors).Lamport);

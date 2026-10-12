@@ -91,6 +91,78 @@ public sealed class AetherHandshakeTests
     }
 
     [Fact]
+    public void Authenticated_owner_delete_waits_for_reordered_create_and_survives_restart()
+    {
+        var time = new ManualTime();
+        using var leftDir = new TempDir();
+        using var rightDir = new TempDir();
+        using var archiveDir = new TempDir();
+        using var left = Side.Create(leftDir.Path, time);
+        using var right = Side.Create(rightDir.Path, time);
+        var leftServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var rightServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var leftScene = leftServices.GetRequiredService<ISceneManager>();
+        var rightScene = rightServices.GetRequiredService<ISceneManager>();
+        var leftStore = Store();
+        var rightStore = Store();
+        var leftHost = new AetherHost(leftStore, 4096, 8);
+        var rightHost = new AetherHost(rightStore, 4096, 8);
+        using var leftLink = new AetherLabelLink(
+            left.Network,
+            leftHost,
+            leftScene,
+            leftServices.GetRequiredService<ILogger>(),
+            "entity-1",
+            left.Principal.Id,
+            "session-1",
+            "catalog");
+        using var rightLink = new AetherLabelLink(
+            right.Network,
+            rightHost,
+            rightScene,
+            rightServices.GetRequiredService<ILogger>(),
+            "entity-1",
+            right.Principal.Id,
+            "session-1",
+            "catalog");
+        Exchange(left, right);
+
+        Assert.Equal(AetherAdmitKind.Queued, leftLink.SubmitCreate(TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, leftLink.SubmitDelete().Kind);
+        leftLink.Pump();
+        var create = Assert.Single(left.Transport.Sent, packet => AetherWire.IsCreatePacket(packet));
+        var delete = Assert.Single(left.Transport.Sent, packet => AetherWire.IsDeletePacket(packet));
+
+        right.Receive(delete);
+        Assert.Equal("Delete entity owner is unknown.", rightLink.LastRemoteFault);
+        right.Receive(create);
+        rightLink.Pump();
+        Assert.NotNull(rightScene.GetEntity("entity-1"));
+        Assert.False(rightStore.IsDeleted("entity-1"));
+        rightLink.Pump();
+        Assert.Null(rightScene.GetEntity("entity-1"));
+        Assert.True(rightStore.IsDeleted("entity-1"));
+        Assert.Equal(left.Principal.Id, Assert.Single(rightStore.Deletions).WriterId);
+
+        var archive = new AetherArchive(archiveDir.Path);
+        archive.Save(leftStore);
+        leftLink.Dispose();
+        left.Transport.Sent.Clear();
+        using var restartedLink = new AetherLabelLink(
+            left.Network,
+            new AetherHost(archive.Load(), 4096, 8),
+            leftScene,
+            leftServices.GetRequiredService<ILogger>(),
+            "entity-1",
+            left.Principal.Id,
+            "session-2",
+            "catalog");
+        restartedLink.CatchUp();
+        Assert.Equal(create, left.Transport.Sent[0]);
+        Assert.Equal(delete, left.Transport.Sent[1]);
+    }
+
+    [Fact]
     public void A_mutual_handshake_authenticates_both_peers()
     {
         var time = new ManualTime();

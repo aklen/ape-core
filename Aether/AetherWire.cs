@@ -12,6 +12,7 @@ public static class AetherWire
     public const byte PacketType = 0x30;
     public const byte ContributionType = 0x31;
     public const byte CreateType = 0x32;
+    public const byte DeleteType = 0x33;
     public const ushort WireVersion = 1;
     public const string LabelRule = "lww";
     public const int MaxPacketBytes = 65_536;
@@ -19,7 +20,7 @@ public static class AetherWire
     public const string PacketTooLarge = "State packet is too large.";
 
     public static bool IsStatePacket(ReadOnlySpan<byte> data) =>
-        !data.IsEmpty && (data[0] == PacketType || data[0] == ContributionType || data[0] == CreateType);
+        !data.IsEmpty && (data[0] == PacketType || data[0] == ContributionType || data[0] == CreateType || data[0] == DeleteType);
 
     public static bool IsContributionPacket(ReadOnlySpan<byte> data) =>
         !data.IsEmpty && data[0] == ContributionType;
@@ -27,11 +28,16 @@ public static class AetherWire
     public static bool IsCreatePacket(ReadOnlySpan<byte> data) =>
         !data.IsEmpty && data[0] == CreateType;
 
+    public static bool IsDeletePacket(ReadOnlySpan<byte> data) =>
+        !data.IsEmpty && data[0] == DeleteType;
+
     public static byte[] Encode(AetherOperation op)
     {
         ArgumentNullException.ThrowIfNull(op);
         if (op.Effect == AetherEffect.CreateEntity)
             return EncodeCreate(op);
+        if (op.Effect == AetherEffect.DeleteEntity)
+            return EncodeDelete(op);
         if (op.Effect != AetherEffect.Write || op.Changes.Count != 1)
             throw new AetherProtocolException("This packet carries one label write.");
         var field = op.Changes.Single();
@@ -89,6 +95,28 @@ public static class AetherWire
         WriteText(body, op.EntityTypeId!);
         WriteText(body, op.CreatorId!);
         WriteText(body, op.OwnerId!);
+        return WithChecksum(body.ToArray());
+    }
+
+    private static byte[] EncodeDelete(AetherOperation op)
+    {
+        var size = 0;
+        Reserve(ref size, 1 + 2);
+        ReserveText(ref size, op.Id);
+        ReserveText(ref size, op.EntityId);
+        ReserveText(ref size, op.WriterId);
+        ReserveText(ref size, op.ActorId);
+        Reserve(ref size, 8 + 8);
+
+        using var body = new MemoryStream(size);
+        body.WriteByte(DeleteType);
+        WriteU16(body, WireVersion);
+        WriteText(body, op.Id);
+        WriteText(body, op.EntityId);
+        WriteText(body, op.WriterId);
+        WriteText(body, op.ActorId);
+        WriteI64(body, op.Sequence);
+        WriteI64(body, op.Lamport);
         return WithChecksum(body.ToArray());
     }
 
@@ -200,7 +228,8 @@ public static class AetherWire
 
     private static AetherOperation Decode(byte[] data, string entityId, string fieldId)
     {
-        if (data.Length < 33 || data.Length > MaxPacketBytes || (data[0] != PacketType && data[0] != CreateType))
+        if (data.Length < 33 || data.Length > MaxPacketBytes
+            || (data[0] != PacketType && data[0] != CreateType && data[0] != DeleteType))
             throw new AetherProtocolException(data.Length > MaxPacketBytes
                 ? PacketTooLarge
                 : "State packet is truncated.");
@@ -216,6 +245,8 @@ public static class AetherWire
             throw new AetherProtocolException("Wire version is not supported.");
         if (packetType == CreateType)
             return DecodeCreate(ref reader, entityId);
+        if (packetType == DeleteType)
+            return DecodeDelete(ref reader, entityId);
         var rule = reader.Text();
         if (!string.Equals(rule, LabelRule, StringComparison.Ordinal))
             throw new AetherProtocolException("Rule is not lww.");
@@ -269,6 +300,28 @@ public static class AetherWire
             entityTypeId: entityTypeId,
             creatorId: creatorId,
             ownerId: ownerId);
+    }
+
+    private static AetherOperation DecodeDelete(ref Reader reader, string entityId)
+    {
+        var id = reader.Text();
+        var encodedEntity = reader.Text();
+        var writerId = reader.Text();
+        var actorId = reader.Text();
+        var sequence = reader.I64();
+        var lamport = reader.I64();
+        reader.End();
+        if (!string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
+            throw new AetherProtocolException("Entity is not on this link.");
+        return new AetherOperation(
+            id,
+            encodedEntity,
+            writerId,
+            actorId,
+            sequence,
+            lamport,
+            new Dictionary<string, FieldValue>(),
+            AetherEffect.DeleteEntity);
     }
 
     private static IReadOnlyList<StoredField> DecodeContributions(byte[] data)

@@ -71,8 +71,8 @@ A failed handshake does not enter the queue. A replay fails because the
 transcript includes this connection's fresh nonce. A send the transport does
 not accept stays pending as the same bytes. The proof authenticates a principal's
 initial self-create: writer, actor peer, creator, and initial owner must all be that
-principal before the request enters the queue. It does not grant later owner
-transfer or delete authority.
+principal before the request enters the queue. Delete requires the authenticated
+principal to equal the stored owner. It does not grant owner transfer.
 A loaded record does not need a live connection.
 A local write is rejected before it is applied when its fields would not fit in
 one contribution packet, or when its one label would not fit in one state packet.
@@ -174,6 +174,9 @@ counter, deletion, or sync semantics match Aether's contracts.
   Update may wait as raw state for Create; it never becomes Create.
 - Delete is terminal for an entity ID. Hide changes shared visibility. Withdraw
   changes one publication membership. Field writes and heartbeat do not restore them.
+- Keep the authenticated Delete claim with the tombstone so restart catch-up can
+  send its canonical envelope after Create. A Delete received before Create waits
+  in a bounded dependency queue. It never supplies creation or ownership facts.
 - Compose the actual shared projection from deletion, visibility, and relevant
   publication/read membership. Storing a membership flag is insufficient if the
   frame or API projection ignores it. Preserve raw data as the contract requires.

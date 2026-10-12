@@ -57,6 +57,8 @@ public sealed class AetherPeerSimTests
         var sim = new Sim();
         sim.Add("ahead");
         sim.Add("behind");
+        sim.Deliver("ahead", CreateEntity());
+        sim.Deliver("behind", CreateEntity());
         sim.Deliver("ahead", publish);
         sim.Deliver("behind", publish);
         sim.Deliver("ahead", label);
@@ -166,6 +168,8 @@ public sealed class AetherPeerSimTests
         var sim = new Sim();
         var peer = sim.Add("a", dir.Path);
         sim.Add("b");
+        sim.Deliver("a", CreateEntity());
+        sim.Deliver("b", CreateEntity());
         sim.Deliver("a", publish);
         sim.Deliver("b", publish);
         sim.Deliver("a", withdraw);
@@ -183,7 +187,7 @@ public sealed class AetherPeerSimTests
         var restarted = sim.Restart("a");
         ExpectPartition(restarted);
         Assert.Equal(33, restarted.Clock);
-        Assert.Equal(4, Assert.Single(restarted.ActorCursors).Sequence);
+        Assert.Equal(4, Assert.Single(restarted.ActorCursors, cursor => cursor.ActorId == "peer-A/s1").Sequence);
 
         var stamped = restarted.StampLocal("entity-1", "peer-A", "peer-A/s1", new Dictionary<string, FieldValue>
         {
@@ -235,6 +239,8 @@ public sealed class AetherPeerSimTests
         var sim = new Sim();
         sim.Add("a");
         sim.Add("b");
+        sim.Deliver("a", CreateEntity());
+        sim.Deliver("b", CreateEntity());
         sim.Deliver("a", publish);
         sim.Deliver("b", publish);
         sim.Deliver("a", withdraw);
@@ -266,8 +272,30 @@ public sealed class AetherPeerSimTests
     private AetherOperation Life(AetherEffect effect, long lamport, string? publicationId)
     {
         var (id, actorId, sequence) = Next("peer-A");
-        return new AetherOperation(id, "entity-1", "peer-A", actorId, sequence, lamport, new Dictionary<string, FieldValue>(), effect, publicationId);
+        return new AetherOperation(
+            id,
+            "entity-1",
+            "peer-A",
+            effect == AetherEffect.DeleteEntity ? AetherActorId.Format("peer-A", "s1") : actorId,
+            sequence,
+            lamport,
+            new Dictionary<string, FieldValue>(),
+            effect,
+            publicationId);
     }
+
+    private static AetherOperation CreateEntity() => new(
+        "create",
+        "entity-1",
+        "peer-A",
+        AetherActorId.Format("peer-A", "create"),
+        1,
+        0,
+        new Dictionary<string, FieldValue>(),
+        AetherEffect.CreateEntity,
+        entityTypeId: "tests.stub.v1",
+        creatorId: "peer-A",
+        ownerId: "peer-A");
 
     private (string Id, string ActorId, long Sequence) Next(string writerId)
     {

@@ -571,6 +571,7 @@ public sealed class AetherReducerTests
         foreach (var deleteFirst in new[] { true, false })
         {
             var store = NewStore();
+            Apply(store, CreateEntity());
             var update = LabelOp("update", "peer-A", "peer-A/s1", 6, 10, "cube");
             var delete = Life(AetherEffect.DeleteEntity, "delete", 5);
             if (deleteFirst)
@@ -594,6 +595,7 @@ public sealed class AetherReducerTests
     public void A_snapshot_from_before_delete_does_not_revive()
     {
         var origin = NewStore();
+        Apply(origin, CreateEntity());
         Apply(origin, LabelOp("old", "peer-A", "peer-A/s1", 1, 10, "cube"));
         var before = origin.Capture();
         Apply(origin, Life(AetherEffect.DeleteEntity, "delete", 20));
@@ -822,6 +824,7 @@ public sealed class AetherReducerTests
         var delete = Life(AetherEffect.DeleteEntity, "delete", 20);
         var ops = new[]
         {
+            CreateEntity(),
             LabelOp("a-label", "peer-A", "peer-A/s1", 1, 10, "cube"),
             Life(AetherEffect.Publish, "pub", 11, publicationId: "catalog"),
             delete,
@@ -966,7 +969,29 @@ public sealed class AetherReducerTests
         long lamport,
         string actorId = "peer-A/s1",
         string? publicationId = null) =>
-        new(id, "entity-1", "peer-A", actorId, lamport, lamport, new Dictionary<string, FieldValue>(), effect, publicationId);
+        new(
+            id,
+            "entity-1",
+            "peer-A",
+            effect == AetherEffect.DeleteEntity ? AetherActorId.Format("peer-A", "s1") : actorId,
+            lamport,
+            lamport,
+            new Dictionary<string, FieldValue>(),
+            effect,
+            publicationId);
+
+    private static AetherOperation CreateEntity() => new(
+        "create",
+        "entity-1",
+        "peer-A",
+        AetherActorId.Format("peer-A", "create"),
+        1,
+        0,
+        new Dictionary<string, FieldValue>(),
+        AetherEffect.CreateEntity,
+        entityTypeId: "tests.stub.v1",
+        creatorId: "peer-A",
+        ownerId: "peer-A");
 
     private static StoredField LabelRow(long lamport, string label, string operationId) =>
         new(

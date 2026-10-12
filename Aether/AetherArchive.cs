@@ -12,7 +12,7 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    private const ushort FormatVersion = 6;
+    private const ushort FormatVersion = 7;
     private const byte ContributionRecord = 0x10;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;
@@ -128,10 +128,11 @@ public sealed class AetherArchive
         var visibility = ReadVisibility(reader);
         var membership = ReadMembership(reader);
         var entities = ReadEntities(reader);
+        var deletions = ReadDeletions(reader);
         var cursors = ReadCursors(reader);
         reader.End();
 
-        reducer.MergeImage(new AetherImage(clock, fields, seen, deleted, visibility, membership, entities));
+        reducer.MergeImage(new AetherImage(clock, fields, seen, deleted, visibility, membership, entities, deletions));
         reducer.RestoreSaveThrough(saveThrough);
         foreach (var cursor in cursors)
             reducer.RestoreActorSequence(cursor.ActorId, cursor.Sequence, cursor.Lamport, cursor.OperationId);
@@ -290,6 +291,23 @@ public sealed class AetherArchive
         return entities;
     }
 
+    private static List<StoredDeletion> ReadDeletions(Reader reader)
+    {
+        var count = reader.U32();
+        var deletions = new List<StoredDeletion>(checked((int)count));
+        for (var i = 0; i < count; i++)
+        {
+            var entityId = reader.Text();
+            var writerId = reader.Text();
+            var version = new FieldVersion(reader.I64(), reader.Text());
+            var operationId = reader.Text();
+            var sequence = reader.I64();
+            deletions.Add(new StoredDeletion(entityId, writerId, version, operationId, sequence));
+        }
+
+        return deletions;
+    }
+
     private static List<ActorCursor> ReadCursors(Reader reader)
     {
         var count = reader.U32();
@@ -369,6 +387,17 @@ public sealed class AetherArchive
             WriteText(buffer, entity.Version.ActorId);
             WriteText(buffer, entity.OperationId);
             WriteI64(buffer, entity.Sequence);
+        }
+
+        WriteU32(buffer, (uint)(image.Deletions?.Count ?? 0));
+        foreach (var deletion in image.Deletions ?? [])
+        {
+            WriteText(buffer, deletion.EntityId);
+            WriteText(buffer, deletion.WriterId);
+            WriteI64(buffer, deletion.Version.Lamport);
+            WriteText(buffer, deletion.Version.ActorId);
+            WriteText(buffer, deletion.OperationId);
+            WriteI64(buffer, deletion.Sequence);
         }
 
         WriteU32(buffer, (uint)reducer.ActorCursors.Count);

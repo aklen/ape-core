@@ -16,6 +16,7 @@ public sealed class AetherReducer
     private readonly Dictionary<string, long> _nextSequence = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ActorFrontier> _frontiers = new(StringComparer.Ordinal);
     private readonly HashSet<string> _deleted = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, StoredDeletion> _deletions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, VisibilityState> _visibility = new(StringComparer.Ordinal);
     private readonly Dictionary<MembershipKey, MembershipState> _membership = new();
     private readonly Dictionary<string, StoredEntity> _entities = new(StringComparer.Ordinal);
@@ -55,6 +56,9 @@ public sealed class AetherReducer
 
     public IReadOnlyList<StoredEntity> Entities =>
         _entities.Values.OrderBy(entity => entity.EntityId, StringComparer.Ordinal).ToArray();
+
+    public IReadOnlyList<StoredDeletion> Deletions =>
+        _deletions.Values.OrderBy(deletion => deletion.EntityId, StringComparer.Ordinal).ToArray();
 
     public bool Remembers(string operationId) => _digests.ContainsKey(operationId);
 
@@ -156,6 +160,29 @@ public sealed class AetherReducer
         return stamped;
     }
 
+    public AetherOperation StampLocalDelete(string entityId, string writerId, string actorId)
+    {
+        if (string.IsNullOrEmpty(actorId))
+            throw new AetherProtocolException("Actor sequence is missing.");
+        var nextClock = NextClock(_clock);
+        var sequence = NextSequence(actorId);
+        var stamped = new AetherOperation(
+            $"{actorId}/{sequence.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
+            entityId,
+            writerId,
+            actorId,
+            sequence,
+            nextClock,
+            new Dictionary<string, FieldValue>(),
+            AetherEffect.DeleteEntity);
+        RejectBeforeAdmit(stamped);
+        AetherWire.Encode(stamped);
+        _clock = nextClock;
+        _nextSequence[actorId] = sequence;
+        _frontiers[actorId] = new ActorFrontier(sequence, nextClock, stamped.Id);
+        return stamped;
+    }
+
     /// <summary>
     /// Fold an operation. A newly admitted remote op sets the clock to max(clock, lamport) + 1,
     /// including when the remote Lamport is older. An exact duplicate still in the window leaves the clock alone.
@@ -206,6 +233,7 @@ public sealed class AetherReducer
             switch (op.Effect)
             {
                 case AetherEffect.DeleteEntity:
+                    RejectDeletion(op);
                     return;
                 case AetherEffect.HideShared:
                     RejectVisibility(op.EntityId, version, hidden: true);
@@ -401,6 +429,8 @@ public sealed class AetherReducer
             UpsertMembership(new MembershipKey(mark.EntityId, mark.PublicationId), mark.Version, mark.Published);
         foreach (var entity in folded.Entities)
             UpsertEntity(entity);
+        foreach (var deletion in folded.Deletions)
+            UpsertDeletion(deletion);
     }
 
     public AetherImage Capture()
@@ -421,7 +451,8 @@ public sealed class AetherReducer
             .Select(pair => new MembershipMark(pair.Key.EntityId, pair.Key.PublicationId, pair.Value.Version, pair.Value.Published))
             .ToArray();
         var entities = _entities.Values.OrderBy(entity => entity.EntityId, StringComparer.Ordinal).ToArray();
-        return new AetherImage(_clock, fields, _seenOrder.ToArray(), deleted, visibility, membership, entities);
+        var deletions = _deletions.Values.OrderBy(deletion => deletion.EntityId, StringComparer.Ordinal).ToArray();
+        return new AetherImage(_clock, fields, _seenOrder.ToArray(), deleted, visibility, membership, entities, deletions);
     }
 
     public void RestoreActorSequence(string actorId, long sequence, long lamport = 0, string? operationId = null)
@@ -447,6 +478,9 @@ public sealed class AetherReducer
 
     public StoredEntity? GetEntity(string entityId) =>
         _entities.TryGetValue(entityId, out var entity) ? entity : null;
+
+    public StoredDeletion? GetDeletion(string entityId) =>
+        _deletions.TryGetValue(entityId, out var deletion) ? deletion : null;
 
     public bool IsSharedVisible(string entityId) =>
         !_visibility.TryGetValue(entityId, out var state) || !state.Hidden;
@@ -504,8 +538,10 @@ public sealed class AetherReducer
         switch (op.Effect)
         {
             case AetherEffect.DeleteEntity:
+                RejectDeletion(op);
                 Admit(op, observeClock);
                 _deleted.Add(op.EntityId);
+                UpsertDeletion(DeletionFrom(op));
                 return;
             case AetherEffect.HideShared:
                 RejectVisibility(op.EntityId, version, hidden: true);
@@ -591,12 +627,40 @@ public sealed class AetherReducer
             folded.Add(winner!);
         }
 
+        var entities = FoldEntities(image.Entities);
+        var deletions = FoldDeletions(image.Deletions, entities);
+        var deleted = FoldDeleted(image.Deleted);
+        if (!deleted.ToHashSet(StringComparer.Ordinal).SetEquals(deletions.Select(row => row.EntityId)))
+            throw new AetherProtocolException("Snapshot tombstone metadata is incomplete.");
         return new FoldedImage(
             folded,
-            FoldDeleted(image.Deleted),
+            deleted,
             FoldVisibility(image.Visibility),
             FoldMembership(image.Membership),
-            FoldEntities(image.Entities));
+            entities,
+            deletions);
+    }
+
+    private List<StoredDeletion> FoldDeletions(
+        IReadOnlyList<StoredDeletion>? rows,
+        IReadOnlyList<StoredEntity> imageEntities)
+    {
+        var entities = imageEntities.ToDictionary(entity => entity.EntityId, StringComparer.Ordinal);
+        var folded = new Dictionary<string, StoredDeletion>(StringComparer.Ordinal);
+        foreach (var row in rows ?? [])
+        {
+            var entity = entities.TryGetValue(row.EntityId, out var fromImage)
+                ? fromImage
+                : GetEntity(row.EntityId) ?? throw new AetherProtocolException("Delete entity owner is unknown.");
+            RequireDeletion(row, entity);
+            if (_deletions.TryGetValue(row.EntityId, out var existing) && existing != row)
+                throw new AetherProtocolException($"Entity '{row.EntityId}' has a deletion collision.");
+            if (folded.TryGetValue(row.EntityId, out var prior) && prior != row)
+                throw new AetherProtocolException($"Entity '{row.EntityId}' has a deletion collision.");
+            folded[row.EntityId] = row;
+        }
+
+        return folded.Values.ToList();
     }
 
     private List<StoredEntity> FoldEntities(IReadOnlyList<StoredEntity>? rows)
@@ -631,6 +695,53 @@ public sealed class AetherReducer
         RequireCreation(candidate);
         if (_entities.TryGetValue(op.EntityId, out var existing))
             RejectEntityConflict(existing, candidate);
+    }
+
+    private void RejectDeletion(AetherOperation op)
+    {
+        var entity = GetEntity(op.EntityId)
+            ?? throw new AetherProtocolException("Delete entity owner is unknown.");
+        var deletion = DeletionFrom(op);
+        RequireDeletion(deletion, entity);
+        if (_deletions.TryGetValue(op.EntityId, out var existing) && existing != deletion)
+            throw new AetherProtocolException($"Entity '{op.EntityId}' is already deleted.");
+    }
+
+    private static StoredDeletion DeletionFrom(AetherOperation op) => new(
+        op.EntityId,
+        op.WriterId,
+        new FieldVersion(op.Lamport, op.ActorId),
+        op.Id,
+        op.Sequence);
+
+    private static void RequireDeletion(StoredDeletion deletion, StoredEntity entity)
+    {
+        if (string.IsNullOrEmpty(deletion.EntityId)
+            || string.IsNullOrEmpty(deletion.WriterId)
+            || string.IsNullOrEmpty(deletion.Version.ActorId)
+            || string.IsNullOrEmpty(deletion.OperationId)
+            || deletion.Sequence < 1)
+            throw new AetherProtocolException("Deletion metadata is missing.");
+        if (!string.Equals(deletion.EntityId, entity.EntityId, StringComparison.Ordinal)
+            || !string.Equals(deletion.WriterId, entity.OwnerId, StringComparison.Ordinal)
+            || !ActorBelongsTo(deletion.Version.ActorId, entity.OwnerId))
+            throw new AetherProtocolException("Delete is not issued by the entity owner.");
+    }
+
+    private static bool ActorBelongsTo(string actorId, string principalId) =>
+        AetherActorId.TryParse(actorId, out var actor)
+        && string.Equals(actor.PeerId, principalId, StringComparison.Ordinal);
+
+    private void UpsertDeletion(StoredDeletion deletion)
+    {
+        if (_deletions.TryGetValue(deletion.EntityId, out var existing))
+        {
+            if (existing != deletion)
+                throw new AetherProtocolException($"Entity '{deletion.EntityId}' has a deletion collision.");
+            return;
+        }
+        _deletions[deletion.EntityId] = deletion;
+        _deleted.Add(deletion.EntityId);
     }
 
     private static StoredEntity EntityFrom(AetherOperation op) => new(
@@ -1014,7 +1125,8 @@ public sealed class AetherReducer
         List<string> Deleted,
         List<VisibilityMark> Visibility,
         List<MembershipMark> Membership,
-        List<StoredEntity> Entities);
+        List<StoredEntity> Entities,
+        List<StoredDeletion> Deletions);
 }
 
 public readonly record struct FieldDefinition(string Id, string Resolver, long Min, long Max);
@@ -1036,6 +1148,13 @@ public sealed record StoredEntity(
     string EntityTypeId,
     string CreatorId,
     string OwnerId,
+    FieldVersion Version,
+    string OperationId,
+    long Sequence);
+
+public sealed record StoredDeletion(
+    string EntityId,
+    string WriterId,
     FieldVersion Version,
     string OperationId,
     long Sequence);
@@ -1067,4 +1186,5 @@ public sealed record AetherImage(
     IReadOnlyList<string>? Deleted = null,
     IReadOnlyList<VisibilityMark>? Visibility = null,
     IReadOnlyList<MembershipMark>? Membership = null,
-    IReadOnlyList<StoredEntity>? Entities = null);
+    IReadOnlyList<StoredEntity>? Entities = null,
+    IReadOnlyList<StoredDeletion>? Deletions = null);
