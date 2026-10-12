@@ -199,7 +199,7 @@ public sealed class AetherLabelLinkTests
     public void A_connection_does_not_replace_its_principal()
     {
         var transport = new ScriptedTransport("process-b");
-        var network = new NetworkManager(transport);
+        var network = new NetworkManager(transport, allowUnauthenticated: true);
         var slot = transport.OpenSlot();
         transport.Announce(slot, "process-a");
         transport.Announce(slot, "process-c");
@@ -219,7 +219,7 @@ public sealed class AetherLabelLinkTests
     public void Reconnect_keeps_one_writer_for_lww_and_sum()
     {
         var transport = new ScriptedTransport("process-b");
-        var network = new NetworkManager(transport);
+        var network = new NetworkManager(transport, allowUnauthenticated: true);
         var store = new AetherReducer();
         store.DefineField("label", "lww");
         store.DefineField("offset", "sumContributions");
@@ -385,7 +385,7 @@ public sealed class AetherLabelLinkTests
         Assert.NotEqual("instance-2", announced);
 
         var receiverTransport = new ScriptedTransport("instance-9");
-        var receiverNetwork = new NetworkManager(receiverTransport, "other-principal");
+        var receiverNetwork = new NetworkManager(receiverTransport, "other-principal", allowUnauthenticated: true);
         var receiverStore = new AetherArchive(saved.Path).Load();
         var receiverHost = new AetherHost(receiverStore, 4096, 8);
         var slot = receiverTransport.OpenSlot();
@@ -447,7 +447,7 @@ public sealed class AetherLabelLinkTests
         Assert.Equal(AetherAdmitKind.Queued, left.Link.LastRemoteAdmit!.Value.Kind);
 
         var transport = new ScriptedTransport("instance-3");
-        var network = new NetworkManager(transport, "principal-3");
+        var network = new NetworkManager(transport, "principal-3", allowUnauthenticated: true);
         var bare = transport.OpenSlot();
         var hugeHello = new byte[PeerHello.MaxBytes + 1];
         hugeHello[0] = PeerHello.Marker;
@@ -458,6 +458,56 @@ public sealed class AetherLabelLinkTests
         Assert.True(network.TryGetPeer(bare, out var peer));
         Assert.Equal("principal-3", peer.PrincipalId);
         Assert.False(peer.IsAuthenticated);
+    }
+
+    [Fact]
+    public void An_unidentified_packet_expires_before_it_is_admitted()
+    {
+        var time = new ManualTime();
+        var store = new AetherReducer();
+        store.DefineField("label", "lww");
+        using var left = Link(
+            "local",
+            "local",
+            "s1",
+            store,
+            8,
+            64,
+            65_536,
+            time: time,
+            unidentifiedLifetime: TimeSpan.FromSeconds(5));
+        var actor = AetherActorId.Format("peer-a", "s1");
+        var packet = AetherWire.Encode(new AetherOperation(
+            "peer-a/s1/1",
+            "entity-1",
+            "peer-a",
+            actor,
+            1,
+            4,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("kept") }));
+        var freshActor = AetherActorId.Format("peer-b", "s1");
+        var freshPacket = AetherWire.Encode(new AetherOperation(
+            "peer-b/s1/1",
+            "entity-1",
+            "peer-b",
+            freshActor,
+            1,
+            4,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("now") }));
+        var fresh = left.Transport.OpenSlot();
+        left.Transport.DeliverSlot(fresh, freshPacket);
+        left.Transport.Announce(fresh, "peer-b");
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.LastRemoteAdmit!.Value.Kind);
+
+        var slot = left.Transport.OpenSlot();
+        left.Transport.DeliverSlot(slot, packet);
+        time.Now += TimeSpan.FromSeconds(6);
+        var pending = left.Host.PendingCount;
+        var clock = store.Clock;
+        left.Transport.Announce(slot, "peer-a");
+        Assert.Equal(pending, left.Host.PendingCount);
+        Assert.Equal(clock, store.Clock);
+        Assert.Equal(0, store.RecordCount);
     }
 
     [Fact]
@@ -754,10 +804,12 @@ public sealed class AetherLabelLinkTests
         int maxCount,
         int maxOutgoing,
         int maxUnidentifiedBytes,
-        int maxBytes = 4096)
+        int maxBytes = 4096,
+        TimeProvider? time = null,
+        TimeSpan? unidentifiedLifetime = null)
     {
         var transport = new ScriptedTransport(processId);
-        var network = new NetworkManager(transport, principal);
+        var network = new NetworkManager(transport, principal, allowUnauthenticated: true);
         var sp = RegisteredEntityCommitTests.BuildWithStubRegistered();
         var scene = sp.GetRequiredService<ISceneManager>();
         var log = sp.GetRequiredService<ILogger>();
@@ -776,7 +828,10 @@ public sealed class AetherLabelLinkTests
             session,
             "catalog",
             maxOutgoing: maxOutgoing,
-            maxUnidentifiedBytes: maxUnidentifiedBytes);
+            maxUnidentifiedBytes: maxUnidentifiedBytes,
+            time: time,
+            unidentifiedLifetime: unidentifiedLifetime,
+            allowUnauthenticated: true);
         return new PeerPeer(transport, network, link, scene, store, host);
     }
 
@@ -931,6 +986,13 @@ public sealed class AetherLabelLinkTests
         public void RequestFileChunk(string peerId, Guid fileId, int chunkIndex) { }
 
         public void Dispose() { }
+    }
+
+    private sealed class ManualTime : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+        public override DateTimeOffset GetUtcNow() => Now;
     }
 
     private sealed class TempDir : IDisposable

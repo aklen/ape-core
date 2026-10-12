@@ -9,6 +9,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.Versioning;
+using System.Security.Cryptography;
 
 namespace Ape.Core.Network.Services;
 
@@ -30,7 +31,11 @@ public class NetworkManager : INetworkManager, ICoreService, IDisposable
     private readonly INetworkTransport _transport;
     private readonly object _peersGate = new();
     private readonly Dictionary<string, PeerConnectionContext> _peers = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Handshake> _handshakes = new(StringComparer.Ordinal);
     private readonly DurablePrincipal? _profile;
+    private readonly DurablePrincipal? _signer;
+    private readonly TimeProvider _time;
+    private readonly bool _allowUnauthenticated;
     private string _role = String.Empty;
 
     public event Action<string, byte[]>? OnDataReceived;
@@ -45,7 +50,8 @@ public class NetworkManager : INetworkManager, ICoreService, IDisposable
     public string LocalPeerId => _transport.LocalPeerId;
 
     /// <summary>
-    /// Durable writer id. The hello sends this. <see cref="LocalPeerId"/> stays the process instance.
+    /// Durable writer id. A profile key sends its public-key fingerprint. <see cref="LocalPeerId"/> stays the process instance.
+    /// A checked handshake is not create, owner, or delete authority.
     /// </summary>
     public string PrincipalId { get; }
 
@@ -73,11 +79,13 @@ public class NetworkManager : INetworkManager, ICoreService, IDisposable
             _ => throw new ArgumentException($"Unknown transport type: {transportType}")
         };
         _transport = transport;
+        _time = TimeProvider.System;
         if (string.IsNullOrEmpty(profileDirectory))
-            PrincipalId = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(DurablePrincipal.ByteLength)).ToLowerInvariant();
+            PrincipalId = Convert.ToHexString(RandomNumberGenerator.GetBytes(DurablePrincipal.ByteLength)).ToLowerInvariant();
         else
         {
             _profile = DurablePrincipal.Open(profileDirectory);
+            _signer = _profile;
             PrincipalId = _profile.Id;
         }
 
@@ -86,11 +94,24 @@ public class NetworkManager : INetworkManager, ICoreService, IDisposable
         tempLogger.LogDebug($"NetworkManager initialized with {transportType} transport");
     }
 
-    internal NetworkManager(INetworkTransport transport, string? principalId = null)
+    internal NetworkManager(INetworkTransport transport, string? principalId = null, bool allowUnauthenticated = false)
     {
         ArgumentNullException.ThrowIfNull(transport);
         _transport = transport;
+        _time = TimeProvider.System;
+        _allowUnauthenticated = allowUnauthenticated;
         PrincipalId = string.IsNullOrEmpty(principalId) ? transport.LocalPeerId : principalId;
+        Wire();
+    }
+
+    internal NetworkManager(INetworkTransport transport, DurablePrincipal signer, TimeProvider? time = null)
+    {
+        ArgumentNullException.ThrowIfNull(transport);
+        ArgumentNullException.ThrowIfNull(signer);
+        _transport = transport;
+        _signer = signer;
+        _time = time ?? TimeProvider.System;
+        PrincipalId = signer.Id;
         Wire();
     }
 
@@ -98,14 +119,24 @@ public class NetworkManager : INetworkManager, ICoreService, IDisposable
     {
         _transport.OnDataReceived += (connectionId, data, length) =>
         {
+            if (length >= 1 && data[0] == PrincipalHandshake.Marker)
+            {
+                if (length < 2 || data[1] != PrincipalHandshake.Version || length > PrincipalHandshake.MaxBytes)
+                    return;
+                var packet = new byte[length];
+                Array.Copy(data, packet, length);
+                AcceptHandshake(connectionId, packet);
+                return;
+            }
+
             if (length >= 2 && PeerHello.HasMarker(data.AsSpan(0, length)))
             {
-                if (length > PeerHello.MaxBytes)
+                if (length > PeerHello.MaxBytes || _signer is not null || !_allowUnauthenticated)
                     return;
                 var hello = new byte[length];
                 Array.Copy(data, hello, length);
                 if (PeerHello.TryDecode(hello, out var principal))
-                    Bind(connectionId, principal);
+                    Bind(connectionId, principal, authenticated: false);
                 return;
             }
 
@@ -117,7 +148,10 @@ public class NetworkManager : INetworkManager, ICoreService, IDisposable
         {
             try
             {
-                _transport.SendReliable(connectionId, PeerHello.Encode(PrincipalId));
+                if (_signer is not null)
+                    SendHello(connectionId);
+                else if (_allowUnauthenticated)
+                    _transport.SendReliable(connectionId, PeerHello.Encode(PrincipalId));
             }
             catch (Exception ex)
             {
@@ -129,9 +163,230 @@ public class NetworkManager : INetworkManager, ICoreService, IDisposable
         _transport.OnPeerDisconnected += connectionId =>
         {
             lock (_peersGate)
+            {
                 _peers.Remove(connectionId);
+                _handshakes.Remove(connectionId);
+            }
+
             OnPeerDisconnected?.Invoke(connectionId);
         };
+    }
+
+    private void SendHello(string connectionId)
+    {
+        lock (_peersGate)
+        {
+            if (!_handshakes.TryGetValue(connectionId, out var state))
+            {
+                state = new Handshake();
+                _handshakes[connectionId] = state;
+            }
+
+            if (state.Failed)
+                return;
+            if (state.LocalNonce.Length != PrincipalHandshake.NonceLength)
+            {
+                state.LocalNonce = RandomNumberGenerator.GetBytes(PrincipalHandshake.NonceLength);
+                state.StartedAt = _time.GetUtcNow();
+            }
+
+            state.HelloEnvelope ??= PrincipalHandshake.EncodeHello(_signer!, state.LocalNonce);
+        }
+
+        Flush(connectionId);
+    }
+
+    private void Flush(string connectionId)
+    {
+        Handshake? state;
+        lock (_peersGate)
+        {
+            if (!_handshakes.TryGetValue(connectionId, out state))
+                return;
+            if (state.Failed || Expired(state))
+            {
+                Fail(state);
+                return;
+            }
+        }
+
+        if (!SendEnvelope(connectionId, state, hello: true))
+            return;
+        SendProofIfReady(connectionId, state);
+    }
+
+    private void AcceptHandshake(string connectionId, byte[] packet)
+    {
+        if (_signer is null || !PrincipalHandshake.TryRead(packet, out var message))
+            return;
+        if (message.Kind == 1)
+            AcceptHello(connectionId, message);
+        else
+            AcceptProof(connectionId, message);
+    }
+
+    private void AcceptHello(string connectionId, PrincipalHandshake.Message message)
+    {
+        Handshake state;
+        lock (_peersGate)
+        {
+            if (_peers.ContainsKey(connectionId))
+                return;
+            if (!_handshakes.TryGetValue(connectionId, out state!))
+            {
+                state = new Handshake { StartedAt = _time.GetUtcNow() };
+                _handshakes[connectionId] = state;
+            }
+
+            if (state.Failed || Expired(state))
+            {
+                Fail(state);
+                return;
+            }
+
+            if (state.RemoteNonce is not null)
+                return;
+            if (!DurablePrincipal.IsCanonicalP256(message.PublicKey))
+            {
+                Fail(state);
+                return;
+            }
+
+            var fingerprint = SHA256.HashData(message.PublicKey);
+            if (message.Fingerprint.Length != fingerprint.Length
+                || !CryptographicOperations.FixedTimeEquals(message.Fingerprint, fingerprint)
+                || message.Fingerprint.AsSpan().SequenceEqual(_signer!.FingerprintBytes))
+            {
+                Fail(state);
+                return;
+            }
+
+            state.RemoteNonce = message.Nonce;
+            state.RemoteKey = message.PublicKey;
+            state.RemoteFingerprint = message.Fingerprint;
+        }
+
+        Flush(connectionId);
+    }
+
+    private void AcceptProof(string connectionId, PrincipalHandshake.Message message)
+    {
+        string? principal = null;
+        lock (_peersGate)
+        {
+            if (_peers.ContainsKey(connectionId) || !_handshakes.TryGetValue(connectionId, out var state))
+                return;
+            if (state.Failed || Expired(state) || state.RemoteNonce is null || state.LocalNonce.Length != PrincipalHandshake.NonceLength)
+            {
+                Fail(state);
+                return;
+            }
+
+            var transcript = PrincipalHandshake.Transcript(
+                state.RemoteFingerprint!,
+                _signer!.FingerprintBytes,
+                state.RemoteNonce,
+                state.LocalNonce,
+                state.RemoteKey!,
+                _signer.PublicKey);
+            if (!DurablePrincipal.Verify(state.RemoteKey!, transcript, message.Signature))
+            {
+                Fail(state);
+                return;
+            }
+
+            principal = Convert.ToHexString(state.RemoteFingerprint!).ToLowerInvariant();
+        }
+
+        if (principal is not null && !Bind(connectionId, principal, authenticated: true))
+        {
+            lock (_peersGate)
+            {
+                if (_handshakes.TryGetValue(connectionId, out var state))
+                    Fail(state);
+            }
+        }
+    }
+
+    private void SendProofIfReady(string connectionId, Handshake state)
+    {
+        lock (_peersGate)
+        {
+            if (state.Failed || state.ProofSent || state.RemoteNonce is null || state.LocalNonce.Length != PrincipalHandshake.NonceLength)
+                return;
+            if (state.ProofEnvelope is null)
+            {
+                var transcript = PrincipalHandshake.Transcript(
+                    _signer!.FingerprintBytes,
+                    state.RemoteFingerprint!,
+                    state.LocalNonce,
+                    state.RemoteNonce,
+                    _signer.PublicKey,
+                    state.RemoteKey!);
+                state.ProofEnvelope = PrincipalHandshake.EncodeProof(_signer.Sign(transcript));
+            }
+        }
+
+        SendEnvelope(connectionId, state, hello: false);
+    }
+
+    private bool SendEnvelope(string connectionId, Handshake state, bool hello)
+    {
+        byte[]? envelope;
+        lock (_peersGate)
+        {
+            if (state.Failed)
+                return false;
+            if (hello ? state.HelloSent : state.ProofSent)
+                return true;
+            envelope = hello ? state.HelloEnvelope : state.ProofEnvelope;
+            if (envelope is null)
+                return false;
+        }
+
+        try
+        {
+            _transport.SendReliable(connectionId, envelope);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning($"[NetworkManager] Peer hello was not sent: {ex.Message}");
+            return false;
+        }
+
+        lock (_peersGate)
+        {
+            if (hello)
+                state.HelloSent = true;
+            else
+                state.ProofSent = true;
+        }
+
+        return true;
+    }
+
+    private bool Expired(Handshake state) => _time.GetUtcNow() - state.StartedAt > PrincipalHandshake.Lifetime;
+
+    private static void Fail(Handshake state)
+    {
+        state.Failed = true;
+        state.RemoteNonce = null;
+        state.RemoteKey = null;
+        state.RemoteFingerprint = null;
+    }
+
+    private sealed class Handshake
+    {
+        public byte[] LocalNonce { get; set; } = [];
+        public byte[]? RemoteNonce { get; set; }
+        public byte[]? RemoteKey { get; set; }
+        public byte[]? RemoteFingerprint { get; set; }
+        public DateTimeOffset StartedAt { get; set; }
+        public bool Failed { get; set; }
+        public byte[]? HelloEnvelope { get; set; }
+        public byte[]? ProofEnvelope { get; set; }
+        public bool HelloSent { get; set; }
+        public bool ProofSent { get; set; }
     }
 
     public bool TryGetPeer(string connectionId, out PeerConnectionContext peer)
@@ -140,24 +395,27 @@ public class NetworkManager : INetworkManager, ICoreService, IDisposable
             return _peers.TryGetValue(connectionId, out peer);
     }
 
-    private void Bind(string connectionId, string principal)
+    private bool Bind(string connectionId, string principal, bool authenticated)
     {
         PeerConnectionContext bound;
         lock (_peersGate)
         {
-            if (_peers.TryGetValue(connectionId, out var existing))
-                return;
+            if (_peers.ContainsKey(connectionId))
+                return false;
+            if (_handshakes.TryGetValue(connectionId, out var handshake) && handshake.Failed)
+                return false;
             foreach (var peer in _peers.Values)
             {
                 if (string.Equals(peer.PrincipalId, principal, StringComparison.Ordinal))
-                    return;
+                    return false;
             }
 
-            bound = new PeerConnectionContext(connectionId, principal, IsAuthenticated: false);
+            bound = new PeerConnectionContext(connectionId, principal, authenticated);
             _peers[connectionId] = bound;
         }
 
         OnPeerIdentified?.Invoke(bound);
+        return true;
     }
 
     // ICoreService implementation
@@ -230,6 +488,23 @@ public class NetworkManager : INetworkManager, ICoreService, IDisposable
     public void PollEvents()
     {
         _transport.PollEvents();
+        string[] pending;
+        lock (_peersGate)
+        {
+            foreach (var handshake in _handshakes.Values)
+            {
+                if (!handshake.Failed && Expired(handshake))
+                    Fail(handshake);
+            }
+
+            pending = _handshakes
+                .Where(pair => !pair.Value.Failed && (!pair.Value.HelloSent || (pair.Value.ProofEnvelope is not null && !pair.Value.ProofSent)))
+                .Select(pair => pair.Key)
+                .ToArray();
+        }
+
+        foreach (var connectionId in pending)
+            Flush(connectionId);
     }
 
     /// <inheritdoc/>

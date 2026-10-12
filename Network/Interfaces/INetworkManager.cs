@@ -12,8 +12,8 @@ public interface INetworkManager
     string LocalPeerId { get; }
 
     /// <summary>
-    /// Durable writer id loaded from disk. The hello sends this, not <see cref="LocalPeerId"/>.
-    /// A stored 256-bit id is not a signature. Create, owner, and delete authority do not use it.
+    /// Durable writer id. A profile sends the fingerprint of its public key, not <see cref="LocalPeerId"/>.
+    /// A checked handshake shows that this key is present. Create, owner, and delete authority do not use it.
     /// </summary>
     string PrincipalId { get; }
 

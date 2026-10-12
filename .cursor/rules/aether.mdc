@@ -51,14 +51,33 @@ happens before the queue. The socket slot only routes. The process instance id c
 change on every start. The durable principal is a 256-bit id in an explicit profile
 directory. One process holds that profile. One profile is the whole configuration
 directory. The file has a magic, a version, and a checksum. A damaged file does
-not open. It is not a signature, so create, owner, and delete do not use it yet.
+not open. A version 1 file is not opened. Its random id is not this key's
+fingerprint, so a new profile is required. The key file is readable only by
+its owner, and the profile directory is private before the key is written.
+The temporary key is flushed, then renamed, and the profile directory is
+flushed so the new name survives power loss. A recovered temporary file is
+opened exclusively, checked as a canonical P-256 key, flushed again, and only
+then renamed. An existing principal is accepted only after that directory is
+flushed again. The parent of the profile directory must already exist.
+Open may create the profile directory, and it flushes that parent before
+it accepts the principal.
+The checksum shows integrity, not secrecy.
+A handshake public key must be the canonical P-256 encoding, with no extra bytes.
+The principal id is the fingerprint of the profile's public key.
+`IsAuthenticated` is true only after both sides sign a fresh transcript.
+A remote state packet is admitted only from an authenticated peer.
+An unauthenticated claim is a development switch and stays off unless requested.
+A failed handshake does not enter the queue. A replay fails because the
+transcript includes this connection's fresh nonce. A send the transport does
+not accept stays pending as the same bytes. The proof is not create, owner,
+or delete authority.
 A loaded record does not need a live connection.
 A local write is rejected before it is applied when its fields would not fit in
 one contribution packet, or when its one label would not fit in one state packet.
 The encoded size is counted before the payload is copied.
 A state packet and a contribution count are rejected before a field array is built
 when they pass the protocol maximum. Packets waiting for a principal are capped
-by count and by bytes.
+by count, by bytes, and by time.
 An unchanged merge is not appended.
 The actor and the sequence are on the record, not parsed from the operation id.
 An operation is resent only from an envelope this process still holds.

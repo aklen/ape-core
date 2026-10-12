@@ -23,6 +23,9 @@ public sealed class AetherLabelLink : IDisposable
     private readonly string _fieldId;
     private readonly int _maxOutgoing;
     private readonly int _maxUnidentifiedBytes;
+    private readonly TimeProvider _time;
+    private readonly TimeSpan _unidentifiedLifetime;
+    private readonly bool _allowUnauthenticated;
     private readonly HashSet<long> _localIds = new();
     private readonly Queue<AetherOperation> _outgoing = new();
     private readonly Queue<HeldOperation> _held = new();
@@ -49,14 +52,22 @@ public sealed class AetherLabelLink : IDisposable
         string fieldId = "label",
         string labelPropertyName = "Label",
         int maxOutgoing = 64,
-        int maxUnidentifiedBytes = 65_536)
+        int maxUnidentifiedBytes = 65_536,
+        TimeProvider? time = null,
+        TimeSpan? unidentifiedLifetime = null,
+        bool allowUnauthenticated = false)
     {
         if (maxOutgoing < 1)
             throw new ArgumentOutOfRangeException(nameof(maxOutgoing));
         if (maxUnidentifiedBytes < 1)
             throw new ArgumentOutOfRangeException(nameof(maxUnidentifiedBytes));
+        if (unidentifiedLifetime is { } lifetime && lifetime <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(unidentifiedLifetime));
         _maxOutgoing = maxOutgoing;
         _maxUnidentifiedBytes = maxUnidentifiedBytes;
+        _time = time ?? TimeProvider.System;
+        _unidentifiedLifetime = unidentifiedLifetime ?? TimeSpan.FromSeconds(5);
+        _allowUnauthenticated = allowUnauthenticated;
         _network = network ?? throw new ArgumentNullException(nameof(network));
         _host = host ?? throw new ArgumentNullException(nameof(host));
         _scene = scene ?? throw new ArgumentNullException(nameof(scene));
@@ -127,6 +138,7 @@ public sealed class AetherLabelLink : IDisposable
     public void Pump()
     {
         ObjectDisposedException.ThrowIf(_stopped, this);
+        DropExpired();
         AdmitHeld();
         AdmitContributions();
         _plan.Tick(ref _scratch, ref _runtime);
@@ -186,6 +198,12 @@ public sealed class AetherLabelLink : IDisposable
             return;
         }
 
+        if (!Accepts(peer))
+        {
+            RefuseUnauthenticated(connectionId);
+            return;
+        }
+
         AcceptRemote(peer.PrincipalId, operation, fields);
     }
 
@@ -195,27 +213,20 @@ public sealed class AetherLabelLink : IDisposable
     {
         if (_stopped)
             return;
-        var kept = new Queue<UnidentifiedPacket>();
-        while (_unidentified.Count > 0)
-        {
-            var held = _unidentified.Dequeue();
-            if (string.Equals(held.ConnectionId, connectionId, StringComparison.Ordinal))
-            {
-                _unidentifiedBytes -= held.Data.Length;
-                continue;
-            }
-
-            kept.Enqueue(held);
-        }
-
-        while (kept.Count > 0)
-            _unidentified.Enqueue(kept.Dequeue());
+        DropUnidentified(connectionId);
     }
 
     private void OnPeerIdentified(PeerConnectionContext peer)
     {
         if (_stopped)
             return;
+        if (!Accepts(peer))
+        {
+            RefuseUnauthenticated(peer.ConnectionId);
+            return;
+        }
+
+        DropExpired();
         var waiting = _unidentified.Count;
         for (var i = 0; i < waiting; i++)
         {
@@ -233,8 +244,37 @@ public sealed class AetherLabelLink : IDisposable
         }
     }
 
+    private bool Accepts(PeerConnectionContext peer) => peer.IsAuthenticated || _allowUnauthenticated;
+
+    private void RefuseUnauthenticated(string connectionId)
+    {
+        DropUnidentified(connectionId);
+        LastRemoteFault = "Peer is not authenticated.";
+        LastRemoteAdmit = null;
+    }
+
+    private void DropUnidentified(string connectionId)
+    {
+        var kept = new Queue<UnidentifiedPacket>();
+        while (_unidentified.Count > 0)
+        {
+            var held = _unidentified.Dequeue();
+            if (string.Equals(held.ConnectionId, connectionId, StringComparison.Ordinal))
+            {
+                _unidentifiedBytes -= held.Data.Length;
+                continue;
+            }
+
+            kept.Enqueue(held);
+        }
+
+        while (kept.Count > 0)
+            _unidentified.Enqueue(kept.Dequeue());
+    }
+
     private void HoldUntilIdentified(string connectionId, byte[] data)
     {
+        DropExpired();
         if (_unidentified.Count >= _maxOutgoing
             || data.Length > _maxUnidentifiedBytes
             || _unidentifiedBytes > _maxUnidentifiedBytes - data.Length)
@@ -245,7 +285,29 @@ public sealed class AetherLabelLink : IDisposable
 
         LastRemoteFault = null;
         _unidentifiedBytes += data.Length;
-        _unidentified.Enqueue(new UnidentifiedPacket(connectionId, data));
+        _unidentified.Enqueue(new UnidentifiedPacket(connectionId, data, _time.GetUtcNow()));
+    }
+
+    private void DropExpired()
+    {
+        if (_unidentified.Count == 0)
+            return;
+        var now = _time.GetUtcNow();
+        var kept = new Queue<UnidentifiedPacket>();
+        while (_unidentified.Count > 0)
+        {
+            var held = _unidentified.Dequeue();
+            if (now - held.ArrivedAt > _unidentifiedLifetime)
+            {
+                _unidentifiedBytes -= held.Data.Length;
+                continue;
+            }
+
+            kept.Enqueue(held);
+        }
+
+        while (kept.Count > 0)
+            _unidentified.Enqueue(kept.Dequeue());
     }
 
     private bool TryReadRemote(byte[] data, out AetherOperation? operation, out IReadOnlyList<StoredField>? fields)
@@ -464,5 +526,5 @@ public sealed class AetherLabelLink : IDisposable
 
     private readonly record struct HeldContribution(string PrincipalId, IReadOnlyList<StoredField> Fields);
 
-    private readonly record struct UnidentifiedPacket(string ConnectionId, byte[] Data);
+    private readonly record struct UnidentifiedPacket(string ConnectionId, byte[] Data, DateTimeOffset ArrivedAt);
 }
