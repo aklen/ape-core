@@ -33,12 +33,15 @@ membership or authority.
 The label of an existing entity is on the wire. Reconnect of the same link
 sends this peer's own current contribution for that label, and only after the
 reducer applied it. Restart is separate: loading the reducer does not rebuild
-the link. A new link sends the saved own contribution when the stamped id still
-carries the sequence, and does not invent one. That rebuild is this one label
-only. Do not rebuild a multi-field operation from one stored field: the same id
-would get a different digest. The next slice keeps an unchanged envelope
-separate from a state catch-up that carries its own version and explicit actor
-and sequence data beside the current record. Do not add a full history for that.
+the link. A new link sends the saved own records as a contribution merge.
+The receiver queues that merge on the host. Commit journals it as state, not as an operation.
+Check every (key, version) pair before choosing a winner.
+The same version must carry the same value, operation id, and sequence.
+Only a stored record moves the actor cursor.
+An unchanged merge is not appended.
+The actor and the sequence are on the record, not parsed from the operation id.
+An operation is resent only from an envelope this process still holds.
+Do not rebuild a multi-field operation from one stored field.
 Do not relay another writer's
 contribution. Do not fold creation, deletion, or owner into that packet. A full
 queue is a visible refusal, not a silent send. Catch-up advances only while the

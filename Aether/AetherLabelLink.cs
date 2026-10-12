@@ -25,7 +25,9 @@ public sealed class AetherLabelLink : IDisposable
     private readonly HashSet<long> _localIds = new();
     private readonly Queue<AetherOperation> _outgoing = new();
     private readonly Queue<AetherOperation> _held = new();
+    private readonly Queue<IReadOnlyList<StoredField>> _heldContributions = new();
     private AetherOperation? _own;
+    private byte[]? _contribution;
     private bool _catchUpPending;
     private readonly FrozenPlan<AetherScratch> _plan;
     private PlanRuntime _runtime;
@@ -77,7 +79,6 @@ public sealed class AetherLabelLink : IDisposable
         };
         network.OnDataReceived += OnData;
         network.OnPeerConnected += OnPeerConnected;
-        RememberOwn();
     }
 
     public AetherAdmit? LastRemoteAdmit { get; private set; }
@@ -102,17 +103,23 @@ public sealed class AetherLabelLink : IDisposable
     public void CatchUp()
     {
         ObjectDisposedException.ThrowIf(_stopped, this);
-        if (_own is null)
-            return;
         _catchUpPending = true;
-        ScheduleCatchUp();
-        Flush();
+        if (_own is not null)
+        {
+            ScheduleCatchUp();
+            Flush();
+            return;
+        }
+
+        ScheduleContribution();
+        FlushContribution();
     }
 
     public void Pump()
     {
         ObjectDisposedException.ThrowIf(_stopped, this);
         AdmitHeld();
+        AdmitContributions();
         _plan.Tick(ref _scratch, ref _runtime);
         if (_scratch.SceneCommits is not null)
         {
@@ -127,16 +134,18 @@ public sealed class AetherLabelLink : IDisposable
                 if (!_localIds.Contains(outcome.RequestId))
                     continue;
                 _localIds.Remove(outcome.RequestId);
-                if (outcome.Kind != AetherOutcomeKind.Applied || outcome.Result is null)
+                if (outcome.Kind != AetherOutcomeKind.Applied || outcome.Result is not { Operation: { } operation })
                     continue;
-                Note(outcome.Result.Value.Operation);
-                _outgoing.Enqueue(outcome.Result.Value.Operation);
+                Note(operation);
+                _outgoing.Enqueue(operation);
             }
         }
 
         Flush();
         ScheduleCatchUp();
         Flush();
+        ScheduleContribution();
+        FlushContribution();
     }
 
     public void Dispose()
@@ -152,6 +161,11 @@ public sealed class AetherLabelLink : IDisposable
     {
         if (_stopped || !AetherWire.IsStatePacket(data))
             return;
+        if (AetherWire.IsContributionPacket(data))
+        {
+            HoldContribution(data);
+            return;
+        }
         if (!AetherWire.TryDecode(data, _entityId, _fieldId, out var operation, out var fault))
         {
             LastRemoteFault = fault;
@@ -193,42 +207,55 @@ public sealed class AetherLabelLink : IDisposable
         }
     }
 
-    private void RememberOwn()
+    private void HoldContribution(byte[] data)
     {
-        foreach (var field in _host.Reducer.Capture().Fields)
+        if (!AetherWire.TryDecodeContributions(data, out var fields, out var fault))
         {
-            if (!string.Equals(field.Key.EntityId, _entityId, StringComparison.Ordinal)
-                || !string.Equals(field.Key.WriterId, _writerId, StringComparison.Ordinal)
-                || !string.Equals(field.Key.FieldId, _fieldId, StringComparison.Ordinal)
-                || !field.Value.IsText
-                || !TryStampedSequence(field.OperationId, field.Version.ActorId, out var sequence))
-                continue;
-
-            _own = new AetherOperation(
-                field.OperationId,
-                _entityId,
-                _writerId,
-                field.Version.ActorId,
-                sequence,
-                field.Version.Lamport,
-                new Dictionary<string, FieldValue> { [_fieldId] = field.Value });
+            LastRemoteFault = fault;
+            LastRemoteAdmit = null;
             return;
         }
+
+        if (!string.Equals(fields[0].Key.EntityId, _entityId, StringComparison.Ordinal))
+        {
+            LastRemoteFault = "Entity is not on this link.";
+            LastRemoteAdmit = null;
+            return;
+        }
+
+        foreach (var field in fields)
+        {
+            if (!string.Equals(field.Key.FieldId, _fieldId, StringComparison.Ordinal))
+            {
+                LastRemoteFault = "Field is not on this link.";
+                LastRemoteAdmit = null;
+                return;
+            }
+        }
+
+        if (_heldContributions.Count >= _maxOutgoing)
+        {
+            LastRemoteFault = "Catch-up does not fit.";
+            return;
+        }
+
+        LastRemoteFault = null;
+        _heldContributions.Enqueue(fields);
     }
 
-    private static bool TryStampedSequence(string operationId, string actorId, out long sequence)
+    private void AdmitContributions()
     {
-        sequence = 0;
-        var prefix = actorId + "/";
-        if (string.IsNullOrEmpty(actorId)
-            || !operationId.StartsWith(prefix, StringComparison.Ordinal))
-            return false;
-        return long.TryParse(
-                operationId.AsSpan(prefix.Length),
-                System.Globalization.NumberStyles.None,
-                System.Globalization.CultureInfo.InvariantCulture,
-                out sequence)
-            && sequence >= 1;
+        var waiting = _heldContributions.Count;
+        for (var i = 0; i < waiting; i++)
+        {
+            var fields = _heldContributions.Dequeue();
+            var admit = _host.TryAcceptContribution(fields);
+            LastRemoteAdmit = admit;
+            if (admit.Kind == AetherAdmitKind.Queued)
+                continue;
+
+            _heldContributions.Enqueue(fields);
+        }
     }
 
     private void Note(AetherOperation operation)
@@ -251,7 +278,7 @@ public sealed class AetherLabelLink : IDisposable
             return;
         if (_outgoing.Any(queued => queued.Id == _own.Id))
             return;
-        if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
+        if (_localIds.Count + _outgoing.Count + (_contribution is null ? 0 : 1) >= _maxOutgoing)
             return;
         _outgoing.Enqueue(_own);
     }
@@ -266,5 +293,43 @@ public sealed class AetherLabelLink : IDisposable
             if (_catchUpPending && _own is not null && operation.Id == _own.Id)
                 _catchUpPending = false;
         }
+    }
+
+    private void ScheduleContribution()
+    {
+        if (!_catchUpPending || _own is not null || _contribution is not null)
+            return;
+        var records = OwnRecords();
+        if (records.Count == 0)
+            return;
+        if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
+            return;
+        _contribution = AetherWire.EncodeContributions(records);
+    }
+
+    private void FlushContribution()
+    {
+        if (_contribution is null)
+            return;
+        var packet = _contribution;
+        _network.Broadcast(packet, reliable: true);
+        _contribution = null;
+        _catchUpPending = false;
+    }
+
+    private List<StoredField> OwnRecords()
+    {
+        var records = new List<StoredField>();
+        foreach (var field in _host.Reducer.Capture().Fields)
+        {
+            if (!string.Equals(field.Key.EntityId, _entityId, StringComparison.Ordinal)
+                || !string.Equals(field.Key.WriterId, _writerId, StringComparison.Ordinal)
+                || !string.Equals(field.Key.FieldId, _fieldId, StringComparison.Ordinal)
+                || !field.Value.IsText)
+                continue;
+            records.Add(field);
+        }
+
+        return records;
     }
 }

@@ -265,14 +265,19 @@ public sealed class AetherLabelLinkTests
         rightAgain.Transport.AddPeer(leftAgain.Transport.LocalPeerId);
         var alpha = Assert.Single(leftAgain.Transport.Sent);
         var beta = Assert.Single(rightAgain.Transport.Sent);
-        Assert.True(AetherWire.TryDecode(alpha, "entity-1", "label", out var leftOp, out _));
-        Assert.True(AetherWire.TryDecode(beta, "entity-1", "label", out var rightOp, out _));
-        Assert.Equal("peer-a/2", leftOp!.Id);
-        Assert.Equal(2, leftOp.Sequence);
-        Assert.Equal("alpha", leftOp.Changes["label"].Text);
-        Assert.Equal("peer-b/2", rightOp!.Id);
-        Assert.Equal(2, rightOp.Sequence);
-        Assert.Equal("beta", rightOp.Changes["label"].Text);
+        Assert.Equal(AetherWire.ContributionType, alpha[0]);
+        Assert.Equal(AetherWire.ContributionType, beta[0]);
+        Assert.False(AetherWire.TryDecode(alpha, "entity-1", "label", out _, out _));
+        Assert.True(AetherWire.TryDecodeContributions(alpha, out var leftFields, out _));
+        Assert.True(AetherWire.TryDecodeContributions(beta, out var rightFields, out _));
+        var leftField = Assert.Single(leftFields);
+        var rightField = Assert.Single(rightFields);
+        Assert.Equal("peer-a/2", leftField.OperationId);
+        Assert.Equal(2, leftField.Sequence);
+        Assert.Equal("alpha", leftField.Value.Text);
+        Assert.Equal("peer-b/2", rightField.OperationId);
+        Assert.Equal(2, rightField.Sequence);
+        Assert.Equal("beta", rightField.Value.Text);
 
         rightAgain.Transport.Deliver(leftAgain.Transport.LocalPeerId, alpha);
         leftAgain.Transport.Deliver(rightAgain.Transport.LocalPeerId, beta);

@@ -290,7 +290,8 @@ public sealed class AetherReducerTests
                     FieldValue.Label("hibás"),
                     new FieldVersion(30, "peer-A/s1"),
                     "peer-A",
-                    "bad"),
+                    "bad",
+                    1),
             ],
             []);
         Assert.Throws<AetherProtocolException>(() => store.MergeImage(image));
@@ -315,13 +316,15 @@ public sealed class AetherReducerTests
                     FieldValue.FixedPoint(9),
                     new FieldVersion(20, "peer-B/s1"),
                     "peer-B",
-                    "newer-off"),
+                    "newer-off",
+                    1),
                 new StoredField(
                     new RecordKey("entity-1", "peer-A", "label"),
                     FieldValue.Label("box"),
                     new FieldVersion(10, "peer-A/s1"),
                     "peer-A",
-                    "clash"),
+                    "clash",
+                    1),
             ],
             [new SeenOperation("intruder", "abc", 20)]);
 
@@ -341,13 +344,15 @@ public sealed class AetherReducerTests
                     FieldValue.Label("one"),
                     new FieldVersion(1, "peer-A/s1"),
                     "peer-A",
-                    "row-1"),
+                    "row-1",
+                    1),
                 new StoredField(
                     new RecordKey("entity-1", "peer-A", "label"),
                     FieldValue.Label("two"),
                     new FieldVersion(1, "peer-A/s1"),
                     "peer-A",
-                    "row-2"),
+                    "row-2",
+                    1),
             ],
             []);
         Assert.Throws<AetherProtocolException>(() => within.MergeImage(colliding));
@@ -919,7 +924,8 @@ public sealed class AetherReducerTests
             FieldValue.Label(label),
             new FieldVersion(lamport, "peer-A/s1"),
             "peer-A",
-            operationId);
+            operationId,
+            1);
 
     private static AetherOperation ActorLabel(string id, string actorId, string label) =>
         new(id, "entity-1", "peer-A", actorId, 1, 10, new Dictionary<string, FieldValue>

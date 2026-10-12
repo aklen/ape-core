@@ -141,7 +141,7 @@ public sealed class AetherReducer
         var version = new FieldVersion(op.Lamport, op.ActorId);
         Admit(op, observeClock);
         foreach (var (fieldId, value) in op.Changes)
-            Upsert(new RecordKey(op.EntityId, op.WriterId, fieldId), value, version, op.WriterId, op.Id);
+            Upsert(new RecordKey(op.EntityId, op.WriterId, fieldId), value, version, op.WriterId, op.Id, op.Sequence);
         return Applied(op);
     }
 
@@ -209,6 +209,96 @@ public sealed class AetherReducer
         return new AetherApplied(op, _clock, _saveSequence);
     }
 
+    /// <summary>
+    /// Merge current field records. This is not an operation: the dedup window stays unchanged.
+    /// Every (key, version) pair is checked before a winner is chosen. The same version must carry the same value, operation id, and sequence.
+    /// Only a record that is stored moves that actor's cursor. An unchanged merge does not take a save-sequence place.
+    /// </summary>
+    public AetherMerge MergeContributions(IReadOnlyList<StoredField> fields)
+    {
+        ArgumentNullException.ThrowIfNull(fields);
+        if (fields.Count == 0)
+            throw new AetherProtocolException("Contribution packet is empty.");
+
+        var copy = fields.ToArray();
+        var entityId = copy[0].Key.EntityId;
+        var writerId = copy[0].WriterId;
+        if (string.IsNullOrEmpty(entityId) || string.IsNullOrEmpty(writerId))
+            throw new AetherProtocolException("Contribution writer is missing.");
+
+        var versions = new Dictionary<RecordKey, Dictionary<FieldVersion, StoredField>>();
+        foreach (var field in copy)
+        {
+            if (!string.Equals(field.Key.EntityId, entityId, StringComparison.Ordinal)
+                || !string.Equals(field.Key.WriterId, writerId, StringComparison.Ordinal)
+                || !string.Equals(field.WriterId, writerId, StringComparison.Ordinal))
+                throw new AetherProtocolException("Contribution packet has one writer.");
+            if (string.IsNullOrEmpty(field.Version.ActorId) || field.Sequence < 1 || string.IsNullOrEmpty(field.OperationId))
+                throw new AetherProtocolException("Actor sequence is missing.");
+            RequireShape(field.Key.FieldId, field.Value);
+            if (_records.TryGetValue(field.Key, out var existing)
+                && existing.Version.CompareTo(field.Version) == 0
+                && existing != field)
+                throw new AetherProtocolException($"Version collision on '{field.Key.FieldId}'.");
+
+            if (!versions.TryGetValue(field.Key, out var byVersion))
+            {
+                byVersion = new Dictionary<FieldVersion, StoredField>();
+                versions[field.Key] = byVersion;
+            }
+
+            if (byVersion.TryGetValue(field.Version, out var already) && already != field)
+                throw new AetherProtocolException($"Version collision on '{field.Key.FieldId}'.");
+            byVersion[field.Version] = field;
+        }
+
+        var winners = new List<StoredField>(versions.Count);
+        foreach (var byVersion in versions.Values)
+        {
+            StoredField? winner = null;
+            foreach (var field in byVersion.Values)
+            {
+                if (winner is null || field.Version > winner.Version)
+                    winner = field;
+            }
+
+            winners.Add(winner!);
+        }
+
+        var accepted = new List<StoredField>();
+        long highest = 0;
+        foreach (var field in winners)
+        {
+            if (_records.TryGetValue(field.Key, out var existing) && field.Version.CompareTo(existing.Version) <= 0)
+                continue;
+            accepted.Add(field);
+            if (field.Version.Lamport > highest)
+                highest = field.Version.Lamport;
+        }
+
+        if (accepted.Count == 0)
+            return new AetherMerge(false, default);
+
+        if (_saveSequence == long.MaxValue)
+            throw new AetherProtocolException("Save sequence overflow.");
+        if (accepted.Count > 0)
+        {
+            var next = Math.Max(_clock, highest);
+            if (next == long.MaxValue)
+                throw new AetherProtocolException("Lamport clock overflow.");
+            _clock = next + 1;
+        }
+
+        _saveSequence++;
+        foreach (var field in accepted)
+        {
+            Upsert(field.Key, field.Value, field.Version, field.WriterId, field.OperationId, field.Sequence);
+            RestoreActorSequence(field.Version.ActorId, field.Sequence);
+        }
+
+        return new AetherMerge(true, new AetherApplied(null, _clock, _saveSequence, accepted));
+    }
+
     public void MergeImage(AetherImage image)
     {
         var folded = FoldImage(image);
@@ -220,7 +310,7 @@ public sealed class AetherReducer
             Remember(seen.Id, seen.Digest, seen.Lamport);
 
         foreach (var field in folded.Fields)
-            Upsert(field.Key, field.Value, field.Version, field.WriterId, field.OperationId);
+            Upsert(field.Key, field.Value, field.Version, field.WriterId, field.OperationId, field.Sequence);
         foreach (var entityId in folded.Deleted)
             _deleted.Add(entityId);
         foreach (var mark in folded.Visibility)
@@ -575,7 +665,7 @@ public sealed class AetherReducer
             throw new AetherProtocolException($"Field '{fieldId}' stores a label.");
     }
 
-    private void Upsert(RecordKey key, FieldValue value, FieldVersion version, string writerId, string operationId)
+    private void Upsert(RecordKey key, FieldValue value, FieldVersion version, string writerId, string operationId, long sequence)
     {
         if (_records.TryGetValue(key, out var existing))
         {
@@ -590,7 +680,7 @@ public sealed class AetherReducer
             }
         }
 
-        _records[key] = new StoredField(key, value, version, writerId, operationId);
+        _records[key] = new StoredField(key, value, version, writerId, operationId, sequence);
     }
 
     private void Remember(string id, string digest, long lamport)
@@ -637,14 +727,22 @@ public sealed record StoredField(
     FieldValue Value,
     FieldVersion Version,
     string WriterId,
-    string OperationId);
+    string OperationId,
+    long Sequence);
 
 public readonly record struct SeenOperation(string Id, string Digest, long Lamport);
 
+public readonly record struct AetherMerge(bool Changed, AetherApplied Applied);
+
 /// <summary>
-/// One application and the clock after that application. A later write does not change this pair.
+/// One folded request and the clock after it. An operation resend carries <see cref="Operation"/>.
+/// A contribution merge carries <see cref="Contributions"/> and no operation.
 /// </summary>
-public readonly record struct AetherApplied(AetherOperation Operation, long Clock, long SaveSequence);
+public readonly record struct AetherApplied(
+    AetherOperation? Operation,
+    long Clock,
+    long SaveSequence,
+    IReadOnlyList<StoredField>? Contributions = null);
 
 public readonly record struct MembershipKey(string EntityId, string PublicationId);
 

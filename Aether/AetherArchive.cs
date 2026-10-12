@@ -12,7 +12,8 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    private const ushort FormatVersion = 3;
+    private const ushort FormatVersion = 4;
+    private const byte ContributionRecord = 0x10;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;
 
@@ -63,7 +64,8 @@ public sealed class AetherArchive
 
     public void Append(AetherApplied applied)
     {
-        ArgumentNullException.ThrowIfNull(applied.Operation);
+        if (applied.Contributions is null)
+            ArgumentNullException.ThrowIfNull(applied.Operation);
         if (!File.Exists(SnapshotPath))
             throw new AetherProtocolException("No snapshot to append after.");
         if (applied.SaveSequence <= SaveThrough())
@@ -77,7 +79,9 @@ public sealed class AetherArchive
         if (applied.SaveSequence != logged + 1)
             throw new AetherProtocolException("Save sequence is out of order.");
 
-        var payload = EncodeOperation(applied.Operation, applied.Clock);
+        var payload = applied.Contributions is null
+            ? EncodeOperation(applied.Operation!, applied.Clock)
+            : EncodeContribution(applied.Contributions, applied.Clock);
         var record = new byte[4 + payload.Length + 32];
         BinaryPrimitives.WriteUInt32BigEndian(record, (uint)payload.Length);
         payload.CopyTo(record.AsSpan(4));
@@ -164,12 +168,22 @@ public sealed class AetherArchive
             if (!SHA256.HashData(payload).AsSpan().SequenceEqual(hash))
                 throw new AetherProtocolException("Recovery log checksum failed.");
 
-            var (op, clock) = DecodeOperation(payload);
-            if (clock < reducer.Clock)
+            if (payload.Length > 0 && payload[0] == ContributionRecord)
+            {
+                var (fields, clock) = DecodeContribution(payload);
+                if (clock < reducer.Clock)
+                    throw new AetherProtocolException("Recovery log clock moved backwards.");
+                reducer.MergeContributions(fields);
+                reducer.RestoreClock(clock);
+                continue;
+            }
+
+            var (op, operationClock) = DecodeOperation(payload);
+            if (operationClock < reducer.Clock)
                 throw new AetherProtocolException("Recovery log clock moved backwards.");
             reducer.RestoreActorSequence(op.ActorId, op.Sequence);
             reducer.Apply(op, observeClock: false);
-            reducer.RestoreClock(clock);
+            reducer.RestoreClock(operationClock);
         }
     }
 
@@ -185,6 +199,7 @@ public sealed class AetherArchive
             var operationId = reader.Text();
             var lamport = reader.I64();
             var actorId = reader.Text();
+            var sequence = reader.I64();
             var kind = reader.U8();
             var fixedValue = reader.I64();
             var text = reader.Text();
@@ -199,7 +214,8 @@ public sealed class AetherArchive
                 value,
                 new FieldVersion(lamport, actorId),
                 writerId,
-                operationId));
+                operationId,
+                sequence));
         }
 
         return fields;
@@ -281,6 +297,7 @@ public sealed class AetherArchive
             WriteText(buffer, field.OperationId);
             WriteI64(buffer, field.Version.Lamport);
             WriteText(buffer, field.Version.ActorId);
+            WriteI64(buffer, field.Sequence);
             buffer.WriteByte(field.Value.IsText ? (byte)2 : (byte)1);
             WriteI64(buffer, field.Value.Fixed);
             WriteText(buffer, field.Value.Text ?? "");
@@ -346,6 +363,68 @@ public sealed class AetherArchive
 
         WriteI64(buffer, clock);
         return buffer.ToArray();
+    }
+
+    private static byte[] EncodeContribution(IReadOnlyList<StoredField> fields, long clock)
+    {
+        using var buffer = new MemoryStream();
+        buffer.WriteByte(ContributionRecord);
+        WriteI64(buffer, clock);
+        WriteU32(buffer, (uint)fields.Count);
+        foreach (var field in fields)
+        {
+            WriteText(buffer, field.Key.EntityId);
+            WriteText(buffer, field.Key.WriterId);
+            WriteText(buffer, field.Key.FieldId);
+            WriteText(buffer, field.OperationId);
+            WriteI64(buffer, field.Version.Lamport);
+            WriteText(buffer, field.Version.ActorId);
+            WriteI64(buffer, field.Sequence);
+            buffer.WriteByte(field.Value.IsText ? (byte)2 : (byte)1);
+            WriteI64(buffer, field.Value.Fixed);
+            WriteText(buffer, field.Value.Text ?? "");
+        }
+
+        return buffer.ToArray();
+    }
+
+    private static (IReadOnlyList<StoredField> Fields, long Clock) DecodeContribution(byte[] payload)
+    {
+        var reader = new Reader(payload);
+        if (reader.U8() != ContributionRecord)
+            throw new AetherProtocolException("Recovery log value kind is unknown.");
+        var clock = reader.I64();
+        var count = checked((int)reader.U32());
+        var fields = new StoredField[count];
+        for (var i = 0; i < count; i++)
+        {
+            var entityId = reader.Text();
+            var writerId = reader.Text();
+            var fieldId = reader.Text();
+            var operationId = reader.Text();
+            var lamport = reader.I64();
+            var actorId = reader.Text();
+            var sequence = reader.I64();
+            var kind = reader.U8();
+            var fixedValue = reader.I64();
+            var text = reader.Text();
+            var value = kind switch
+            {
+                1 => FieldValue.FixedPoint(fixedValue),
+                2 => FieldValue.Label(text),
+                _ => throw new AetherProtocolException("Recovery log value kind is unknown."),
+            };
+            fields[i] = new StoredField(
+                new RecordKey(entityId, writerId, fieldId),
+                value,
+                new FieldVersion(lamport, actorId),
+                writerId,
+                operationId,
+                sequence);
+        }
+
+        reader.End();
+        return (fields, clock);
     }
 
     private static (AetherOperation Operation, long Clock) DecodeOperation(byte[] payload)

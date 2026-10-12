@@ -42,6 +42,13 @@ public sealed class AetherHost
         return TryEnqueue(new Pending(op, null, Measure(op)));
     }
 
+    public AetherAdmit TryAcceptContribution(IReadOnlyList<StoredField> fields)
+    {
+        ArgumentNullException.ThrowIfNull(fields);
+        var copy = fields.ToArray();
+        return TryEnqueue(new Pending(null, null, Measure(copy), copy));
+    }
+
     public AetherAdmit TryAcceptLocal(
         string entityId,
         string writerId,
@@ -91,24 +98,30 @@ public sealed class AetherHost
             if (spentOperations > 0 && spentBytes + pending.Bytes > maxBytes)
                 break;
 
-            bool foldedOk;
+            FoldResult fold;
             AetherApplied folded = default;
             string? reason = null;
             try
             {
                 beforeFold?.Invoke(pending.RequestId);
-                foldedOk = TryFold(pending, afterLocalStamp, out folded, out reason);
+                fold = TryFold(pending, afterLocalStamp, out folded, out reason);
             }
             catch (Exception ex) when (ex is not AetherInterruptedException && outcomes.Count > 0)
             {
                 throw new AetherInterruptedException(outcomes, ex);
             }
 
-            if (!foldedOk)
+            if (fold == FoldResult.Rejected)
             {
                 _inbox.Dequeue();
                 _inboxBytes -= pending.Bytes;
                 outcomes.Add(AetherOutcome.Rejected(pending.RequestId, reason!));
+            }
+            else if (fold == FoldResult.NoChange)
+            {
+                _inbox.Dequeue();
+                _inboxBytes -= pending.Bytes;
+                outcomes.Add(AetherOutcome.NoChange(pending.RequestId));
             }
             else
             {
@@ -176,6 +189,18 @@ public sealed class AetherHost
         return bytes;
     }
 
+    private static int Measure(IReadOnlyList<StoredField> fields)
+    {
+        var bytes = BaseBytes;
+        foreach (var field in fields)
+        {
+            bytes += Utf8(field.Key.EntityId) + Utf8(field.Key.WriterId) + Utf8(field.Key.FieldId);
+            bytes += Utf8(field.OperationId) + Utf8(field.Version.ActorId) + Utf8(field.Value.Text) + 24;
+        }
+
+        return bytes;
+    }
+
     private AetherAdmit TryEnqueue(Pending pending)
     {
         if (_inbox.Count + _outbox.Count >= _maxCount)
@@ -192,16 +217,39 @@ public sealed class AetherHost
         return AetherAdmit.Queued(requestId);
     }
 
-    private bool TryFold(Pending pending, Action? afterLocalStamp, out AetherApplied folded, out string? reason)
+    private FoldResult TryFold(Pending pending, Action? afterLocalStamp, out AetherApplied folded, out string? reason)
     {
         reason = null;
+        if (pending.Contributions is not null)
+        {
+            try
+            {
+                var merged = Reducer.MergeContributions(pending.Contributions);
+                if (!merged.Changed)
+                {
+                    folded = default;
+                    return FoldResult.NoChange;
+                }
+
+                folded = merged.Applied;
+            }
+            catch (AetherProtocolException ex)
+            {
+                folded = default;
+                reason = ex.Message;
+                return FoldResult.Rejected;
+            }
+
+            return FoldResult.Applied;
+        }
+
         if (pending.Remote is not null)
         {
             if (!AetherReducer.HasActorSequence(pending.Remote))
             {
                 folded = default;
                 reason = "Actor sequence is missing.";
-                return false;
+                return FoldResult.Rejected;
             }
 
             try
@@ -212,7 +260,7 @@ public sealed class AetherHost
             {
                 folded = default;
                 reason = ex.Message;
-                return false;
+                return FoldResult.Rejected;
             }
         }
         else
@@ -229,7 +277,7 @@ public sealed class AetherHost
                 {
                     folded = default;
                     reason = ex.Message;
-                    return false;
+                    return FoldResult.Rejected;
                 }
 
                 pending.Stamped = stamped;
@@ -239,9 +287,17 @@ public sealed class AetherHost
             folded = Reducer.Apply(stamped, observeClock: false);
         }
 
-        Reducer.RestoreActorSequence(folded.Operation.ActorId, folded.Operation.Sequence);
+        var operation = folded.Operation ?? throw new InvalidOperationException("A folded write has no operation.");
+        Reducer.RestoreActorSequence(operation.ActorId, operation.Sequence);
         pending.Stamped = null;
-        return true;
+        return FoldResult.Applied;
+    }
+
+    private enum FoldResult
+    {
+        Applied,
+        Rejected,
+        NoChange,
     }
 
     private static int Utf8(string? value) => value is null ? 0 : Encoding.UTF8.GetByteCount(value);
@@ -256,16 +312,18 @@ public sealed class AetherHost
 
     private sealed class Pending
     {
-        public Pending(AetherOperation? remote, LocalWrite? local, int bytes)
+        public Pending(AetherOperation? remote, LocalWrite? local, int bytes, IReadOnlyList<StoredField>? contributions = null)
         {
             Remote = remote;
             Local = local;
+            Contributions = contributions;
             Bytes = bytes;
         }
 
         public long RequestId { get; private set; }
         public AetherOperation? Remote { get; }
         public LocalWrite? Local { get; }
+        public IReadOnlyList<StoredField>? Contributions { get; }
         public AetherOperation? Stamped { get; set; }
         public AetherApplied? Applied { get; private set; }
         public int Bytes { get; }
@@ -298,6 +356,7 @@ public enum AetherOutcomeKind : byte
 {
     Applied = 1,
     Rejected = 2,
+    NoChange = 3,
 }
 
 /// <summary>
@@ -310,6 +369,9 @@ public readonly record struct AetherOutcome(long RequestId, AetherOutcomeKind Ki
 
     public static AetherOutcome Rejected(long requestId, string reason) =>
         new(requestId, AetherOutcomeKind.Rejected, reason, null);
+
+    public static AetherOutcome NoChange(long requestId) =>
+        new(requestId, AetherOutcomeKind.NoChange, null, null);
 }
 
 /// <summary>The archive now holds this request, either in the snapshot or in the recovery log.</summary>

@@ -10,11 +10,15 @@ namespace Ape.Core.Aether;
 public static class AetherWire
 {
     public const byte PacketType = 0x30;
+    public const byte ContributionType = 0x31;
     public const ushort WireVersion = 1;
     public const string LabelRule = "lww";
 
     public static bool IsStatePacket(ReadOnlySpan<byte> data) =>
-        !data.IsEmpty && data[0] == PacketType;
+        !data.IsEmpty && (data[0] == PacketType || data[0] == ContributionType);
+
+    public static bool IsContributionPacket(ReadOnlySpan<byte> data) =>
+        !data.IsEmpty && data[0] == ContributionType;
 
     public static byte[] Encode(AetherOperation op)
     {
@@ -37,12 +41,70 @@ public static class AetherWire
         WriteI64(body, op.Lamport);
         WriteText(body, field.Key);
         WriteText(body, field.Value.Text!);
-        var bytes = body.ToArray();
+        return WithChecksum(body.ToArray());
+    }
+
+    private static byte[] WithChecksum(byte[] bytes)
+    {
         var hash = SHA256.HashData(bytes);
         var packet = new byte[bytes.Length + hash.Length];
         bytes.CopyTo(packet, 0);
         hash.CopyTo(packet, bytes.Length);
         return packet;
+    }
+
+    public static byte[] EncodeContributions(IReadOnlyList<StoredField> fields)
+    {
+        ArgumentNullException.ThrowIfNull(fields);
+        if (fields.Count == 0)
+            throw new AetherProtocolException("Contribution packet is empty.");
+        var entityId = fields[0].Key.EntityId;
+        var writerId = fields[0].WriterId;
+        foreach (var field in fields)
+        {
+            if (!string.Equals(field.Key.EntityId, entityId, StringComparison.Ordinal)
+                || !string.Equals(field.WriterId, writerId, StringComparison.Ordinal))
+                throw new AetherProtocolException("Contribution packet has one writer.");
+        }
+
+        using var body = new MemoryStream();
+        body.WriteByte(ContributionType);
+        WriteU16(body, WireVersion);
+        WriteText(body, entityId);
+        WriteText(body, writerId);
+        WriteU32(body, (uint)fields.Count);
+        foreach (var field in fields)
+        {
+            WriteText(body, field.Key.FieldId);
+            body.WriteByte(field.Value.IsText ? (byte)2 : (byte)1);
+            WriteI64(body, field.Value.Fixed);
+            WriteText(body, field.Value.Text ?? "");
+            WriteI64(body, field.Version.Lamport);
+            WriteText(body, field.Version.ActorId);
+            WriteI64(body, field.Sequence);
+            WriteText(body, field.OperationId);
+        }
+
+        return WithChecksum(body.ToArray());
+    }
+
+    public static bool TryDecodeContributions(
+        byte[] data,
+        out IReadOnlyList<StoredField> fields,
+        out string? fault)
+    {
+        try
+        {
+            fields = DecodeContributions(data);
+            fault = null;
+            return true;
+        }
+        catch (AetherProtocolException ex)
+        {
+            fields = [];
+            fault = ex.Message;
+            return false;
+        }
     }
 
     public static bool TryDecode(
@@ -68,7 +130,7 @@ public static class AetherWire
 
     private static AetherOperation Decode(byte[] data, string entityId, string fieldId)
     {
-        if (data.Length < 33 || !IsStatePacket(data))
+        if (data.Length < 33 || data[0] != PacketType)
             throw new AetherProtocolException("State packet is truncated.");
         var body = data.AsSpan(0, data.Length - 32);
         var hash = data.AsSpan(data.Length - 32);
@@ -107,10 +169,67 @@ public static class AetherWire
             new Dictionary<string, FieldValue> { [encodedField] = FieldValue.Label(label) });
     }
 
+    private static IReadOnlyList<StoredField> DecodeContributions(byte[] data)
+    {
+        if (data.Length < 33 || !IsContributionPacket(data))
+            throw new AetherProtocolException("Contribution packet is truncated.");
+        var body = data.AsSpan(0, data.Length - 32);
+        var hash = data.AsSpan(data.Length - 32);
+        if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(body), hash))
+            throw new AetherProtocolException("Contribution packet checksum does not match.");
+
+        var reader = new Reader(body);
+        reader.U8();
+        var version = reader.U16();
+        if (version != WireVersion)
+            throw new AetherProtocolException("Wire version is not supported.");
+        var entityId = reader.Text();
+        var writerId = reader.Text();
+        var rawCount = reader.U32();
+        if (rawCount == 0 || rawCount > int.MaxValue)
+            throw new AetherProtocolException("Contribution packet is truncated.");
+        var count = (int)rawCount;
+        var fields = new StoredField[count];
+        for (var i = 0; i < count; i++)
+        {
+            var fieldId = reader.Text();
+            var kind = reader.U8();
+            var fixedValue = reader.I64();
+            var text = reader.Text();
+            var lamport = reader.I64();
+            var actorId = reader.Text();
+            var sequence = reader.I64();
+            var operationId = reader.Text();
+            var value = kind switch
+            {
+                1 => FieldValue.FixedPoint(fixedValue),
+                2 => FieldValue.Label(text),
+                _ => throw new AetherProtocolException("Contribution value kind is unknown."),
+            };
+            fields[i] = new StoredField(
+                new RecordKey(entityId, writerId, fieldId),
+                value,
+                new FieldVersion(lamport, actorId),
+                writerId,
+                operationId,
+                sequence);
+        }
+
+        reader.End();
+        return fields;
+    }
+
     private static void WriteU16(Stream buffer, ushort value)
     {
         Span<byte> encoded = stackalloc byte[2];
         BinaryPrimitives.WriteUInt16BigEndian(encoded, value);
+        buffer.Write(encoded);
+    }
+
+    private static void WriteU32(Stream buffer, uint value)
+    {
+        Span<byte> encoded = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(encoded, value);
         buffer.Write(encoded);
     }
 
@@ -140,6 +259,8 @@ public static class AetherWire
         public byte U8() => Take(1)[0];
 
         public ushort U16() => BinaryPrimitives.ReadUInt16BigEndian(Take(2));
+
+        public uint U32() => BinaryPrimitives.ReadUInt32BigEndian(Take(4));
 
         public long I64() => BinaryPrimitives.ReadInt64BigEndian(Take(8));
 
