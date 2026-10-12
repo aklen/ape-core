@@ -90,9 +90,9 @@ public static class SceneCommitApplicator
 
                 if (existing is not Entity entity
                     || !string.Equals(entity.TypeId, e.TypeId, StringComparison.Ordinal)
-                    || existing is not Replica replica
-                    || !string.Equals(replica.OwnerId, e.OwnerId, StringComparison.Ordinal))
+                    || existing is not Replica replica)
                     throw new InvalidOperationException($"Scene entity '{e.Name}' conflicts with Aether creation metadata.");
+                replica.OwnerId = e.OwnerId;
                 break;
             }
             case RemoveRegisteredEntityCommitRequest x:

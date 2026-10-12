@@ -14,6 +14,7 @@ public enum AetherEffect : byte
     WithdrawPublication = 4,
     Publish = 5,
     CreateEntity = 6,
+    TransferOwnership = 7,
 }
 
 /// <summary>
@@ -34,7 +35,9 @@ public sealed class AetherOperation
         string? publicationId = null,
         string? entityTypeId = null,
         string? creatorId = null,
-        string? ownerId = null)
+        string? ownerId = null,
+        string? newOwnerId = null,
+        string? priorOwnerOperationId = null)
     {
         Id = id ?? throw new ArgumentNullException(nameof(id));
         EntityId = entityId ?? throw new ArgumentNullException(nameof(entityId));
@@ -73,13 +76,25 @@ public sealed class AetherOperation
             throw new AetherProtocolException("This operation has no creation metadata.");
         }
 
+        if (effect == AetherEffect.TransferOwnership)
+        {
+            if (string.IsNullOrEmpty(newOwnerId) || string.IsNullOrEmpty(priorOwnerOperationId))
+                throw new AetherProtocolException("Ownership transfer needs a new owner and prior operation.");
+        }
+        else if (newOwnerId is not null || priorOwnerOperationId is not null)
+        {
+            throw new AetherProtocolException("This operation has no ownership metadata.");
+        }
+
         Effect = effect;
         PublicationId = publicationId;
         EntityTypeId = entityTypeId;
         CreatorId = creatorId;
         OwnerId = ownerId;
+        NewOwnerId = newOwnerId;
+        PriorOwnerOperationId = priorOwnerOperationId;
         Changes = new ReadOnlyDictionary<string, FieldValue>(stored);
-        Digest = ComputeDigest(EntityId, WriterId, ActorId, Sequence, Lamport, Changes, effect, publicationId, entityTypeId, creatorId, ownerId);
+        Digest = ComputeDigest(EntityId, WriterId, ActorId, Sequence, Lamport, Changes, effect, publicationId, entityTypeId, creatorId, ownerId, newOwnerId, priorOwnerOperationId);
     }
 
     public string Id { get; }
@@ -103,6 +118,8 @@ public sealed class AetherOperation
     public string? CreatorId { get; }
 
     public string? OwnerId { get; }
+    public string? NewOwnerId { get; }
+    public string? PriorOwnerOperationId { get; }
 
     public IReadOnlyDictionary<string, FieldValue> Changes { get; }
 
@@ -119,7 +136,9 @@ public sealed class AetherOperation
         string? publicationId = null,
         string? entityTypeId = null,
         string? creatorId = null,
-        string? ownerId = null)
+        string? ownerId = null,
+        string? newOwnerId = null,
+        string? priorOwnerOperationId = null)
     {
         using var buffer = new MemoryStream();
         buffer.WriteByte((byte)effect);
@@ -127,6 +146,8 @@ public sealed class AetherOperation
         WriteString(buffer, entityTypeId ?? "");
         WriteString(buffer, creatorId ?? "");
         WriteString(buffer, ownerId ?? "");
+        WriteString(buffer, newOwnerId ?? "");
+        WriteString(buffer, priorOwnerOperationId ?? "");
         WriteString(buffer, entityId);
         WriteString(buffer, writerId);
         WriteString(buffer, actorId);

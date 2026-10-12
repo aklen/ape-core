@@ -51,11 +51,27 @@ public sealed class AetherHost
             return AetherAdmit.Refused("Create is not owned by this connection.");
         if (op.Effect == AetherEffect.DeleteEntity)
         {
-            var entity = Reducer.GetEntity(op.EntityId);
-            if (entity is null)
+            var owner = Reducer.GetOwner(op.EntityId);
+            if (owner is null)
                 return AetherAdmit.Refused("Delete entity owner is unknown.");
-            if (!string.Equals(entity.OwnerId, principalId, StringComparison.Ordinal))
+            if (!string.Equals(owner, principalId, StringComparison.Ordinal))
                 return AetherAdmit.Refused("Delete is not issued by the entity owner.");
+        }
+        if (op.Effect == AetherEffect.TransferOwnership)
+        {
+            if (Reducer.IsCurrentOwnershipOperation(op))
+                return TryEnqueue(new Pending(op, null, Measure(op)));
+            var owner = Reducer.GetOwner(op.EntityId);
+            if (owner is null)
+                return AetherAdmit.Refused("Ownership transfer entity is unknown.");
+            if (!string.Equals(owner, principalId, StringComparison.Ordinal))
+                return AetherAdmit.Refused("Ownership transfer is not issued by the entity owner.");
+            if (!string.Equals(Reducer.GetOwnerOperationId(op.EntityId), op.PriorOwnerOperationId, StringComparison.Ordinal))
+            {
+                if (string.Equals(Reducer.GetOwnership(op.EntityId)?.PriorOperationId, op.Id, StringComparison.Ordinal))
+                    return AetherAdmit.Refused("Ownership transfer is already covered.");
+                return AetherAdmit.Refused("Ownership transfer prior operation does not match.");
+            }
         }
         return TryEnqueue(new Pending(op, null, Measure(op)));
     }
@@ -123,6 +139,14 @@ public sealed class AetherHost
                 new Dictionary<string, FieldValue>(),
                 effect: AetherEffect.DeleteEntity),
             bytes));
+    }
+
+    public AetherAdmit TryAcceptLocalTransfer(string entityId, string newOwnerId, string writerId, string actorId)
+    {
+        var bytes = BaseBytes + Utf8(entityId) + Utf8(newOwnerId) + Utf8(writerId) + Utf8(actorId) + 32;
+        return TryEnqueue(new Pending(null,
+            new LocalWrite(entityId, writerId, actorId, new Dictionary<string, FieldValue>(),
+                effect: AetherEffect.TransferOwnership, newOwnerId: newOwnerId), bytes));
     }
 
     public IReadOnlyList<AetherOutcome> Drain() => Drain(int.MaxValue, int.MaxValue, beforeFold: null);
@@ -254,6 +278,8 @@ public sealed class AetherHost
             + Utf8(op.EntityTypeId)
             + Utf8(op.CreatorId)
             + Utf8(op.OwnerId)
+            + Utf8(op.NewOwnerId)
+            + Utf8(op.PriorOwnerOperationId)
             + 16;
         foreach (var (fieldId, value) in op.Changes)
             bytes += Utf8(fieldId) + Utf8(value.Text) + 8;
@@ -353,6 +379,11 @@ public sealed class AetherHost
                             write.EntityId,
                             write.WriterId,
                             write.ActorId),
+                        AetherEffect.TransferOwnership => Reducer.StampLocalTransfer(
+                            write.EntityId,
+                            write.NewOwnerId!,
+                            write.WriterId,
+                            write.ActorId),
                         _ => Reducer.StampLocal(write.EntityId, write.WriterId, write.ActorId, write.Changes),
                     };
                 }
@@ -391,7 +422,8 @@ public sealed class AetherHost
         string actorId,
         Dictionary<string, FieldValue> changes,
         string? entityTypeId = null,
-        AetherEffect effect = AetherEffect.Write)
+        AetherEffect effect = AetherEffect.Write,
+        string? newOwnerId = null)
     {
         public string EntityId { get; } = entityId;
         public string WriterId { get; } = writerId;
@@ -399,6 +431,7 @@ public sealed class AetherHost
         public Dictionary<string, FieldValue> Changes { get; } = changes;
         public string? EntityTypeId { get; } = entityTypeId;
         public AetherEffect Effect { get; } = entityTypeId is null ? effect : AetherEffect.CreateEntity;
+        public string? NewOwnerId { get; } = newOwnerId;
     }
 
     private sealed class Pending

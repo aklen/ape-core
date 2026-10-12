@@ -123,7 +123,7 @@ public static class AetherFrame
                     entity.EntityTypeId,
                     entity.EntityId,
                     entity.CreatorId,
-                    entity.OwnerId));
+                    scratch.Reducer.GetOwner(entity.EntityId)!));
             }
 
             if (!string.IsNullOrEmpty(scratch.LabelPropertyName))

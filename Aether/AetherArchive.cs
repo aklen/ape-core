@@ -12,7 +12,7 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    private const ushort FormatVersion = 7;
+    private const ushort FormatVersion = 8;
     private const byte ContributionRecord = 0x10;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;
@@ -129,10 +129,11 @@ public sealed class AetherArchive
         var membership = ReadMembership(reader);
         var entities = ReadEntities(reader);
         var deletions = ReadDeletions(reader);
+        var ownership = ReadOwnership(reader);
         var cursors = ReadCursors(reader);
         reader.End();
 
-        reducer.MergeImage(new AetherImage(clock, fields, seen, deleted, visibility, membership, entities, deletions));
+        reducer.MergeImage(new AetherImage(clock, fields, seen, deleted, visibility, membership, entities, deletions, ownership));
         reducer.RestoreSaveThrough(saveThrough);
         foreach (var cursor in cursors)
             reducer.RestoreActorSequence(cursor.ActorId, cursor.Sequence, cursor.Lamport, cursor.OperationId);
@@ -308,6 +309,16 @@ public sealed class AetherArchive
         return deletions;
     }
 
+    private static List<StoredOwnership> ReadOwnership(Reader reader)
+    {
+        var count = checked((int)reader.U32());
+        var rows = new List<StoredOwnership>(count);
+        for (var i = 0; i < count; i++)
+            rows.Add(new StoredOwnership(reader.Text(), reader.Text(), reader.Text(), reader.Text(), reader.I64(),
+                new FieldVersion(reader.I64(), reader.Text()), reader.Text(), reader.I64()));
+        return rows;
+    }
+
     private static List<ActorCursor> ReadCursors(Reader reader)
     {
         var count = reader.U32();
@@ -400,6 +411,15 @@ public sealed class AetherArchive
             WriteI64(buffer, deletion.Sequence);
         }
 
+        WriteU32(buffer, (uint)(image.Ownership?.Count ?? 0));
+        foreach (var row in image.Ownership ?? [])
+        {
+            WriteText(buffer, row.EntityId); WriteText(buffer, row.PreviousOwnerId); WriteText(buffer, row.OwnerId);
+            WriteText(buffer, row.PriorOperationId); WriteI64(buffer, row.Generation);
+            WriteI64(buffer, row.Version.Lamport); WriteText(buffer, row.Version.ActorId);
+            WriteText(buffer, row.OperationId); WriteI64(buffer, row.Sequence);
+        }
+
         WriteU32(buffer, (uint)reducer.ActorCursors.Count);
         foreach (var cursor in reducer.ActorCursors)
         {
@@ -424,6 +444,8 @@ public sealed class AetherArchive
         WriteText(buffer, op.EntityTypeId ?? "");
         WriteText(buffer, op.CreatorId ?? "");
         WriteText(buffer, op.OwnerId ?? "");
+        WriteText(buffer, op.NewOwnerId ?? "");
+        WriteText(buffer, op.PriorOwnerOperationId ?? "");
         WriteI64(buffer, op.Sequence);
         WriteI64(buffer, op.Lamport);
         WriteU32(buffer, (uint)op.Changes.Count);
@@ -513,6 +535,8 @@ public sealed class AetherArchive
         var entityTypeId = reader.Text();
         var creatorId = reader.Text();
         var ownerId = reader.Text();
+        var newOwnerId = reader.Text();
+        var priorOwnerOperationId = reader.Text();
         var sequence = reader.I64();
         var lamport = reader.I64();
         var count = reader.U32();
@@ -545,7 +569,9 @@ public sealed class AetherArchive
             effect is AetherEffect.Publish or AetherEffect.WithdrawPublication ? publicationId : null,
             effect == AetherEffect.CreateEntity ? entityTypeId : null,
             effect == AetherEffect.CreateEntity ? creatorId : null,
-            effect == AetherEffect.CreateEntity ? ownerId : null), clock);
+            effect == AetherEffect.CreateEntity ? ownerId : null,
+            effect == AetherEffect.TransferOwnership ? newOwnerId : null,
+            effect == AetherEffect.TransferOwnership ? priorOwnerOperationId : null), clock);
     }
 
     private static byte[] Finish(ReadOnlySpan<byte> magic, long generation, byte[] body)

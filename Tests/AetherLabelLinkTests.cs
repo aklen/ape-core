@@ -745,6 +745,45 @@ public sealed class AetherLabelLinkTests
         Assert.True(kept.HasChanges());
     }
 
+    [Fact]
+    public void Ownership_transfer_changes_the_peer_allowed_to_delete()
+    {
+        using var left = Peer("peer-a");
+        using var right = Peer("peer-b");
+        left.Transport.AddPeer(right.Transport.LocalPeerId);
+        right.Transport.AddPeer(left.Transport.LocalPeerId);
+
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.SubmitCreate(TestStubEntity.RegistryTypeId).Kind);
+        left.Link.Pump();
+        right.Transport.Deliver(left.Transport.LocalPeerId, left.Transport.Sent[0]);
+        right.Link.Pump();
+
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.SubmitOwnershipTransfer("peer-b").Kind);
+        left.Link.Pump();
+        right.Transport.Deliver(left.Transport.LocalPeerId, left.Transport.Sent[1]);
+        right.Link.Pump();
+
+        Assert.Equal("peer-b", left.Store.GetOwner("entity-1"));
+        Assert.Equal("peer-b", right.Store.GetOwner("entity-1"));
+        Assert.Equal("peer-b", Assert.IsAssignableFrom<Replica>(right.Scene.GetEntity("entity-1")).OwnerId);
+
+        Assert.Equal(AetherAdmitKind.Queued, left.Link.SubmitDelete().Kind);
+        left.Link.Pump();
+        Assert.False(left.Store.IsDeleted("entity-1"));
+        Assert.Equal(2, left.Transport.Sent.Count);
+
+        Assert.Equal(AetherAdmitKind.Queued, right.Link.SubmitDelete().Kind);
+        right.Link.Pump();
+        var deletion = Assert.Single(right.Transport.Sent);
+        left.Transport.Deliver(right.Transport.LocalPeerId, deletion);
+        left.Link.Pump();
+
+        Assert.True(left.Store.IsDeleted("entity-1"));
+        Assert.True(right.Store.IsDeleted("entity-1"));
+        Assert.Null(left.Scene.GetEntity("entity-1"));
+        Assert.Null(right.Scene.GetEntity("entity-1"));
+    }
+
     private static StoredField[] RemoteFields(string principal)
     {
         var actor = AetherActorId.Format(principal, "s1");

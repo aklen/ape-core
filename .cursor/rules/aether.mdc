@@ -72,7 +72,11 @@ transcript includes this connection's fresh nonce. A send the transport does
 not accept stays pending as the same bytes. The proof authenticates a principal's
 initial self-create: writer, actor peer, creator, and initial owner must all be that
 principal before the request enters the queue. Delete requires the authenticated
-principal to equal the stored owner. It does not grant owner transfer.
+principal to equal the current owner. Ownership transfer is explicit, is issued by
+that current owner, and names the operation that established it. Keep creator,
+initial owner, and current owner separate. Never resolve two transfers from the same
+prior ownership operation by arrival order or actor id; that is owner equivocation,
+outside the valid input set. An exact replay of the current transfer remains idempotent after digest eviction. A missing predecessor may wait only in a bounded queue.
 A loaded record does not need a live connection.
 A local write is rejected before it is applied when its fields would not fit in
 one contribution packet, or when its one label would not fit in one state packet.

@@ -20,6 +20,7 @@ public sealed class AetherReducer
     private readonly Dictionary<string, VisibilityState> _visibility = new(StringComparer.Ordinal);
     private readonly Dictionary<MembershipKey, MembershipState> _membership = new();
     private readonly Dictionary<string, StoredEntity> _entities = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, StoredOwnership> _ownership = new(StringComparer.Ordinal);
     private long _clock;
     private long _saveSequence;
 
@@ -59,6 +60,9 @@ public sealed class AetherReducer
 
     public IReadOnlyList<StoredDeletion> Deletions =>
         _deletions.Values.OrderBy(deletion => deletion.EntityId, StringComparer.Ordinal).ToArray();
+
+    public IReadOnlyList<StoredOwnership> Ownership =>
+        _ownership.Values.OrderBy(row => row.EntityId, StringComparer.Ordinal).ToArray();
 
     public bool Remembers(string operationId) => _digests.ContainsKey(operationId);
 
@@ -183,6 +187,27 @@ public sealed class AetherReducer
         return stamped;
     }
 
+    public AetherOperation StampLocalTransfer(string entityId, string newOwnerId, string writerId, string actorId)
+    {
+        if (string.IsNullOrEmpty(actorId))
+            throw new AetherProtocolException("Actor sequence is missing.");
+        var prior = GetOwnerOperationId(entityId)
+            ?? throw new AetherProtocolException("Ownership transfer entity is unknown.");
+        var nextClock = NextClock(_clock);
+        var sequence = NextSequence(actorId);
+        var stamped = new AetherOperation(
+            $"{actorId}/{sequence.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
+            entityId, writerId, actorId, sequence, nextClock,
+            new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
+            newOwnerId: newOwnerId, priorOwnerOperationId: prior);
+        RejectBeforeAdmit(stamped);
+        AetherWire.Encode(stamped);
+        _clock = nextClock;
+        _nextSequence[actorId] = sequence;
+        _frontiers[actorId] = new ActorFrontier(sequence, nextClock, stamped.Id);
+        return stamped;
+    }
+
     /// <summary>
     /// Fold an operation. A newly admitted remote op sets the clock to max(clock, lamport) + 1,
     /// including when the remote Lamport is older. An exact duplicate still in the window leaves the clock alone.
@@ -249,6 +274,9 @@ public sealed class AetherReducer
                     return;
                 case AetherEffect.CreateEntity:
                     RejectCreation(op);
+                    return;
+                case AetherEffect.TransferOwnership:
+                    RejectOwnership(op);
                     return;
                 default:
                     throw new AetherProtocolException($"Unknown effect '{op.Effect}'.");
@@ -431,6 +459,8 @@ public sealed class AetherReducer
             UpsertEntity(entity);
         foreach (var deletion in folded.Deletions)
             UpsertDeletion(deletion);
+        foreach (var ownership in folded.Ownership)
+            UpsertOwnership(ownership);
     }
 
     public AetherImage Capture()
@@ -452,7 +482,8 @@ public sealed class AetherReducer
             .ToArray();
         var entities = _entities.Values.OrderBy(entity => entity.EntityId, StringComparer.Ordinal).ToArray();
         var deletions = _deletions.Values.OrderBy(deletion => deletion.EntityId, StringComparer.Ordinal).ToArray();
-        return new AetherImage(_clock, fields, _seenOrder.ToArray(), deleted, visibility, membership, entities, deletions);
+        var ownership = _ownership.Values.OrderBy(row => row.EntityId, StringComparer.Ordinal).ToArray();
+        return new AetherImage(_clock, fields, _seenOrder.ToArray(), deleted, visibility, membership, entities, deletions, ownership);
     }
 
     public void RestoreActorSequence(string actorId, long sequence, long lamport = 0, string? operationId = null)
@@ -481,6 +512,29 @@ public sealed class AetherReducer
 
     public StoredDeletion? GetDeletion(string entityId) =>
         _deletions.TryGetValue(entityId, out var deletion) ? deletion : null;
+
+    public StoredOwnership? GetOwnership(string entityId) =>
+        _ownership.TryGetValue(entityId, out var ownership) ? ownership : null;
+
+    public string? GetOwner(string entityId) =>
+        _ownership.TryGetValue(entityId, out var ownership)
+            ? ownership.OwnerId
+            : GetEntity(entityId)?.OwnerId;
+
+    public string? GetOwnerOperationId(string entityId) =>
+        _ownership.TryGetValue(entityId, out var ownership)
+            ? ownership.OperationId
+            : GetEntity(entityId)?.OperationId;
+
+    public bool IsCurrentOwnershipOperation(AetherOperation op) =>
+        op.Effect == AetherEffect.TransferOwnership
+        && _ownership.TryGetValue(op.EntityId, out var row)
+        && string.Equals(row.PreviousOwnerId, op.WriterId, StringComparison.Ordinal)
+        && string.Equals(row.OwnerId, op.NewOwnerId, StringComparison.Ordinal)
+        && string.Equals(row.PriorOperationId, op.PriorOwnerOperationId, StringComparison.Ordinal)
+        && string.Equals(row.OperationId, op.Id, StringComparison.Ordinal)
+        && row.Sequence == op.Sequence
+        && row.Version == new FieldVersion(op.Lamport, op.ActorId);
 
     public bool IsSharedVisible(string entityId) =>
         !_visibility.TryGetValue(entityId, out var state) || !state.Hidden;
@@ -568,6 +622,11 @@ public sealed class AetherReducer
                 Admit(op, observeClock);
                 UpsertEntity(EntityFrom(op));
                 return;
+            case AetherEffect.TransferOwnership:
+                RejectOwnership(op);
+                Admit(op, observeClock);
+                UpsertOwnership(OwnershipFrom(op));
+                return;
             default:
                 throw new AetherProtocolException($"Unknown effect '{op.Effect}'.");
         }
@@ -628,7 +687,8 @@ public sealed class AetherReducer
         }
 
         var entities = FoldEntities(image.Entities);
-        var deletions = FoldDeletions(image.Deletions, entities);
+        var ownership = FoldOwnership(image.Ownership, entities);
+        var deletions = FoldDeletions(image.Deletions, entities, ownership);
         var deleted = FoldDeleted(image.Deleted);
         if (!deleted.ToHashSet(StringComparer.Ordinal).SetEquals(deletions.Select(row => row.EntityId)))
             throw new AetherProtocolException("Snapshot tombstone metadata is incomplete.");
@@ -638,12 +698,14 @@ public sealed class AetherReducer
             FoldVisibility(image.Visibility),
             FoldMembership(image.Membership),
             entities,
-            deletions);
+            deletions,
+            ownership);
     }
 
     private List<StoredDeletion> FoldDeletions(
         IReadOnlyList<StoredDeletion>? rows,
-        IReadOnlyList<StoredEntity> imageEntities)
+        IReadOnlyList<StoredEntity> imageEntities,
+        IReadOnlyList<StoredOwnership> imageOwnership)
     {
         var entities = imageEntities.ToDictionary(entity => entity.EntityId, StringComparer.Ordinal);
         var folded = new Dictionary<string, StoredDeletion>(StringComparer.Ordinal);
@@ -652,7 +714,9 @@ public sealed class AetherReducer
             var entity = entities.TryGetValue(row.EntityId, out var fromImage)
                 ? fromImage
                 : GetEntity(row.EntityId) ?? throw new AetherProtocolException("Delete entity owner is unknown.");
-            RequireDeletion(row, entity);
+            var owner = imageOwnership.FirstOrDefault(x => x.EntityId == row.EntityId)?.OwnerId
+                ?? GetOwner(row.EntityId) ?? entity.OwnerId;
+            RequireDeletion(row, entity, owner);
             if (_deletions.TryGetValue(row.EntityId, out var existing) && existing != row)
                 throw new AetherProtocolException($"Entity '{row.EntityId}' has a deletion collision.");
             if (folded.TryGetValue(row.EntityId, out var prior) && prior != row)
@@ -702,7 +766,7 @@ public sealed class AetherReducer
         var entity = GetEntity(op.EntityId)
             ?? throw new AetherProtocolException("Delete entity owner is unknown.");
         var deletion = DeletionFrom(op);
-        RequireDeletion(deletion, entity);
+        RequireDeletion(deletion, entity, GetOwner(op.EntityId)!);
         if (_deletions.TryGetValue(op.EntityId, out var existing) && existing != deletion)
             throw new AetherProtocolException($"Entity '{op.EntityId}' is already deleted.");
     }
@@ -714,7 +778,7 @@ public sealed class AetherReducer
         op.Id,
         op.Sequence);
 
-    private static void RequireDeletion(StoredDeletion deletion, StoredEntity entity)
+    private static void RequireDeletion(StoredDeletion deletion, StoredEntity entity, string ownerId)
     {
         if (string.IsNullOrEmpty(deletion.EntityId)
             || string.IsNullOrEmpty(deletion.WriterId)
@@ -723,9 +787,86 @@ public sealed class AetherReducer
             || deletion.Sequence < 1)
             throw new AetherProtocolException("Deletion metadata is missing.");
         if (!string.Equals(deletion.EntityId, entity.EntityId, StringComparison.Ordinal)
-            || !string.Equals(deletion.WriterId, entity.OwnerId, StringComparison.Ordinal)
-            || !ActorBelongsTo(deletion.Version.ActorId, entity.OwnerId))
+            || !string.Equals(deletion.WriterId, ownerId, StringComparison.Ordinal)
+            || !ActorBelongsTo(deletion.Version.ActorId, ownerId))
             throw new AetherProtocolException("Delete is not issued by the entity owner.");
+    }
+
+    private void RejectOwnership(AetherOperation op)
+    {
+        if (IsCurrentOwnershipOperation(op))
+            return;
+        if (IsDeleted(op.EntityId))
+            throw new AetherProtocolException("Deleted entity ownership cannot change.");
+        if (_ownership.TryGetValue(op.EntityId, out var stored) && stored.Generation == long.MaxValue)
+            throw new AetherProtocolException("Ownership generation overflow.");
+        var currentOwner = GetOwner(op.EntityId)
+            ?? throw new AetherProtocolException("Ownership transfer entity is unknown.");
+        var currentOperation = GetOwnerOperationId(op.EntityId)!;
+        if (!string.Equals(op.WriterId, currentOwner, StringComparison.Ordinal)
+            || !ActorBelongsTo(op.ActorId, currentOwner))
+            throw new AetherProtocolException("Ownership transfer is not issued by the entity owner.");
+        if (!string.Equals(op.PriorOwnerOperationId, currentOperation, StringComparison.Ordinal))
+            throw new AetherProtocolException("Ownership transfer prior operation does not match.");
+        if (string.Equals(op.NewOwnerId, currentOwner, StringComparison.Ordinal))
+            throw new AetherProtocolException("Ownership transfer does not change the owner.");
+    }
+
+    private StoredOwnership OwnershipFrom(AetherOperation op)
+    {
+        if (_ownership.TryGetValue(op.EntityId, out var existing) && IsCurrentOwnershipOperation(op))
+            return existing;
+        var generation = _ownership.TryGetValue(op.EntityId, out var current) ? checked(current.Generation + 1) : 1;
+        return new StoredOwnership(op.EntityId, op.WriterId, op.NewOwnerId!, op.PriorOwnerOperationId!, generation,
+            new FieldVersion(op.Lamport, op.ActorId), op.Id, op.Sequence);
+    }
+
+    private static void RequireOwnership(StoredOwnership row)
+    {
+        if (string.IsNullOrEmpty(row.EntityId) || string.IsNullOrEmpty(row.PreviousOwnerId)
+            || string.IsNullOrEmpty(row.OwnerId) || string.IsNullOrEmpty(row.PriorOperationId)
+            || string.IsNullOrEmpty(row.OperationId) || string.IsNullOrEmpty(row.Version.ActorId)
+            || row.Sequence < 1 || row.Generation < 1
+            || string.Equals(row.PreviousOwnerId, row.OwnerId, StringComparison.Ordinal)
+            || !ActorBelongsTo(row.Version.ActorId, row.PreviousOwnerId))
+            throw new AetherProtocolException("Ownership metadata is invalid.");
+    }
+
+    private List<StoredOwnership> FoldOwnership(IReadOnlyList<StoredOwnership>? rows, IReadOnlyList<StoredEntity> entities)
+    {
+        var known = entities.Select(x => x.EntityId).Concat(_entities.Keys).ToHashSet(StringComparer.Ordinal);
+        var folded = new Dictionary<string, StoredOwnership>(StringComparer.Ordinal);
+        foreach (var row in rows ?? [])
+        {
+            RequireOwnership(row);
+            if (!known.Contains(row.EntityId))
+                throw new AetherProtocolException("Ownership transfer entity is unknown.");
+            if (folded.TryGetValue(row.EntityId, out var prior) && prior != row)
+                throw new AetherProtocolException($"Entity '{row.EntityId}' has an ownership collision.");
+            if (_ownership.TryGetValue(row.EntityId, out var local))
+            {
+                if (row.Generation < local.Generation) continue;
+                if (row.Generation == local.Generation && row != local)
+                    throw new AetherProtocolException($"Entity '{row.EntityId}' has an ownership collision.");
+            }
+            folded[row.EntityId] = row;
+        }
+        return folded.Values.ToList();
+    }
+
+    private void UpsertOwnership(StoredOwnership row)
+    {
+        RequireOwnership(row);
+        if (_ownership.TryGetValue(row.EntityId, out var current))
+        {
+            if (row.Generation < current.Generation) return;
+            if (row.Generation == current.Generation)
+            {
+                if (row != current) throw new AetherProtocolException($"Entity '{row.EntityId}' has an ownership collision.");
+                return;
+            }
+        }
+        _ownership[row.EntityId] = row;
     }
 
     private static bool ActorBelongsTo(string actorId, string principalId) =>
@@ -1126,7 +1267,8 @@ public sealed class AetherReducer
         List<VisibilityMark> Visibility,
         List<MembershipMark> Membership,
         List<StoredEntity> Entities,
-        List<StoredDeletion> Deletions);
+        List<StoredDeletion> Deletions,
+        List<StoredOwnership> Ownership);
 }
 
 public readonly record struct FieldDefinition(string Id, string Resolver, long Min, long Max);
@@ -1159,6 +1301,16 @@ public sealed record StoredDeletion(
     string OperationId,
     long Sequence);
 
+public sealed record StoredOwnership(
+    string EntityId,
+    string PreviousOwnerId,
+    string OwnerId,
+    string PriorOperationId,
+    long Generation,
+    FieldVersion Version,
+    string OperationId,
+    long Sequence);
+
 public readonly record struct SeenOperation(string Id, string Digest, long Lamport);
 
 public readonly record struct AetherMerge(bool Changed, AetherApplied Applied);
@@ -1187,4 +1339,5 @@ public sealed record AetherImage(
     IReadOnlyList<VisibilityMark>? Visibility = null,
     IReadOnlyList<MembershipMark>? Membership = null,
     IReadOnlyList<StoredEntity>? Entities = null,
-    IReadOnlyList<StoredDeletion>? Deletions = null);
+    IReadOnlyList<StoredDeletion>? Deletions = null,
+    IReadOnlyList<StoredOwnership>? Ownership = null);
