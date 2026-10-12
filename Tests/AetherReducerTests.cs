@@ -497,21 +497,71 @@ public sealed class AetherReducerTests
     }
 
     [Fact]
-    public void A_local_stamp_that_reuses_an_operation_id_is_rejected_before_the_clock_moves()
+    public void A_write_without_an_actor_sequence_is_rejected_before_any_change()
+    {
+        var store = NewStore();
+        var missing = new AetherOperation(
+            "missing",
+            "entity-1",
+            "peer-A",
+            "",
+            0,
+            1,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("nope") });
+
+        var error = Assert.Throws<AetherProtocolException>(() => Apply(store, missing));
+        Assert.Equal("Actor sequence is missing.", error.Message);
+        Assert.Equal(0, store.Clock);
+        Assert.Equal(0, store.SaveThrough);
+        Assert.Equal(0, store.RecordCount);
+        Assert.False(store.IsDeleted("entity-1"));
+        Assert.Empty(store.ActorCursors);
+        Assert.False(store.Remembers("missing"));
+    }
+
+    [Fact]
+    public void A_lifecycle_operation_without_an_actor_sequence_is_rejected_before_any_change()
+    {
+        var store = NewStore();
+        var missing = new AetherOperation(
+            "missing",
+            "entity-1",
+            "peer-A",
+            "",
+            0,
+            1,
+            new Dictionary<string, FieldValue>(),
+            AetherEffect.DeleteEntity);
+
+        var error = Assert.Throws<AetherProtocolException>(() => Apply(store, missing));
+        Assert.Equal("Actor sequence is missing.", error.Message);
+        Assert.Equal(0, store.Clock);
+        Assert.Equal(0, store.SaveThrough);
+        Assert.Equal(0, store.RecordCount);
+        Assert.False(store.IsDeleted("entity-1"));
+        Assert.Empty(store.ActorCursors);
+        Assert.False(store.Remembers("missing"));
+    }
+
+    [Fact]
+    public void An_admitted_operation_occupies_its_actor_sequence()
     {
         var store = NewStore();
         Apply(store, LabelOp("peer-A/s1/1", "peer-A", "peer-A/s1", 1, 10, "taken"));
-        Assert.Equal(11, store.Clock);
+        var cursor = Assert.Single(store.ActorCursors);
+        Assert.Equal(1, cursor.Sequence);
+        Assert.Equal(10, cursor.Lamport);
+        Assert.Equal("peer-A/s1/1", cursor.OperationId);
 
-        Assert.Throws<AetherProtocolException>(() => store.StampLocal(
+        var local = store.StampLocal(
             "entity-1",
             "peer-A",
             "peer-A/s1",
-            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("other") }));
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("other") });
 
-        Assert.Equal(11, store.Clock);
+        Assert.Equal(2, local.Sequence);
+        Assert.Equal("peer-A/s1/2", local.Id);
         Assert.Equal("taken", store.ResolveLww("entity-1", "label")?.Text);
-        Assert.Empty(store.ActorCursors);
         Assert.True(store.Remembers("peer-A/s1/1"));
     }
 
@@ -521,7 +571,7 @@ public sealed class AetherReducerTests
         foreach (var deleteFirst in new[] { true, false })
         {
             var store = NewStore();
-            var update = LabelOp("update", "peer-A", "peer-A/s1", 1, 10, "cube");
+            var update = LabelOp("update", "peer-A", "peer-A/s1", 6, 10, "cube");
             var delete = Life(AetherEffect.DeleteEntity, "delete", 5);
             if (deleteFirst)
             {
@@ -916,7 +966,7 @@ public sealed class AetherReducerTests
         long lamport,
         string actorId = "peer-A/s1",
         string? publicationId = null) =>
-        new(id, "entity-1", "peer-A", actorId, 1, lamport, new Dictionary<string, FieldValue>(), effect, publicationId);
+        new(id, "entity-1", "peer-A", actorId, lamport, lamport, new Dictionary<string, FieldValue>(), effect, publicationId);
 
     private static StoredField LabelRow(long lamport, string label, string operationId) =>
         new(

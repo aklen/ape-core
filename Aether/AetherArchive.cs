@@ -12,7 +12,7 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    private const ushort FormatVersion = 4;
+    private const ushort FormatVersion = 5;
     private const byte ContributionRecord = 0x10;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;

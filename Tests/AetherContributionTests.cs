@@ -216,6 +216,69 @@ public sealed class AetherContributionTests
     }
 
     [Fact]
+    public void A_received_operation_keeps_its_actor_claim()
+    {
+        var store = NewStore();
+        var host = new AetherHost(store, 4096, 8);
+        var op = new AetherOperation(
+            "actor-a/6",
+            "entity-1",
+            "actor-a",
+            "actor-a",
+            6,
+            20,
+            new Dictionary<string, FieldValue> { ["note"] = FieldValue.Label("real") });
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptRemote(op).Kind);
+        Assert.Equal(AetherOutcomeKind.Applied, Assert.Single(host.Drain()).Kind);
+        var cursor = Assert.Single(store.ActorCursors, item => item.ActorId == "actor-a");
+        Assert.Equal(6, cursor.Sequence);
+        Assert.Equal(20, cursor.Lamport);
+        Assert.Equal("actor-a/6", cursor.OperationId);
+        var clock = store.Clock;
+        var through = store.SaveThrough;
+
+        var forged = new AetherOperation(
+            "different-operation",
+            "entity-1",
+            "actor-a",
+            "actor-a",
+            6,
+            999,
+            new Dictionary<string, FieldValue> { ["note"] = FieldValue.Label("forged") });
+        Assert.Throws<AetherProtocolException>(() => store.Apply(forged, observeClock: true));
+        Assert.Equal(clock, store.Clock);
+        Assert.Equal(through, store.SaveThrough);
+        Assert.Equal("real", store.ResolveLww("entity-1", "note")?.Text);
+
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution(
+            [Claim("note", 999, "different-operation", 6, "forged", "actor-a")]).Kind);
+        var rejected = Assert.Single(host.Drain());
+        Assert.Equal(AetherOutcomeKind.Rejected, rejected.Kind);
+        Assert.Equal("real", store.ResolveLww("entity-1", "note")?.Text);
+        Assert.Equal(20, store.ActorCursors.Single(item => item.ActorId == "actor-a").Lamport);
+        Assert.Equal("actor-a/6", store.ActorCursors.Single(item => item.ActorId == "actor-a").OperationId);
+
+        var deleted = NewStore();
+        deleted.Apply(
+            new AetherOperation(
+                "actor-a/4",
+                "entity-1",
+                "actor-a",
+                "actor-a",
+                4,
+                8,
+                new Dictionary<string, FieldValue>(),
+                AetherEffect.DeleteEntity),
+            observeClock: true);
+        Assert.Throws<AetherProtocolException>(() => deleted.MergeContributions(
+            [Claim("label", 3, "other", 4, "forged", "actor-a")]));
+        Assert.True(deleted.IsDeleted("entity-1"));
+        Assert.Equal(0, deleted.RecordCount);
+        Assert.Equal(8, Assert.Single(deleted.ActorCursors).Lamport);
+        Assert.Equal("actor-a/4", Assert.Single(deleted.ActorCursors).OperationId);
+    }
+
+    [Fact]
     public void An_unchanged_contribution_is_not_journaled_again()
     {
         using var dir = new TempDir();

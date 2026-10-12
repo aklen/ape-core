@@ -126,6 +126,7 @@ public sealed class AetherReducer
     /// including when the remote Lamport is older. An exact duplicate still in the window leaves the clock alone.
     /// Evicting an id from the window does not reject any other operation.
     /// The returned clock is the clock after this call, paired with this operation.
+    /// A sequence of at least 1 is checked before anything changes, then recorded with its Lamport and operation id.
     /// </summary>
     public AetherApplied Apply(AetherOperation op, bool observeClock)
     {
@@ -137,6 +138,7 @@ public sealed class AetherReducer
         if (op.Effect != AetherEffect.Write)
         {
             ApplyLifecycle(op, observeClock);
+            RememberOperationFrontier(op);
             return Applied(op);
         }
 
@@ -144,6 +146,7 @@ public sealed class AetherReducer
         Admit(op, observeClock);
         foreach (var (fieldId, value) in op.Changes)
             Upsert(new RecordKey(op.EntityId, op.WriterId, fieldId), value, version, op.WriterId, op.Id, op.Sequence);
+        RememberOperationFrontier(op);
         return Applied(op);
     }
 
@@ -161,6 +164,7 @@ public sealed class AetherReducer
             return;
         }
 
+        RejectActorClaim(op);
         if (op.Effect != AetherEffect.Write)
         {
             var version = new FieldVersion(op.Lamport, op.ActorId);
@@ -708,27 +712,51 @@ public sealed class AetherReducer
             if (_frontiers.TryGetValue(actor, out var frontier) && !string.IsNullOrEmpty(frontier.OperationId))
             {
                 foreach (var claim in bySequence.Values)
-                {
-                    if (claim.Sequence == frontier.Sequence)
-                    {
-                        if (claim.Lamport != frontier.Lamport
-                            || !string.Equals(claim.OperationId, frontier.OperationId, StringComparison.Ordinal))
-                            throw new AetherProtocolException("Actor sequence is inconsistent.");
-                    }
-                    else if (claim.Sequence > frontier.Sequence)
-                    {
-                        if (claim.Lamport <= frontier.Lamport)
-                            throw new AetherProtocolException("Actor sequence is inconsistent.");
-                    }
-                    else if (claim.Lamport >= frontier.Lamport)
-                        throw new AetherProtocolException("Actor sequence is inconsistent.");
-                }
+                    RejectStoredClaim(frontier, claim);
             }
 
             tops[actor] = top;
         }
 
         return tops;
+    }
+
+    private void RejectActorClaim(AetherOperation op)
+    {
+        if (!HasActorSequence(op))
+            throw new AetherProtocolException("Actor sequence is missing.");
+        if (_frontiers.TryGetValue(op.ActorId, out var frontier) && !string.IsNullOrEmpty(frontier.OperationId))
+            RejectStoredClaim(frontier, new ActorClaim(op.Sequence, op.Lamport, op.Id));
+    }
+
+    private static void RejectStoredClaim(ActorFrontier frontier, ActorClaim claim)
+    {
+        if (claim.Sequence == frontier.Sequence)
+        {
+            if (claim.Lamport != frontier.Lamport
+                || !string.Equals(claim.OperationId, frontier.OperationId, StringComparison.Ordinal))
+                throw new AetherProtocolException("Actor sequence is inconsistent.");
+            return;
+        }
+
+        if (claim.Sequence > frontier.Sequence)
+        {
+            if (claim.Lamport <= frontier.Lamport)
+                throw new AetherProtocolException("Actor sequence is inconsistent.");
+            return;
+        }
+
+        if (claim.Lamport >= frontier.Lamport)
+            throw new AetherProtocolException("Actor sequence is inconsistent.");
+    }
+
+    private void RememberOperationFrontier(AetherOperation op)
+    {
+        if (!HasActorSequence(op))
+            return;
+        var claim = new ActorClaim(op.Sequence, op.Lamport, op.Id);
+        if (FrontierAdvances(op.ActorId, claim))
+            RememberFrontier(op.ActorId, claim);
     }
 
     private bool FrontierAdvances(string actorId, ActorClaim claim)

@@ -372,7 +372,7 @@ public sealed class AetherArchiveTests
         var archive = new AetherArchive(dir.Path);
         var store = NewStore();
         var one = Apply(store, LabelOp("one", "peer-A", "peer-A/s1", 1, 50, "one"));
-        var two = Apply(store, LabelOp("two", "peer-A", "peer-A/s1", 2, 40, "two"));
+        var two = Apply(store, LabelOp("two", "peer-C", "peer-C/s1", 1, 40, "two"));
         Assert.Equal(51, one.Clock);
         Assert.Equal(52, two.Clock);
         Assert.True(one.SaveSequence < two.SaveSequence);
@@ -426,14 +426,14 @@ public sealed class AetherArchiveTests
         var archive = new AetherArchive(dir.Path);
         var bytes = new byte[82];
         "AET1"u8.CopyTo(bytes);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(4), 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(4), 4);
         System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(bytes.AsSpan(6), 1);
         System.Security.Cryptography.SHA256.HashData(bytes.AsSpan(0, 18)).CopyTo(bytes.AsSpan(18));
         System.Security.Cryptography.SHA256.HashData(ReadOnlySpan<byte>.Empty).CopyTo(bytes.AsSpan(50));
         File.WriteAllBytes(archive.SnapshotPath, bytes);
 
         var error = Assert.Throws<AetherProtocolException>(() => archive.Load());
-        Assert.Contains("format 1", error.Message, StringComparison.Ordinal);
+        Assert.Contains("format 4", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -444,14 +444,14 @@ public sealed class AetherArchiveTests
         archive.Save(NewStore());
         var bytes = new byte[82];
         "AEL1"u8.CopyTo(bytes);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(4), 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(4), 4);
         System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(bytes.AsSpan(6), 1);
         System.Security.Cryptography.SHA256.HashData(bytes.AsSpan(0, 18)).CopyTo(bytes.AsSpan(18));
         System.Security.Cryptography.SHA256.HashData(ReadOnlySpan<byte>.Empty).CopyTo(bytes.AsSpan(50));
         File.WriteAllBytes(archive.LogPath, bytes);
 
         var error = Assert.Throws<AetherProtocolException>(() => archive.Load());
-        Assert.Contains("format 1", error.Message, StringComparison.Ordinal);
+        Assert.Contains("format 4", error.Message, StringComparison.Ordinal);
     }
 
     private static AetherApplied Apply(AetherReducer store, AetherOperation op) => store.Apply(op, observeClock: true);
@@ -473,7 +473,7 @@ public sealed class AetherArchiveTests
         string id,
         long lamport,
         string? publicationId = null) =>
-        new(id, "entity-1", "peer-A", "peer-A/s1", 1, lamport, new Dictionary<string, FieldValue>(), effect, publicationId);
+        new(id, "entity-1", "peer-A", "peer-A/s1", lamport, lamport, new Dictionary<string, FieldValue>(), effect, publicationId);
 
     private sealed class TempDir : IDisposable
     {

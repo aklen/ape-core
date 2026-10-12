@@ -284,7 +284,7 @@ public sealed class AetherHostTests
     {
         var store = NewStore();
         store.Apply(new AetherOperation(
-            "peer-A/s1/1",
+            "peer-A/s1/2",
             "entity-1",
             "peer-A",
             "peer-A/s1",
@@ -306,13 +306,13 @@ public sealed class AetherHostTests
 
         Assert.Equal(AetherOutcomeKind.Rejected, drained[0].Kind);
         Assert.Equal(rejected.RequestId, drained[0].RequestId);
-        Assert.Equal("Operation 'peer-A/s1/1' changed payload.", drained[0].Reason);
+        Assert.Equal("Operation 'peer-A/s1/2' changed payload.", drained[0].Reason);
         Assert.Equal(AetherOutcomeKind.Applied, drained[1].Kind);
         Assert.Empty(again);
         Assert.Equal(12, store.Clock);
         Assert.Equal("ok", store.ResolveLww("entity-1", "label")?.Text);
-        Assert.Equal("peer-B/s1", Assert.Single(store.ActorCursors).ActorId);
-        Assert.Equal(1, store.ActorCursors[0].Sequence);
+        Assert.Equal(1, store.ActorCursors.Single(cursor => cursor.ActorId == "peer-A/s1").Sequence);
+        Assert.Equal(1, store.ActorCursors.Single(cursor => cursor.ActorId == "peer-B/s1").Sequence);
     }
 
     [Fact]

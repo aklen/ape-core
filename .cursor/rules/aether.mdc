@@ -41,6 +41,9 @@ A validated actor record moves that actor's frontier even when the field loses.
 The same sequence repeats only the same operation id and Lamport.
 A greater sequence needs a greater Lamport.
 An inconsistent claim is rejected before the clock, the records, or the frontier change.
+An admitted operation records that same frontier. The check happens before the write.
+A missing actor id or a sequence below 1 is rejected before any change.
+A sequence-only restore does not replace a recorded frontier.
 Authenticating the actor is not this slice.
 An unchanged merge is not appended.
 The actor and the sequence are on the record, not parsed from the operation id.
