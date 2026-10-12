@@ -14,6 +14,7 @@ public sealed class AetherReducer
     private readonly Dictionary<string, string> _digests = new(StringComparer.Ordinal);
     private readonly Queue<SeenOperation> _seenOrder = new();
     private readonly Dictionary<string, long> _nextSequence = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ActorFrontier> _frontiers = new(StringComparer.Ordinal);
     private readonly HashSet<string> _deleted = new(StringComparer.Ordinal);
     private readonly Dictionary<string, VisibilityState> _visibility = new(StringComparer.Ordinal);
     private readonly Dictionary<MembershipKey, MembershipState> _membership = new();
@@ -44,7 +45,7 @@ public sealed class AetherReducer
     public IReadOnlyList<ActorCursor> ActorCursors =>
         _nextSequence
             .OrderBy(pair => pair.Key, StringComparer.Ordinal)
-            .Select(pair => new ActorCursor(pair.Key, pair.Value))
+            .Select(pair => FrontierCursor(pair.Key, pair.Value))
             .ToArray();
 
     public int RecordCount => _records.Count;
@@ -116,6 +117,7 @@ public sealed class AetherReducer
         RejectBeforeAdmit(stamped);
         _clock = nextClock;
         _nextSequence[actorId] = sequence;
+        _frontiers[actorId] = new ActorFrontier(sequence, nextClock, stamped.Id);
         return stamped;
     }
 
@@ -212,7 +214,9 @@ public sealed class AetherReducer
     /// <summary>
     /// Merge current field records. This is not an operation: the dedup window stays unchanged.
     /// Every (key, version) pair is checked before a winner is chosen. The same version must carry the same value, operation id, and sequence.
-    /// Only a record that is stored moves that actor's cursor. An unchanged merge does not take a save-sequence place.
+    /// Actor frontiers are checked independently. A field may lose and still advance its actor's frontier.
+    /// The same sequence must repeat the same operation id and Lamport. A greater sequence needs a greater Lamport.
+    /// An unchanged merge does not take a save-sequence place.
     /// </summary>
     public AetherMerge MergeContributions(IReadOnlyList<StoredField> fields)
     {
@@ -252,6 +256,7 @@ public sealed class AetherReducer
             byVersion[field.Version] = field;
         }
 
+        var frontiers = ActorFrontiers(copy);
         var winners = new List<StoredField>(versions.Count);
         foreach (var byVersion in versions.Values)
         {
@@ -266,37 +271,50 @@ public sealed class AetherReducer
         }
 
         var accepted = new List<StoredField>();
-        long highest = 0;
         foreach (var field in winners)
         {
             if (_records.TryGetValue(field.Key, out var existing) && field.Version.CompareTo(existing.Version) <= 0)
                 continue;
             accepted.Add(field);
+        }
+
+        var advanced = new List<KeyValuePair<string, ActorClaim>>();
+        foreach (var (actor, claim) in frontiers)
+        {
+            if (FrontierAdvances(actor, claim))
+                advanced.Add(new KeyValuePair<string, ActorClaim>(actor, claim));
+        }
+
+        if (accepted.Count == 0 && advanced.Count == 0)
+            return new AetherMerge(false, default);
+
+        long highest = 0;
+        foreach (var field in accepted)
+        {
             if (field.Version.Lamport > highest)
                 highest = field.Version.Lamport;
         }
 
-        if (accepted.Count == 0)
-            return new AetherMerge(false, default);
+        foreach (var pair in advanced)
+        {
+            if (pair.Value.Lamport > highest)
+                highest = pair.Value.Lamport;
+        }
 
         if (_saveSequence == long.MaxValue)
             throw new AetherProtocolException("Save sequence overflow.");
-        if (accepted.Count > 0)
-        {
-            var next = Math.Max(_clock, highest);
-            if (next == long.MaxValue)
-                throw new AetherProtocolException("Lamport clock overflow.");
-            _clock = next + 1;
-        }
+        var next = Math.Max(_clock, highest);
+        if (next == long.MaxValue)
+            throw new AetherProtocolException("Lamport clock overflow.");
 
+        _clock = next + 1;
         _saveSequence++;
         foreach (var field in accepted)
-        {
             Upsert(field.Key, field.Value, field.Version, field.WriterId, field.OperationId, field.Sequence);
-            RestoreActorSequence(field.Version.ActorId, field.Sequence);
-        }
+        foreach (var (actor, claim) in advanced)
+            RememberFrontier(actor, claim);
 
-        return new AetherMerge(true, new AetherApplied(null, _clock, _saveSequence, accepted));
+        return new AetherMerge(true, new AetherApplied(null, _clock, _saveSequence, copy));
     }
 
     public void MergeImage(AetherImage image)
@@ -339,10 +357,18 @@ public sealed class AetherReducer
         return new AetherImage(_clock, fields, _seenOrder.ToArray(), deleted, visibility, membership);
     }
 
-    public void RestoreActorSequence(string actorId, long sequence)
+    public void RestoreActorSequence(string actorId, long sequence, long lamport = 0, string? operationId = null)
     {
         if (string.IsNullOrEmpty(actorId) || sequence < 1)
             throw new AetherProtocolException("Actor sequence is missing.");
+        if (!string.IsNullOrEmpty(operationId))
+        {
+            _frontiers[actorId] = new ActorFrontier(sequence, lamport, operationId);
+            if (!_nextSequence.TryGetValue(actorId, out var known) || sequence > known)
+                _nextSequence[actorId] = sequence;
+            return;
+        }
+
         if (_nextSequence.TryGetValue(actorId, out var current) && current >= sequence)
             return;
         _nextSequence[actorId] = sequence;
@@ -638,6 +664,89 @@ public sealed class AetherReducer
         _membership[key] = new MembershipState(version, published);
     }
 
+    private ActorCursor FrontierCursor(string actorId, long sequence)
+    {
+        if (_frontiers.TryGetValue(actorId, out var frontier)
+            && frontier.Sequence == sequence
+            && !string.IsNullOrEmpty(frontier.OperationId))
+            return new ActorCursor(actorId, sequence, frontier.Lamport, frontier.OperationId);
+        return new ActorCursor(actorId, sequence);
+    }
+
+    private Dictionary<string, ActorClaim> ActorFrontiers(IReadOnlyList<StoredField> fields)
+    {
+        var byActor = new Dictionary<string, Dictionary<long, ActorClaim>>(StringComparer.Ordinal);
+        foreach (var field in fields)
+        {
+            if (!byActor.TryGetValue(field.Version.ActorId, out var bySequence))
+            {
+                bySequence = new Dictionary<long, ActorClaim>();
+                byActor[field.Version.ActorId] = bySequence;
+            }
+
+            var claim = new ActorClaim(field.Sequence, field.Version.Lamport, field.OperationId);
+            if (bySequence.TryGetValue(field.Sequence, out var prior)
+                && (prior.Lamport != claim.Lamport
+                    || !string.Equals(prior.OperationId, claim.OperationId, StringComparison.Ordinal)))
+                throw new AetherProtocolException("Actor sequence is inconsistent.");
+            bySequence[field.Sequence] = claim;
+        }
+
+        var tops = new Dictionary<string, ActorClaim>(StringComparer.Ordinal);
+        foreach (var (actor, bySequence) in byActor)
+        {
+            ActorClaim? previous = null;
+            ActorClaim top = default;
+            foreach (var claim in bySequence.Values.OrderBy(item => item.Sequence))
+            {
+                if (previous is ActorClaim earlier && claim.Lamport <= earlier.Lamport)
+                    throw new AetherProtocolException("Actor sequence is inconsistent.");
+                previous = claim;
+                top = claim;
+            }
+
+            if (_frontiers.TryGetValue(actor, out var frontier) && !string.IsNullOrEmpty(frontier.OperationId))
+            {
+                foreach (var claim in bySequence.Values)
+                {
+                    if (claim.Sequence == frontier.Sequence)
+                    {
+                        if (claim.Lamport != frontier.Lamport
+                            || !string.Equals(claim.OperationId, frontier.OperationId, StringComparison.Ordinal))
+                            throw new AetherProtocolException("Actor sequence is inconsistent.");
+                    }
+                    else if (claim.Sequence > frontier.Sequence)
+                    {
+                        if (claim.Lamport <= frontier.Lamport)
+                            throw new AetherProtocolException("Actor sequence is inconsistent.");
+                    }
+                    else if (claim.Lamport >= frontier.Lamport)
+                        throw new AetherProtocolException("Actor sequence is inconsistent.");
+                }
+            }
+
+            tops[actor] = top;
+        }
+
+        return tops;
+    }
+
+    private bool FrontierAdvances(string actorId, ActorClaim claim)
+    {
+        if (_frontiers.TryGetValue(actorId, out var frontier) && !string.IsNullOrEmpty(frontier.OperationId))
+            return claim.Sequence > frontier.Sequence;
+        if (_nextSequence.TryGetValue(actorId, out var current))
+            return claim.Sequence >= current;
+        return true;
+    }
+
+    private void RememberFrontier(string actorId, ActorClaim claim)
+    {
+        _frontiers[actorId] = new ActorFrontier(claim.Sequence, claim.Lamport, claim.OperationId);
+        if (!_nextSequence.TryGetValue(actorId, out var current) || claim.Sequence > current)
+            _nextSequence[actorId] = claim.Sequence;
+    }
+
     private static long NextClock(long clock)
     {
         if (clock == long.MaxValue)
@@ -705,6 +814,10 @@ public sealed class AetherReducer
 
     private readonly record struct FieldSchema(FieldKind Kind, long Min, long Max);
 
+    private readonly record struct ActorClaim(long Sequence, long Lamport, string OperationId);
+
+    private readonly record struct ActorFrontier(long Sequence, long Lamport, string OperationId);
+
     private readonly record struct VisibilityState(FieldVersion Version, bool Hidden);
 
     private readonly record struct MembershipState(FieldVersion Version, bool Published);
@@ -718,7 +831,7 @@ public sealed class AetherReducer
 
 public readonly record struct FieldDefinition(string Id, string Resolver, long Min, long Max);
 
-public readonly record struct ActorCursor(string ActorId, long Sequence);
+public readonly record struct ActorCursor(string ActorId, long Sequence, long Lamport = 0, string OperationId = "");
 
 public readonly record struct RecordKey(string EntityId, string WriterId, string FieldId);
 

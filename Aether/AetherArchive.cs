@@ -133,7 +133,7 @@ public sealed class AetherArchive
         reducer.MergeImage(new AetherImage(clock, fields, seen, deleted, visibility, membership));
         reducer.RestoreSaveThrough(saveThrough);
         foreach (var cursor in cursors)
-            reducer.RestoreActorSequence(cursor.ActorId, cursor.Sequence);
+            reducer.RestoreActorSequence(cursor.ActorId, cursor.Sequence, cursor.Lamport, cursor.OperationId);
 
         if (File.Exists(LogPath))
         {
@@ -268,7 +268,7 @@ public sealed class AetherArchive
         var count = reader.U32();
         var cursors = new List<ActorCursor>(checked((int)count));
         for (var i = 0; i < count; i++)
-            cursors.Add(new ActorCursor(reader.Text(), reader.I64()));
+            cursors.Add(new ActorCursor(reader.Text(), reader.I64(), reader.I64(), reader.Text()));
         return cursors;
     }
 
@@ -336,6 +336,8 @@ public sealed class AetherArchive
         {
             WriteText(buffer, cursor.ActorId);
             WriteI64(buffer, cursor.Sequence);
+            WriteI64(buffer, cursor.Lamport);
+            WriteText(buffer, cursor.OperationId ?? "");
         }
 
         return buffer.ToArray();

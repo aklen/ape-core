@@ -37,7 +37,11 @@ the link. A new link sends the saved own records as a contribution merge.
 The receiver queues that merge on the host. Commit journals it as state, not as an operation.
 Check every (key, version) pair before choosing a winner.
 The same version must carry the same value, operation id, and sequence.
-Only a stored record moves the actor cursor.
+A validated actor record moves that actor's frontier even when the field loses.
+The same sequence repeats only the same operation id and Lamport.
+A greater sequence needs a greater Lamport.
+An inconsistent claim is rejected before the clock, the records, or the frontier change.
+Authenticating the actor is not this slice.
 An unchanged merge is not appended.
 The actor and the sequence are on the record, not parsed from the operation id.
 An operation is resent only from an envelope this process still holds.

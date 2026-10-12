@@ -110,23 +110,109 @@ public sealed class AetherContributionTests
     }
 
     [Fact]
-    public void A_stale_contribution_does_not_move_the_actor_cursor()
+    public void An_inconsistent_actor_sequence_is_rejected_before_mutation()
     {
         var stored = NewStore();
         stored.MergeContributions([Label(10, "kept", sequence: 4)]);
-        stored.MergeContributions([Label(5, "old", sequence: long.MaxValue)]);
+        var through = stored.SaveThrough;
+        var clock = stored.Clock;
+        Assert.Throws<AetherProtocolException>(() => stored.MergeContributions([Stale()]));
         Assert.Equal("kept", stored.ResolveLww("entity-1", "label")?.Text);
         Assert.Equal(4, Assert.Single(stored.ActorCursors).Sequence);
+        Assert.Equal(through, stored.SaveThrough);
+        Assert.Equal(clock, stored.Clock);
         Assert.Equal(5, stored.StampLocal("entity-1", "peer-a", "peer-a", Note("next")).Sequence);
 
         foreach (var order in new[] { new[] { Stale(), Winner() }, new[] { Winner(), Stale() } })
         {
             var store = NewStore();
-            store.MergeContributions(order);
-            Assert.Equal("kept", store.ResolveLww("entity-1", "label")?.Text);
-            Assert.Equal(4, Assert.Single(store.ActorCursors).Sequence);
-            Assert.Equal(5, store.StampLocal("entity-1", "peer-a", "peer-a", Note("next")).Sequence);
+            Assert.Throws<AetherProtocolException>(() => store.MergeContributions(order));
+            Assert.Equal(0, store.RecordCount);
+            Assert.Empty(store.ActorCursors);
+            Assert.Equal(0, store.Clock);
+            Assert.Equal(0, store.SaveThrough);
         }
+
+        var older = NewStore();
+        older.MergeContributions([Label(10, "kept", sequence: 4)]);
+        Assert.Throws<AetherProtocolException>(() => older.MergeContributions(
+            [Claim("note", 10, "other", 2, "back")]));
+        Assert.Equal("kept", older.ResolveLww("entity-1", "label")?.Text);
+        Assert.Null(older.ResolveLww("entity-1", "note")?.Text);
+        Assert.Equal(4, Assert.Single(older.ActorCursors).Sequence);
+
+        var sameSequence = NewStore();
+        Assert.Throws<AetherProtocolException>(() => sameSequence.MergeContributions(
+            [Claim("label", 10, "op-a", 4, "a"), Claim("note", 10, "op-b", 4, "b")]));
+        Assert.Throws<AetherProtocolException>(() => sameSequence.MergeContributions(
+            [Claim("note", 10, "op-b", 4, "b"), Claim("label", 10, "op-a", 4, "a")]));
+        Assert.Equal(0, sameSequence.RecordCount);
+        Assert.Empty(sameSequence.ActorCursors);
+
+        var flat = NewStore();
+        Assert.Throws<AetherProtocolException>(() => flat.MergeContributions(
+            [Claim("label", 10, "op-a", 4, "a"), Claim("note", 10, "op-b", 6, "b")]));
+        Assert.Equal(0, flat.RecordCount);
+        Assert.Empty(flat.ActorCursors);
+    }
+
+    [Fact]
+    public void A_losing_field_still_advances_the_actor_frontier()
+    {
+        var prior = new StoredField(
+            new RecordKey("entity-1", "actor-a", "note"),
+            FieldValue.Label("won"),
+            new FieldVersion(30, "actor-b"),
+            "actor-a",
+            "b-note",
+            1);
+        var label = Claim("label", 10, "a-label", 4, "kept", "actor-a");
+        var note = Claim("note", 20, "a-note", 6, "late", "actor-a");
+
+        foreach (var order in new[] { new[] { label, note }, new[] { note, label } })
+        {
+            var store = NewStore();
+            store.MergeContributions([prior]);
+            var merged = store.MergeContributions(order);
+            Assert.True(merged.Changed);
+            Assert.Equal("kept", store.ResolveLww("entity-1", "label")?.Text);
+            Assert.Equal("won", store.ResolveLww("entity-1", "note")?.Text);
+            Assert.DoesNotContain(store.Capture().Fields, field => field.OperationId == "a-note");
+            var cursor = Assert.Single(store.ActorCursors, item => item.ActorId == "actor-a");
+            Assert.Equal(6, cursor.Sequence);
+            Assert.Equal(20, cursor.Lamport);
+            Assert.Equal(7, store.StampLocal("entity-1", "actor-a", "actor-a", Note("next")).Sequence);
+        }
+
+        using var snapshot = new TempDir();
+        var saved = NewStore();
+        saved.MergeContributions([prior]);
+        saved.MergeContributions([label, note]);
+        new AetherArchive(snapshot.Path).Save(saved);
+        var fromSnapshot = new AetherArchive(snapshot.Path).Load();
+        Assert.Equal("won", fromSnapshot.ResolveLww("entity-1", "note")?.Text);
+        Assert.Equal(6, fromSnapshot.ActorCursors.Single(item => item.ActorId == "actor-a").Sequence);
+        Assert.Throws<AetherProtocolException>(() => fromSnapshot.MergeContributions(
+            [Claim("label", 5, "poison", long.MaxValue, "old", "actor-a")]));
+        Assert.Equal(6, fromSnapshot.ActorCursors.Single(item => item.ActorId == "actor-a").Sequence);
+        Assert.Equal(7, fromSnapshot.StampLocal("entity-1", "actor-a", "actor-a", Note("next")).Sequence);
+
+        using var dir = new TempDir();
+        var durable = NewStore();
+        var host = new AetherHost(durable, 4096, 8);
+        var archive = new AetherArchive(dir.Path);
+        host.Save(archive);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([prior]).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, host.TryAcceptContribution([label, note]).Kind);
+        var outcomes = host.Drain();
+        Assert.Equal(2, outcomes.Count);
+        Assert.All(outcomes, outcome => Assert.Equal(AetherOutcomeKind.Applied, outcome.Kind));
+        host.Commit(archive);
+        var loaded = new AetherArchive(dir.Path).Load();
+        Assert.Equal("won", loaded.ResolveLww("entity-1", "note")?.Text);
+        Assert.Equal("kept", loaded.ResolveLww("entity-1", "label")?.Text);
+        Assert.Equal(6, loaded.ActorCursors.Single(item => item.ActorId == "actor-a").Sequence);
+        Assert.Equal(7, loaded.StampLocal("entity-1", "actor-a", "actor-a", Note("next")).Sequence);
     }
 
     [Fact]
@@ -236,12 +322,21 @@ public sealed class AetherContributionTests
     }
 
     private static StoredField Label(long lamport, string text, long sequence = 1) =>
+        Claim("label", lamport, "src", sequence, text);
+
+    private static StoredField Claim(
+        string fieldId,
+        long lamport,
+        string operationId,
+        long sequence,
+        string text,
+        string actorId = "peer-a") =>
         new(
-            new RecordKey("entity-1", "peer-a", "label"),
+            new RecordKey("entity-1", actorId, fieldId),
             FieldValue.Label(text),
-            new FieldVersion(lamport, "peer-a"),
-            "peer-a",
-            "src",
+            new FieldVersion(lamport, actorId),
+            actorId,
+            operationId,
             sequence);
 
     private static AetherReducer NewStore()
