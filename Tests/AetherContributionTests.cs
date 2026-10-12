@@ -53,6 +53,84 @@ public sealed class AetherContributionTests
         Assert.Equal(AetherWire.PacketTooLarge, contribution.Message);
     }
 
+    [Fact]
+    public void A_packet_at_the_byte_limit_is_accepted_and_one_more_byte_is_refused()
+    {
+        const char wide = '\u00e9';
+        Assert.Equal(2, System.Text.Encoding.UTF8.GetByteCount(wide.ToString()));
+        AssertLimit(LabelPacket, ReadLabel, wide);
+        AssertLimit(ContributionPacket, ReadContribution, wide);
+    }
+
+    private static void AssertLimit(Func<string, byte[]> encode, Func<byte[], string> read, char wide)
+    {
+        var room = LabelRoom(encode);
+        var ascii = new string('x', room);
+        var packet = encode(ascii);
+        Assert.Equal(AetherWire.MaxPacketBytes, packet.Length);
+        Assert.Equal(ascii, read(packet));
+        var longer = Assert.Throws<AetherProtocolException>(() => encode(ascii + "y"));
+        Assert.Equal(AetherWire.PacketTooLarge, longer.Message);
+
+        var sameCharacterCount = new string(wide, room);
+        Assert.Equal(ascii.Length, sameCharacterCount.Length);
+        Assert.True(System.Text.Encoding.UTF8.GetByteCount(sameCharacterCount) > room);
+        var countedAsCharacters = Assert.Throws<AetherProtocolException>(() => encode(sameCharacterCount));
+        Assert.Equal(AetherWire.PacketTooLarge, countedAsCharacters.Message);
+
+        var exact = new string(wide, room / 2);
+        var remainder = room - System.Text.Encoding.UTF8.GetByteCount(exact);
+        if (remainder > 0)
+            exact += new string('x', remainder);
+        Assert.Equal(room, System.Text.Encoding.UTF8.GetByteCount(exact));
+        Assert.NotEqual(room, exact.Length);
+        var widePacket = encode(exact);
+        Assert.Equal(AetherWire.MaxPacketBytes, widePacket.Length);
+        Assert.Equal(exact, read(widePacket));
+        var oneMoreByte = Assert.Throws<AetherProtocolException>(() => encode(exact + "y"));
+        Assert.Equal(AetherWire.PacketTooLarge, oneMoreByte.Message);
+    }
+
+    private static int LabelRoom(Func<string, byte[]> encode)
+    {
+        const string sample = "x";
+        return AetherWire.MaxPacketBytes - (encode(sample).Length - System.Text.Encoding.UTF8.GetByteCount(sample));
+    }
+
+    private static byte[] LabelPacket(string text) => AetherWire.Encode(new AetherOperation(
+        "id",
+        "e",
+        "w",
+        "a",
+        1,
+        1,
+        new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label(text) }));
+
+    private static string ReadLabel(byte[] packet)
+    {
+        Assert.True(AetherWire.TryDecode(packet, "e", "label", out var operation, out var fault));
+        Assert.Null(fault);
+        return operation!.Changes["label"].Text!;
+    }
+
+    private static byte[] ContributionPacket(string text) => AetherWire.EncodeContributions(
+    [
+        new StoredField(
+            new RecordKey("e", "w", "label"),
+            FieldValue.Label(text),
+            new FieldVersion(1, "a"),
+            "w",
+            "id",
+            1),
+    ]);
+
+    private static string ReadContribution(byte[] packet)
+    {
+        Assert.True(AetherWire.TryDecodeContributions(packet, out var fields, out var fault));
+        Assert.Null(fault);
+        return Assert.Single(fields).Value.Text!;
+    }
+
     private static byte[] ContributionHeader(uint count)
     {
         using var body = new MemoryStream();
