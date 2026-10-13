@@ -219,6 +219,14 @@ Keep checkpoint I/O and chunk transport outside the frame. Do not call a bootstr
 checkpoint a policy cutover or dedup-coverage proof unless it explicitly carries
 and validates those contracts.
 
+Move checkpoint bytes through the generic content-addressed file path. Manifests
+must bound total bytes, chunk bytes, and chunk count before allocation. Treat the
+externally supplied whole-artifact digest as the trust input; a manifest checksum
+only detects damage. Verify exact chunk length and hash before storage, verify stored
+chunks again on resume and assembly, and verify the complete pinned artifact before
+installing it. Resume from verified chunks rather than retaining a full transfer in
+RAM. Give requests and chunk sends a fair budget beside state updates and live media.
+
 ## Test contracts, not just implementation agreement
 
 Use handwritten expected results and adversarial small examples. Cover relevant

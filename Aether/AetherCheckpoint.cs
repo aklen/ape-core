@@ -274,4 +274,10 @@ public sealed class AetherCheckpointArtifact
     public string Sha256 { get; }
     public int Length => _bytes.Length;
     public byte[] ToArray() => _bytes.ToArray();
+    internal byte[] CopyRange(int offset, int length)
+    {
+        if (offset < 0 || length < 0 || offset > _bytes.Length - length)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+        return _bytes.AsSpan(offset, length).ToArray();
+    }
 }
