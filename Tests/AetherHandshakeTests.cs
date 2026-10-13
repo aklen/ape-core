@@ -1173,6 +1173,167 @@ public sealed class AetherHandshakeTests
     }
 
     [Fact]
+    public void Interest_sends_one_entity_and_leaves_membership_unchanged()
+    {
+        var listed = AetherWire.EncodeInterest(["cube", "sphere"]);
+        Assert.True(AetherWire.TryDecodeInterest(listed, out var decoded, out var decodedFault));
+        Assert.Null(decodedFault);
+        Assert.Equal(["cube", "sphere"], decoded);
+        Assert.True(AetherWire.TryDecodeInterest(AetherWire.EncodeInterest([]), out var empty, out var emptyFault));
+        Assert.Null(emptyFault);
+        Assert.Empty(empty);
+        Assert.Throws<AetherProtocolException>(() => AetherWire.EncodeInterest(["cube", "cube"]));
+        Assert.Throws<AetherProtocolException>(() => AetherWire.EncodeInterest([""]));
+        Assert.Throws<AetherProtocolException>(() => AetherWire.EncodeInterest(
+            Enumerable.Range(0, AetherWire.MaxInterestCount + 1).Select(i => i.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToArray()));
+
+        var time = new ManualTime();
+        using var ownerDir = new TempDir();
+        using var interestedDir = new TempDir();
+        using var openDir = new TempDir();
+        using var owner = Side.Create(ownerDir.Path, time);
+        using var interested = Side.Create(interestedDir.Path, time);
+        using var open = Side.Create(openDir.Path, time);
+        var ownerServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var interestedServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var openServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var ownerScene = ownerServices.GetRequiredService<ISceneManager>();
+        var interestedScene = interestedServices.GetRequiredService<ISceneManager>();
+        var openScene = openServices.GetRequiredService<ISceneManager>();
+        var ownerStore = SceneStore();
+        var interestedStore = SceneStore();
+        var openStore = SceneStore();
+        using var ownerLink = SceneLink(owner, ownerStore, ownerServices);
+        using var interestedLink = SceneLink(interested, interestedStore, interestedServices);
+        using var openLink = SceneLink(open, openStore, openServices);
+
+        var ownerInterested = Exchange(owner, interested);
+        var ownerToInterested = ownerInterested.LeftSlot;
+        var interestedFromOwner = interested.Slot;
+        var ownerOpen = Exchange(owner, open);
+        var ownerToOpen = ownerOpen.LeftSlot;
+        var openFromOwner = open.Slot;
+        Exchange(interested, open);
+
+        var declared = interested.Transport.Directed.Count;
+        Assert.True(interestedLink.DeclareInterest(["cube"]));
+        interestedLink.Pump();
+        var interest = interested.Transport.Directed
+            .Skip(declared)
+            .First(item => item.PeerId == interestedFromOwner && AetherWire.IsInterestPacket(item.Data))
+            .Data;
+        owner.Transport.DeliverSlot(ownerToInterested, interest);
+        Assert.Null(ownerLink.LastRemoteFault);
+        Assert.Equal(0, ownerStore.Clock);
+        Assert.Null(ownerStore.GetEntity("cube"));
+
+        var damaged = interest.ToArray();
+        damaged[^1] ^= 0xFF;
+        owner.Transport.DeliverSlot(ownerToInterested, damaged);
+        Assert.Equal("State packet checksum does not match.", ownerLink.LastRemoteFault);
+        Assert.Equal(0, ownerStore.Clock);
+
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitCreate("cube", TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitCreate("sphere", TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitLabel("cube", "red").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitOffset("cube", 4).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitLabel("sphere", "blue").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitOffset("sphere", 9).Kind);
+        var sent = owner.Transport.Directed.Count;
+        ownerLink.Pump();
+        Assert.NotEmpty(PacketsFor(owner, sent, ownerToInterested));
+        Assert.All(PacketsFor(owner, sent, ownerToInterested), packet => Assert.Equal("cube", EntityOf(packet)));
+        Assert.Contains(PacketsFor(owner, sent, ownerToOpen), packet => EntityOf(packet) == "sphere");
+        DeliverDirected(owner, sent, ownerToInterested, interested, interestedFromOwner);
+        DeliverDirected(owner, sent, ownerToOpen, open, openFromOwner);
+        interestedLink.Pump();
+        openLink.Pump();
+
+        var cube = Assert.IsType<TestStubEntity>(interestedScene.GetEntity("cube"));
+        Assert.Null(interestedScene.GetEntity("sphere"));
+        Assert.Null(cube.Label);
+        Assert.Equal(0, cube.Offset);
+        Assert.False(interestedStore.IsMember("cube", "catalog"));
+        Assert.IsType<TestStubEntity>(openScene.GetEntity("sphere"));
+        Assert.Equal(AetherAdmitKind.Refused, interestedLink.SubmitHide("cube").Kind);
+        Assert.Equal(AetherAdmitKind.Refused, interestedLink.SubmitPublish("cube").Kind);
+        Assert.True(ownerStore.IsSharedVisible("cube"));
+
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitPublish("cube").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitPublish("sphere").Kind);
+        sent = owner.Transport.Directed.Count;
+        ownerLink.Pump();
+        Assert.All(PacketsFor(owner, sent, ownerToInterested), packet => Assert.Equal("cube", EntityOf(packet)));
+        Assert.Contains(PacketsFor(owner, sent, ownerToOpen), packet => EntityOf(packet) == "sphere");
+        DeliverDirected(owner, sent, ownerToInterested, interested, interestedFromOwner);
+        DeliverDirected(owner, sent, ownerToOpen, open, openFromOwner);
+        interestedLink.Pump();
+        openLink.Pump();
+
+        Assert.Equal("red", cube.Label);
+        Assert.Equal(4, cube.Offset);
+        Assert.Null(interestedScene.GetEntity("sphere"));
+        Assert.True(interestedStore.IsMember("cube", "catalog"));
+        Assert.False(interestedStore.IsMember("sphere", "catalog"));
+        Assert.Equal("blue", Assert.IsType<TestStubEntity>(openScene.GetEntity("sphere")).Label);
+        Assert.Equal(9, Assert.IsType<TestStubEntity>(openScene.GetEntity("sphere")).Offset);
+
+        owner.Transport.DisconnectSlot(ownerToInterested);
+        interested.Transport.DisconnectSlot(interestedFromOwner);
+        var again = Exchange(owner, interested);
+        var ownerToInterestedAgain = again.LeftSlot;
+        var interestedFromOwnerAgain = interested.Slot;
+        sent = owner.Transport.Directed.Count;
+        ownerLink.Pump();
+        Assert.Contains(PacketsFor(owner, sent, ownerToInterestedAgain), packet => EntityOf(packet) == "sphere");
+        DeliverDirected(owner, sent, ownerToInterestedAgain, interested, interestedFromOwnerAgain);
+        interestedLink.Pump();
+        interestedLink.Pump();
+        var sphere = Assert.IsType<TestStubEntity>(interestedScene.GetEntity("sphere"));
+        Assert.Equal("blue", sphere.Label);
+        Assert.Equal(9, sphere.Offset);
+        Assert.Same(cube, interestedScene.GetEntity("cube"));
+    }
+
+    [Fact]
+    public void An_empty_interest_receives_nothing()
+    {
+        var time = new ManualTime();
+        using var ownerDir = new TempDir();
+        using var quietDir = new TempDir();
+        using var owner = Side.Create(ownerDir.Path, time);
+        using var quiet = Side.Create(quietDir.Path, time);
+        var ownerServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var quietServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var ownerStore = SceneStore();
+        var quietStore = SceneStore();
+        using var ownerLink = SceneLink(owner, ownerStore, ownerServices);
+        using var quietLink = SceneLink(quiet, quietStore, quietServices);
+        var link = Exchange(owner, quiet);
+        var ownerToQuiet = link.LeftSlot;
+        var quietFromOwner = quiet.Slot;
+
+        var declared = quiet.Transport.Directed.Count;
+        Assert.True(quietLink.DeclareInterest([]));
+        quietLink.Pump();
+        var interest = quiet.Transport.Directed
+            .Skip(declared)
+            .First(item => item.PeerId == quietFromOwner && AetherWire.IsInterestPacket(item.Data))
+            .Data;
+        owner.Transport.DeliverSlot(ownerToQuiet, interest);
+
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitCreate("cube", TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitCreate("sphere", TestStubEntity.RegistryTypeId).Kind);
+        var sent = owner.Transport.Directed.Count;
+        ownerLink.Pump();
+
+        Assert.Empty(PacketsFor(owner, sent, ownerToQuiet));
+        Assert.IsType<TestStubEntity>(ownerServices.GetRequiredService<ISceneManager>().GetEntity("cube"));
+        Assert.Null(quietServices.GetRequiredService<ISceneManager>().GetEntity("cube"));
+        Assert.False(quietStore.IsMember("cube", "catalog"));
+    }
+
+    [Fact]
     public void A_full_scene_queue_does_not_create_the_second_entity()
     {
         var time = new ManualTime();
@@ -1196,6 +1357,39 @@ public sealed class AetherHandshakeTests
         Assert.IsType<TestStubEntity>(scene.GetEntity("cube"));
         Assert.Null(scene.GetEntity("sphere"));
         Assert.Null(store.GetEntity("sphere"));
+    }
+
+    private static IEnumerable<byte[]> PacketsFor(Side sender, int directedBefore, string slot)
+    {
+        foreach (var (peerId, data) in sender.Transport.Directed.Skip(directedBefore))
+        {
+            if (string.Equals(peerId, slot, StringComparison.Ordinal))
+                yield return data;
+        }
+    }
+
+    private static string EntityOf(byte[] packet)
+    {
+        if (AetherWire.IsContributionPacket(packet))
+        {
+            Assert.True(AetherWire.TryDecodeContributions(packet, out var fields, out _));
+            return fields[0].Key.EntityId;
+        }
+
+        Assert.True(AetherWire.TryDecodeAny(packet, out var operation, out _));
+        return operation!.EntityId;
+    }
+
+    private static void DeliverDirected(Side sender, int directedBefore, string senderSlot, Side receiver, string receiverSlot)
+    {
+        var seen = new List<byte[]>();
+        foreach (var packet in PacketsFor(sender, directedBefore, senderSlot))
+        {
+            if (seen.Any(existing => existing.AsSpan().SequenceEqual(packet)))
+                continue;
+            seen.Add(packet);
+            receiver.Transport.DeliverSlot(receiverSlot, packet);
+        }
     }
 
     private static void DeliverOne(Side sender, int sentBefore, Side receiver, string slot)
@@ -1363,6 +1557,8 @@ public sealed class AetherHandshakeTests
 
         public List<byte[]> Sent { get; } = [];
 
+        public List<(string PeerId, byte[] Data)> Directed { get; } = [];
+
         public List<byte[]> Handshakes { get; } = [];
 
         public int FailNextSends { get; set; }
@@ -1395,15 +1591,15 @@ public sealed class AetherHandshakeTests
 
         public void DeliverSlot(string slot, byte[] data) => OnDataReceived?.Invoke(slot, data, data.Length);
 
-        public void SendReliable(string peerId, byte[] data) => Take(data);
+        public void SendReliable(string peerId, byte[] data) => Take(peerId, data);
 
         public bool TrySendBulk(string peerId, byte[] data)
         {
-            Take(data);
+            Take(peerId, data);
             return true;
         }
 
-        public void SendUnreliable(string peerId, byte[] data) => Take(data);
+        public void SendUnreliable(string peerId, byte[] data) => Take(peerId, data);
 
         public IEnumerable<string> GetConnectedPeers() => _peers;
 
@@ -1423,7 +1619,7 @@ public sealed class AetherHandshakeTests
 
         public void Dispose() { }
 
-        private void Take(byte[] data)
+        private void Take(string peerId, byte[] data)
         {
             if (FailNextSends > 0)
             {
@@ -1432,10 +1628,12 @@ public sealed class AetherHandshakeTests
                 throw new IOException("Send failed.");
             }
 
-            if (data.Length > 0 && data[0] == PrincipalHandshake.Marker)
-                Handshakes.Add(data.ToArray());
+            var copy = data.ToArray();
+            if (copy.Length > 0 && copy[0] == PrincipalHandshake.Marker)
+                Handshakes.Add(copy);
             else
-                Sent.Add(data.ToArray());
+                Sent.Add(copy);
+            Directed.Add((peerId, copy));
         }
     }
 

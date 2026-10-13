@@ -19,6 +19,8 @@ public static class AetherWire
     public const byte RestoreType = 0x36;
     public const byte PublishType = 0x37;
     public const byte WithdrawType = 0x38;
+    public const byte InterestType = 0x39;
+    public const int MaxInterestCount = 64;
     public const ushort WireVersion = 2;
     public const string LabelRule = "lww";
     public const int MaxPacketBytes = 65_536;
@@ -32,6 +34,9 @@ public static class AetherWire
 
     public static bool IsContributionPacket(ReadOnlySpan<byte> data) =>
         !data.IsEmpty && data[0] == ContributionType;
+
+    public static bool IsInterestPacket(ReadOnlySpan<byte> data) =>
+        !data.IsEmpty && data[0] == InterestType;
 
     public static bool IsCreatePacket(ReadOnlySpan<byte> data) =>
         !data.IsEmpty && data[0] == CreateType;
@@ -277,6 +282,87 @@ public static class AetherWire
         }
 
         return WithChecksum(body.ToArray());
+    }
+
+    public static byte[] EncodeInterest(IReadOnlyList<string> entityIds)
+    {
+        ArgumentNullException.ThrowIfNull(entityIds);
+        if (entityIds.Count > MaxInterestCount)
+            throw new AetherProtocolException("Interest has too many entities.");
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entityId in entityIds)
+        {
+            if (string.IsNullOrEmpty(entityId))
+                throw new AetherProtocolException("Interest entity is empty.");
+            if (!seen.Add(entityId))
+                throw new AetherProtocolException("Interest entity is repeated.");
+        }
+
+        var size = 0;
+        Reserve(ref size, 1 + 2 + 4);
+        foreach (var entityId in entityIds)
+            ReserveText(ref size, entityId);
+
+        using var body = new MemoryStream(size);
+        body.WriteByte(InterestType);
+        WriteU16(body, WireVersion);
+        WriteU32(body, (uint)entityIds.Count);
+        foreach (var entityId in entityIds)
+            WriteText(body, entityId);
+        return WithChecksum(body.ToArray());
+    }
+
+    public static bool TryDecodeInterest(byte[] data, out IReadOnlyList<string> entityIds, out string? fault)
+    {
+        try
+        {
+            entityIds = DecodeInterest(data);
+            fault = null;
+            return true;
+        }
+        catch (AetherProtocolException ex)
+        {
+            entityIds = [];
+            fault = ex.Message;
+            return false;
+        }
+    }
+
+    private static IReadOnlyList<string> DecodeInterest(byte[] data)
+    {
+        if (data.Length < 33 || data.Length > MaxPacketBytes || data[0] != InterestType)
+            throw new AetherProtocolException(data.Length > MaxPacketBytes
+                ? PacketTooLarge
+                : "State packet is truncated.");
+        var body = data.AsSpan(0, data.Length - 32);
+        var hash = data.AsSpan(data.Length - 32);
+        if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(body), hash))
+            throw new AetherProtocolException("State packet checksum does not match.");
+
+        var reader = new Reader(body);
+        var packetType = reader.U8();
+        if (packetType != InterestType)
+            throw new AetherProtocolException("State packet is truncated.");
+        var version = reader.U16();
+        if (version != WireVersion)
+            throw new AetherProtocolException("Wire version is not supported.");
+        var count = reader.U32();
+        if (count > MaxInterestCount)
+            throw new AetherProtocolException("Interest has too many entities.");
+        var entityIds = new string[count];
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < count; i++)
+        {
+            var entityId = reader.Text();
+            if (string.IsNullOrEmpty(entityId))
+                throw new AetherProtocolException("Interest entity is empty.");
+            if (!seen.Add(entityId))
+                throw new AetherProtocolException("Interest entity is repeated.");
+            entityIds[i] = entityId;
+        }
+
+        reader.End();
+        return entityIds;
     }
 
     public static bool TryDecodeContributions(

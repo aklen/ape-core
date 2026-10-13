@@ -30,7 +30,8 @@ public sealed class AetherSceneLink : IDisposable
     private readonly Dictionary<string, AetherOperation> _ownVisibility = new(StringComparer.Ordinal);
     private readonly Dictionary<string, AetherOperation> _ownMembership = new(StringComparer.Ordinal);
     private readonly HashSet<long> _localIds = new();
-    private readonly Queue<byte[]> _outgoing = new();
+    private readonly Dictionary<string, HashSet<string>> _interest = new(StringComparer.Ordinal);
+    private readonly Queue<Outgoing> _outgoing = new();
     private readonly Queue<HeldOperation> _held = new();
     private readonly Queue<HeldContribution> _heldContributions = new();
     private readonly FrozenPlan<AetherScratch> _plan;
@@ -88,6 +89,7 @@ public sealed class AetherSceneLink : IDisposable
         RememberStored();
         network.OnDataReceived += OnData;
         network.OnPeerConnected += OnPeerConnected;
+        network.OnPeerDisconnected += OnPeerDisconnected;
     }
 
     public AetherAdmit? LastRemoteAdmit { get; private set; }
@@ -136,6 +138,16 @@ public sealed class AetherSceneLink : IDisposable
         _catchUpPending = true;
     }
 
+    public bool DeclareInterest(IReadOnlyList<string> entityIds)
+    {
+        ObjectDisposedException.ThrowIf(_stopped, this);
+        var packet = AetherWire.EncodeInterest(entityIds);
+        if (_outgoing.Count >= _maxOutgoing)
+            return false;
+        _outgoing.Enqueue(new Outgoing(packet, null));
+        return true;
+    }
+
     public void Pump()
     {
         ObjectDisposedException.ThrowIf(_stopped, this);
@@ -163,7 +175,7 @@ public sealed class AetherSceneLink : IDisposable
                 Note(operation);
                 if (_outgoing.Count >= _maxOutgoing)
                     continue;
-                _outgoing.Enqueue(EncodeLive(operation));
+                _outgoing.Enqueue(new Outgoing(EncodeLive(operation), operation.EntityId));
             }
         }
 
@@ -178,6 +190,7 @@ public sealed class AetherSceneLink : IDisposable
             return;
         _stopped = true;
         _network.OnPeerConnected -= OnPeerConnected;
+        _network.OnPeerDisconnected -= OnPeerDisconnected;
         _network.OnDataReceived -= OnData;
     }
 
@@ -221,7 +234,15 @@ public sealed class AetherSceneLink : IDisposable
 
     private void OnData(string connectionId, byte[] data)
     {
-        if (_stopped || !AetherWire.IsStatePacket(data))
+        if (_stopped)
+            return;
+        if (AetherWire.IsInterestPacket(data))
+        {
+            AcceptInterest(connectionId, data);
+            return;
+        }
+
+        if (!AetherWire.IsStatePacket(data))
             return;
         if (data.Length > AetherWire.MaxPacketBytes)
         {
@@ -243,6 +264,36 @@ public sealed class AetherSceneLink : IDisposable
     }
 
     private void OnPeerConnected(string peerId) => CatchUp();
+
+    private void OnPeerDisconnected(string connectionId) => _interest.Remove(connectionId);
+
+    private void AcceptInterest(string connectionId, byte[] data)
+    {
+        if (data.Length > AetherWire.MaxPacketBytes)
+        {
+            LastRemoteFault = AetherWire.PacketTooLarge;
+            LastRemoteAdmit = null;
+            return;
+        }
+
+        if (!AetherWire.TryDecodeInterest(data, out var entityIds, out var fault))
+        {
+            LastRemoteFault = fault;
+            LastRemoteAdmit = null;
+            return;
+        }
+
+        if (!_network.TryGetPeer(connectionId, out var peer) || !peer.IsAuthenticated)
+        {
+            LastRemoteFault = "Peer is not authenticated.";
+            LastRemoteAdmit = null;
+            return;
+        }
+
+        _interest[connectionId] = new HashSet<string>(entityIds, StringComparer.Ordinal);
+        LastRemoteFault = null;
+        LastRemoteAdmit = null;
+    }
 
     private bool TryReadRemote(byte[] data, out AetherOperation? operation, out IReadOnlyList<StoredField>? fields)
     {
@@ -405,31 +456,31 @@ public sealed class AetherSceneLink : IDisposable
         _catchUpPending = false;
     }
 
-    private List<byte[]> BuildCatchUp()
+    private List<Outgoing> BuildCatchUp()
     {
-        var packets = new List<byte[]>();
+        var packets = new List<Outgoing>();
         foreach (var entity in _host.Reducer.Entities)
         {
             if (string.Equals(entity.CreatorId, _writerId, StringComparison.Ordinal))
-                packets.Add(AetherWire.Encode(CreationOperation(entity)));
+                packets.Add(new Outgoing(AetherWire.Encode(CreationOperation(entity)), entity.EntityId));
         }
 
         foreach (var row in _host.Reducer.Ownership)
         {
             if (string.Equals(row.PreviousOwnerId, _writerId, StringComparison.Ordinal))
-                packets.Add(AetherWire.Encode(OwnershipOperation(row)));
+                packets.Add(new Outgoing(AetherWire.Encode(OwnershipOperation(row)), row.EntityId));
         }
 
         foreach (var deletion in _host.Reducer.Deletions)
         {
             if (string.Equals(deletion.WriterId, _writerId, StringComparison.Ordinal))
-                packets.Add(AetherWire.Encode(DeletionOperation(deletion)));
+                packets.Add(new Outgoing(AetherWire.Encode(DeletionOperation(deletion)), deletion.EntityId));
         }
 
         foreach (var operation in _ownVisibility.Values.OrderBy(operation => operation.EntityId, StringComparer.Ordinal))
-            packets.Add(AetherWire.Encode(operation));
+            packets.Add(new Outgoing(AetherWire.Encode(operation), operation.EntityId));
         foreach (var operation in _ownMembership.Values.OrderBy(operation => operation.EntityId, StringComparer.Ordinal))
-            packets.Add(AetherWire.Encode(operation));
+            packets.Add(new Outgoing(AetherWire.Encode(operation), operation.EntityId));
 
         var fields = OwnFields();
         foreach (var entityId in fields
@@ -440,7 +491,7 @@ public sealed class AetherSceneLink : IDisposable
             var group = fields
                 .Where(field => string.Equals(field.Key.EntityId, entityId, StringComparison.Ordinal))
                 .ToArray();
-            packets.Add(AetherWire.EncodeContributions(group));
+            packets.Add(new Outgoing(AetherWire.EncodeContributions(group), entityId));
         }
 
         return packets;
@@ -464,7 +515,40 @@ public sealed class AetherSceneLink : IDisposable
         while (_outgoing.Count > 0)
         {
             var packet = _outgoing.Dequeue();
-            _network.Broadcast(packet, reliable: true);
+            Send(packet);
+        }
+    }
+
+    private void Send(Outgoing packet)
+    {
+        if (packet.EntityId is null)
+        {
+            _network.Broadcast(packet.Bytes, reliable: true);
+            return;
+        }
+
+        var peers = _network.GetConnectedPeers();
+        var filtered = false;
+        foreach (var peer in peers)
+        {
+            if (_interest.ContainsKey(peer))
+            {
+                filtered = true;
+                break;
+            }
+        }
+
+        if (!filtered)
+        {
+            _network.Broadcast(packet.Bytes, reliable: true);
+            return;
+        }
+
+        foreach (var peer in peers)
+        {
+            if (_interest.TryGetValue(peer, out var entityIds) && !entityIds.Contains(packet.EntityId))
+                continue;
+            _network.Send(peer, packet.Bytes, reliable: true);
         }
     }
 
@@ -619,4 +703,6 @@ public sealed class AetherSceneLink : IDisposable
     private readonly record struct HeldOperation(string PrincipalId, AetherOperation Operation);
 
     private readonly record struct HeldContribution(string PrincipalId, IReadOnlyList<StoredField> Fields);
+
+    private readonly record struct Outgoing(byte[] Bytes, string? EntityId);
 }
