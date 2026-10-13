@@ -38,6 +38,11 @@ public sealed class AetherArchiveTests
         Assert.False(loaded.IsSharedVisible("entity-1"));
         Assert.True(loaded.IsMember("entity-1", "catalog"));
         Assert.False(loaded.IsMember("entity-1", "notes"));
+        var image = loaded.Capture();
+        Assert.Equal("hide", Assert.Single(image.Visibility!).OperationId);
+        Assert.Equal("peer-A", Assert.Single(image.Visibility!).WriterId);
+        Assert.Contains(image.Membership!, mark => mark.PublicationId == "catalog" && mark.OperationId == "cat" && mark.Published);
+        Assert.Contains(image.Membership!, mark => mark.PublicationId == "notes" && mark.OperationId == "wd" && !mark.Published);
         Assert.Equal(clock, loaded.Clock);
     }
 

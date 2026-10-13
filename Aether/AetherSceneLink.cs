@@ -85,6 +85,7 @@ public sealed class AetherSceneLink : IDisposable
             LabelPropertyName = labelPropertyName,
             SumPropertyName = sumPropertyName,
         };
+        RememberStored();
         network.OnDataReceived += OnData;
         network.OnPeerConnected += OnPeerConnected;
     }
@@ -485,6 +486,50 @@ public sealed class AetherSceneLink : IDisposable
             replica.YieldPropertyToAether(_sumProperty);
         }
     }
+
+    private void RememberStored()
+    {
+        var image = _host.Reducer.Capture();
+        foreach (var mark in image.Visibility ?? [])
+        {
+            if (string.IsNullOrEmpty(mark.OperationId)
+                || !string.Equals(mark.WriterId, _writerId, StringComparison.Ordinal))
+                continue;
+            _ownVisibility[mark.EntityId] = VisibilityOperation(mark);
+        }
+
+        foreach (var mark in image.Membership ?? [])
+        {
+            if (string.IsNullOrEmpty(mark.OperationId)
+                || !string.Equals(mark.WriterId, _writerId, StringComparison.Ordinal)
+                || !string.Equals(mark.PublicationId, _publicationId, StringComparison.Ordinal))
+                continue;
+            _ownMembership[mark.EntityId] = MembershipOperation(mark);
+        }
+    }
+
+    private static AetherOperation VisibilityOperation(VisibilityMark mark) => new(
+        mark.OperationId,
+        mark.EntityId,
+        mark.WriterId,
+        mark.Version.ActorId,
+        mark.Sequence,
+        mark.Version.Lamport,
+        new Dictionary<string, FieldValue>(),
+        mark.Hidden ? AetherEffect.HideShared : AetherEffect.RestoreShared,
+        authority: mark.Authority);
+
+    private static AetherOperation MembershipOperation(MembershipMark mark) => new(
+        mark.OperationId,
+        mark.EntityId,
+        mark.WriterId,
+        mark.Version.ActorId,
+        mark.Sequence,
+        mark.Version.Lamport,
+        new Dictionary<string, FieldValue>(),
+        mark.Published ? AetherEffect.Publish : AetherEffect.WithdrawPublication,
+        mark.PublicationId,
+        authority: mark.Authority);
 
     private void Note(AetherOperation operation)
     {

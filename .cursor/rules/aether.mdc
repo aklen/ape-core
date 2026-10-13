@@ -205,7 +205,9 @@ those same three stages. The commit stage iterates the entities. It does not
 add a stage or a host drain per entity. The projected fields are the label and
 one sum, and only when the entity is living, shared-visible, and a member of
 the link's publication. Hide and publication are owner operations. A non-owner
-is refused before the reducer changes. The replica create path does not create
+is refused before the reducer changes. The snapshot keeps the signed
+visibility and membership envelopes. A new link resends them and does not
+mint an envelope from the flag. The replica create path does not create
 an id the reducer already stores.
 
 ## Treat persistence as protocol state

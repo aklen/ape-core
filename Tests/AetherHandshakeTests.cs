@@ -1111,6 +1111,68 @@ public sealed class AetherHandshakeTests
     }
 
     [Fact]
+    public void Restart_resends_the_signed_publication_and_hide()
+    {
+        var time = new ManualTime();
+        using var ownerDir = new TempDir();
+        using var otherDir = new TempDir();
+        using var archiveDir = new TempDir();
+        using var owner = Side.Create(ownerDir.Path, time);
+        using var other = Side.Create(otherDir.Path, time);
+        var ownerServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var otherServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var otherScene = otherServices.GetRequiredService<ISceneManager>();
+        var ownerStore = SceneStore();
+        var otherStore = SceneStore();
+        using var ownerLink = SceneLink(owner, ownerStore, ownerServices);
+        using var otherLink = SceneLink(other, otherStore, otherServices);
+        Exchange(owner, other);
+        var otherFromOwner = other.Slot;
+
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitCreate("cube", TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitLabel("cube", "red").Kind);
+        var created = owner.Transport.Sent.Count;
+        ownerLink.Pump();
+        var createPacket = owner.Transport.Sent.Skip(created).First(packet => packet[0] == AetherWire.CreateType);
+        DeliverOne(owner, created, other, otherFromOwner);
+        otherLink.Pump();
+
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitPublish("cube").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitHide("cube").Kind);
+        var lifecycle = owner.Transport.Sent.Count;
+        ownerLink.Pump();
+        var publish = owner.Transport.Sent.Skip(lifecycle).First(packet => packet[0] == AetherWire.PublishType);
+        var hide = owner.Transport.Sent.Skip(lifecycle).First(packet => packet[0] == AetherWire.HideType);
+
+        var archive = new AetherArchive(archiveDir.Path);
+        archive.Save(ownerStore);
+        ownerLink.Dispose();
+        owner.Transport.Sent.Clear();
+        using var restarted = new AetherSceneLink(
+            owner.Network,
+            new AetherHost(archive.Load(), 65_536, 64),
+            ownerServices.GetRequiredService<ISceneManager>(),
+            ownerServices.GetRequiredService<ILogger>(),
+            owner.Principal.Id,
+            "session-2");
+        restarted.CatchUp();
+        restarted.Pump();
+
+        Assert.Contains(owner.Transport.Sent, packet => packet.AsSpan().SequenceEqual(createPacket));
+        Assert.Contains(owner.Transport.Sent, packet => packet.AsSpan().SequenceEqual(publish));
+        Assert.Contains(owner.Transport.Sent, packet => packet.AsSpan().SequenceEqual(hide));
+        foreach (var packet in owner.Transport.Sent)
+            other.Transport.DeliverSlot(otherFromOwner, packet);
+        otherLink.Pump();
+
+        var cube = Assert.IsType<TestStubEntity>(otherScene.GetEntity("cube"));
+        Assert.Null(cube.Label);
+        Assert.True(otherStore.IsMember("cube", "catalog"));
+        Assert.False(otherStore.IsSharedVisible("cube"));
+        Assert.Equal("red", otherStore.ResolveLww("cube", "label")?.Text);
+    }
+
+    [Fact]
     public void A_full_scene_queue_does_not_create_the_second_entity()
     {
         var time = new ManualTime();

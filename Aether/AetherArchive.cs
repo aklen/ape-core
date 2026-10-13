@@ -13,7 +13,7 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    internal const ushort StateFormatVersion = 9;
+    internal const ushort StateFormatVersion = 10;
     private const byte ContributionRecord = 0x10;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;
@@ -257,7 +257,16 @@ public sealed class AetherArchive
         var count = reader.Count("Snapshot visibility count");
         var marks = new List<VisibilityMark>(count);
         for (var i = 0; i < count; i++)
-            marks.Add(new VisibilityMark(reader.Text(), new FieldVersion(reader.I64(), reader.Text()), reader.U8() == 1));
+        {
+            var entityId = reader.Text();
+            var version = new FieldVersion(reader.I64(), reader.Text());
+            var hidden = reader.U8() == 1;
+            var writerId = reader.Text();
+            var operationId = reader.Text();
+            var sequence = reader.I64();
+            marks.Add(new VisibilityMark(entityId, version, hidden, writerId, operationId, sequence, ReadProof(reader)));
+        }
+
         return marks;
     }
 
@@ -270,7 +279,12 @@ public sealed class AetherArchive
             var entityId = reader.Text();
             var publicationId = reader.Text();
             var version = new FieldVersion(reader.I64(), reader.Text());
-            marks.Add(new MembershipMark(entityId, publicationId, version, reader.U8() == 1));
+            var published = reader.U8() == 1;
+            var writerId = reader.Text();
+            var operationId = reader.Text();
+            var sequence = reader.I64();
+            marks.Add(new MembershipMark(
+                entityId, publicationId, version, published, writerId, operationId, sequence, ReadProof(reader)));
         }
 
         return marks;
@@ -398,6 +412,10 @@ public sealed class AetherArchive
             WriteI64(buffer, mark.Version.Lamport);
             WriteText(buffer, mark.Version.ActorId);
             buffer.WriteByte(mark.Hidden ? (byte)1 : (byte)0);
+            WriteText(buffer, mark.WriterId);
+            WriteText(buffer, mark.OperationId);
+            WriteI64(buffer, mark.Sequence);
+            WriteProof(buffer, mark.Authority);
         }
 
         WriteU32(buffer, (uint)(image.Membership?.Count ?? 0));
@@ -408,6 +426,10 @@ public sealed class AetherArchive
             WriteI64(buffer, mark.Version.Lamport);
             WriteText(buffer, mark.Version.ActorId);
             buffer.WriteByte(mark.Published ? (byte)1 : (byte)0);
+            WriteText(buffer, mark.WriterId);
+            WriteText(buffer, mark.OperationId);
+            WriteI64(buffer, mark.Sequence);
+            WriteProof(buffer, mark.Authority);
         }
 
         WriteU32(buffer, (uint)(image.Entities?.Count ?? 0));

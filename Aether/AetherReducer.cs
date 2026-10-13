@@ -345,27 +345,20 @@ public sealed class AetherReducer
         {
             if (op.Effect is AetherEffect.CreateEntity or AetherEffect.TransferOwnership or AetherEffect.DeleteEntity)
                 RequireAuthorityWhenPresent(op);
-            var version = new FieldVersion(op.Lamport, op.ActorId);
             switch (op.Effect)
             {
                 case AetherEffect.DeleteEntity:
                     RejectDeletion(op);
                     return;
                 case AetherEffect.HideShared:
-                    RejectOwnerLifecycle(op);
-                    RejectVisibility(op.EntityId, version, hidden: true);
-                    return;
                 case AetherEffect.RestoreShared:
                     RejectOwnerLifecycle(op);
-                    RejectVisibility(op.EntityId, version, hidden: false);
+                    RejectVisibility(op);
                     return;
                 case AetherEffect.WithdrawPublication:
-                    RejectOwnerLifecycle(op);
-                    RejectMembership(op.EntityId, op.PublicationId!, version, published: false);
-                    return;
                 case AetherEffect.Publish:
                     RejectOwnerLifecycle(op);
-                    RejectMembership(op.EntityId, op.PublicationId!, version, published: true);
+                    RejectMembership(op);
                     return;
                 case AetherEffect.CreateEntity:
                     RejectCreation(op);
@@ -547,9 +540,9 @@ public sealed class AetherReducer
         foreach (var entityId in folded.Deleted)
             _deleted.Add(entityId);
         foreach (var mark in folded.Visibility)
-            UpsertVisibility(mark.EntityId, mark.Version, mark.Hidden);
+            UpsertVisibility(mark);
         foreach (var mark in folded.Membership)
-            UpsertMembership(new MembershipKey(mark.EntityId, mark.PublicationId), mark.Version, mark.Published);
+            UpsertMembership(mark);
         foreach (var entity in folded.Entities)
             UpsertEntity(entity);
         foreach (var deletion in folded.Deletions)
@@ -568,12 +561,27 @@ public sealed class AetherReducer
         var deleted = _deleted.OrderBy(id => id, StringComparer.Ordinal).ToArray();
         var visibility = _visibility
             .OrderBy(pair => pair.Key, StringComparer.Ordinal)
-            .Select(pair => new VisibilityMark(pair.Key, pair.Value.Version, pair.Value.Hidden))
+            .Select(pair => new VisibilityMark(
+                pair.Key,
+                pair.Value.Version,
+                pair.Value.Hidden,
+                pair.Value.WriterId,
+                pair.Value.OperationId,
+                pair.Value.Sequence,
+                pair.Value.Authority))
             .ToArray();
         var membership = _membership
             .OrderBy(pair => pair.Key.EntityId, StringComparer.Ordinal)
             .ThenBy(pair => pair.Key.PublicationId, StringComparer.Ordinal)
-            .Select(pair => new MembershipMark(pair.Key.EntityId, pair.Key.PublicationId, pair.Value.Version, pair.Value.Published))
+            .Select(pair => new MembershipMark(
+                pair.Key.EntityId,
+                pair.Key.PublicationId,
+                pair.Value.Version,
+                pair.Value.Published,
+                pair.Value.WriterId,
+                pair.Value.OperationId,
+                pair.Value.Sequence,
+                pair.Value.Authority))
             .ToArray();
         var entities = _entities.Values.OrderBy(entity => entity.EntityId, StringComparer.Ordinal).ToArray();
         var deletions = _deletions.Values.OrderBy(deletion => deletion.EntityId, StringComparer.Ordinal).ToArray();
@@ -684,7 +692,6 @@ public sealed class AetherReducer
 
     private void ApplyLifecycle(AetherOperation op, bool observeClock)
     {
-        var version = new FieldVersion(op.Lamport, op.ActorId);
         switch (op.Effect)
         {
             case AetherEffect.DeleteEntity:
@@ -694,24 +701,16 @@ public sealed class AetherReducer
                 UpsertDeletion(DeletionFrom(op));
                 return;
             case AetherEffect.HideShared:
-                RejectVisibility(op.EntityId, version, hidden: true);
-                Admit(op, observeClock);
-                UpsertVisibility(op.EntityId, version, hidden: true);
-                return;
             case AetherEffect.RestoreShared:
-                RejectVisibility(op.EntityId, version, hidden: false);
+                RejectVisibility(op);
                 Admit(op, observeClock);
-                UpsertVisibility(op.EntityId, version, hidden: false);
+                UpsertVisibility(VisibilityFrom(op));
                 return;
             case AetherEffect.WithdrawPublication:
-                RejectMembership(op.EntityId, op.PublicationId!, version, published: false);
-                Admit(op, observeClock);
-                UpsertMembership(new MembershipKey(op.EntityId, op.PublicationId!), version, published: false);
-                return;
             case AetherEffect.Publish:
-                RejectMembership(op.EntityId, op.PublicationId!, version, published: true);
+                RejectMembership(op);
                 Admit(op, observeClock);
-                UpsertMembership(new MembershipKey(op.EntityId, op.PublicationId!), version, published: true);
+                UpsertMembership(MembershipFrom(op));
                 return;
             case AetherEffect.CreateEntity:
                 RejectCreation(op);
@@ -1087,7 +1086,7 @@ public sealed class AetherReducer
         {
             if (_visibility.TryGetValue(row.EntityId, out var existing)
                 && existing.Version.CompareTo(row.Version) == 0
-                && existing.Hidden != row.Hidden)
+                && !SameVisibility(existing, row))
                 throw new AetherProtocolException($"Version collision on visibility for '{row.EntityId}'.");
 
             if (!versions.TryGetValue(row.EntityId, out var byVersion))
@@ -1096,7 +1095,7 @@ public sealed class AetherReducer
                 versions[row.EntityId] = byVersion;
             }
 
-            if (byVersion.TryGetValue(row.Version, out var already) && already.Hidden != row.Hidden)
+            if (byVersion.TryGetValue(row.Version, out var already) && !SameVisibility(already, row))
                 throw new AetherProtocolException($"Version collision on visibility for '{row.EntityId}'.");
 
             byVersion[row.Version] = row;
@@ -1126,7 +1125,7 @@ public sealed class AetherReducer
             var key = new MembershipKey(row.EntityId, row.PublicationId);
             if (_membership.TryGetValue(key, out var existing)
                 && existing.Version.CompareTo(row.Version) == 0
-                && existing.Published != row.Published)
+                && !SameMembership(existing, row))
                 throw new AetherProtocolException($"Version collision on membership '{row.PublicationId}'.");
 
             if (!versions.TryGetValue(key, out var byVersion))
@@ -1135,7 +1134,7 @@ public sealed class AetherReducer
                 versions[key] = byVersion;
             }
 
-            if (byVersion.TryGetValue(row.Version, out var already) && already.Published != row.Published)
+            if (byVersion.TryGetValue(row.Version, out var already) && !SameMembership(already, row))
                 throw new AetherProtocolException($"Version collision on membership '{row.PublicationId}'.");
 
             byVersion[row.Version] = row;
@@ -1157,57 +1156,112 @@ public sealed class AetherReducer
         return folded;
     }
 
-    private void RejectVisibility(string entityId, FieldVersion version, bool hidden)
+    private void RejectVisibility(AetherOperation op)
     {
-        if (_visibility.TryGetValue(entityId, out var existing)
-            && existing.Version.CompareTo(version) == 0
-            && existing.Hidden != hidden)
-            throw new AetherProtocolException($"Version collision on visibility for '{entityId}'.");
+        var mark = VisibilityFrom(op);
+        if (_visibility.TryGetValue(op.EntityId, out var existing)
+            && existing.Version.CompareTo(mark.Version) == 0
+            && !SameVisibility(existing, mark))
+            throw new AetherProtocolException($"Version collision on visibility for '{op.EntityId}'.");
     }
 
-    private void RejectMembership(string entityId, string publicationId, FieldVersion version, bool published)
+    private void RejectMembership(AetherOperation op)
     {
-        if (_membership.TryGetValue(new MembershipKey(entityId, publicationId), out var existing)
-            && existing.Version.CompareTo(version) == 0
-            && existing.Published != published)
-            throw new AetherProtocolException($"Version collision on membership '{publicationId}'.");
+        var mark = MembershipFrom(op);
+        if (_membership.TryGetValue(new MembershipKey(op.EntityId, op.PublicationId!), out var existing)
+            && existing.Version.CompareTo(mark.Version) == 0
+            && !SameMembership(existing, mark))
+            throw new AetherProtocolException($"Version collision on membership '{op.PublicationId}'.");
     }
 
-    private void UpsertVisibility(string entityId, FieldVersion version, bool hidden)
+    private void UpsertVisibility(VisibilityMark mark)
     {
-        if (_visibility.TryGetValue(entityId, out var existing))
+        if (_visibility.TryGetValue(mark.EntityId, out var existing))
         {
-            var compared = version.CompareTo(existing.Version);
+            var compared = mark.Version.CompareTo(existing.Version);
             if (compared < 0)
                 return;
             if (compared == 0)
             {
-                if (existing.Hidden != hidden)
-                    throw new InvalidOperationException($"Version collision on visibility for '{entityId}'.");
+                if (!SameVisibility(existing, mark))
+                    throw new InvalidOperationException($"Version collision on visibility for '{mark.EntityId}'.");
                 return;
             }
         }
 
-        _visibility[entityId] = new VisibilityState(version, hidden);
+        _visibility[mark.EntityId] = new VisibilityState(
+            mark.Version, mark.Hidden, mark.WriterId, mark.OperationId, mark.Sequence, mark.Authority);
     }
 
-    private void UpsertMembership(MembershipKey key, FieldVersion version, bool published)
+    private void UpsertMembership(MembershipMark mark)
     {
+        var key = new MembershipKey(mark.EntityId, mark.PublicationId);
         if (_membership.TryGetValue(key, out var existing))
         {
-            var compared = version.CompareTo(existing.Version);
+            var compared = mark.Version.CompareTo(existing.Version);
             if (compared < 0)
                 return;
             if (compared == 0)
             {
-                if (existing.Published != published)
-                    throw new InvalidOperationException($"Version collision on membership '{key.PublicationId}'.");
+                if (!SameMembership(existing, mark))
+                    throw new InvalidOperationException($"Version collision on membership '{mark.PublicationId}'.");
                 return;
             }
         }
 
-        _membership[key] = new MembershipState(version, published);
+        _membership[key] = new MembershipState(
+            mark.Version, mark.Published, mark.WriterId, mark.OperationId, mark.Sequence, mark.Authority);
     }
+
+    private static VisibilityMark VisibilityFrom(AetherOperation op) => new(
+        op.EntityId,
+        new FieldVersion(op.Lamport, op.ActorId),
+        op.Effect == AetherEffect.HideShared,
+        op.WriterId,
+        op.Id,
+        op.Sequence,
+        op.Authority);
+
+    private static MembershipMark MembershipFrom(AetherOperation op) => new(
+        op.EntityId,
+        op.PublicationId!,
+        new FieldVersion(op.Lamport, op.ActorId),
+        op.Effect == AetherEffect.Publish,
+        op.WriterId,
+        op.Id,
+        op.Sequence,
+        op.Authority);
+
+    private static bool SameVisibility(VisibilityState state, VisibilityMark mark) =>
+        state.Hidden == mark.Hidden
+        && string.Equals(state.WriterId, mark.WriterId, StringComparison.Ordinal)
+        && string.Equals(state.OperationId, mark.OperationId, StringComparison.Ordinal)
+        && state.Sequence == mark.Sequence
+        && SameProof(state.Authority, mark.Authority);
+
+    private static bool SameVisibility(VisibilityMark left, VisibilityMark right) =>
+        left.Hidden == right.Hidden
+        && string.Equals(left.WriterId, right.WriterId, StringComparison.Ordinal)
+        && string.Equals(left.OperationId, right.OperationId, StringComparison.Ordinal)
+        && left.Sequence == right.Sequence
+        && SameProof(left.Authority, right.Authority);
+
+    private static bool SameMembership(MembershipState state, MembershipMark mark) =>
+        state.Published == mark.Published
+        && string.Equals(state.WriterId, mark.WriterId, StringComparison.Ordinal)
+        && string.Equals(state.OperationId, mark.OperationId, StringComparison.Ordinal)
+        && state.Sequence == mark.Sequence
+        && SameProof(state.Authority, mark.Authority);
+
+    private static bool SameMembership(MembershipMark left, MembershipMark right) =>
+        left.Published == right.Published
+        && string.Equals(left.WriterId, right.WriterId, StringComparison.Ordinal)
+        && string.Equals(left.OperationId, right.OperationId, StringComparison.Ordinal)
+        && left.Sequence == right.Sequence
+        && SameProof(left.Authority, right.Authority);
+
+    private static bool SameProof(AetherAuthorityProof? left, AetherAuthorityProof? right) =>
+        left is null ? right is null : left.Equals(right);
 
     private ActorCursor FrontierCursor(string actorId, long sequence)
     {
@@ -1387,9 +1441,21 @@ public sealed class AetherReducer
 
     private readonly record struct ActorFrontier(long Sequence, long Lamport, string OperationId);
 
-    private readonly record struct VisibilityState(FieldVersion Version, bool Hidden);
+    private readonly record struct VisibilityState(
+        FieldVersion Version,
+        bool Hidden,
+        string WriterId,
+        string OperationId,
+        long Sequence,
+        AetherAuthorityProof? Authority);
 
-    private readonly record struct MembershipState(FieldVersion Version, bool Published);
+    private readonly record struct MembershipState(
+        FieldVersion Version,
+        bool Published,
+        string WriterId,
+        string OperationId,
+        long Sequence,
+        AetherAuthorityProof? Authority);
 
     private readonly record struct FoldedImage(
         List<StoredField> Fields,
@@ -1460,9 +1526,24 @@ public readonly record struct AetherApplied(
 
 public readonly record struct MembershipKey(string EntityId, string PublicationId);
 
-public readonly record struct VisibilityMark(string EntityId, FieldVersion Version, bool Hidden);
+public readonly record struct VisibilityMark(
+    string EntityId,
+    FieldVersion Version,
+    bool Hidden,
+    string WriterId = "",
+    string OperationId = "",
+    long Sequence = 0,
+    AetherAuthorityProof? Authority = null);
 
-public readonly record struct MembershipMark(string EntityId, string PublicationId, FieldVersion Version, bool Published);
+public readonly record struct MembershipMark(
+    string EntityId,
+    string PublicationId,
+    FieldVersion Version,
+    bool Published,
+    string WriterId = "",
+    string OperationId = "",
+    long Sequence = 0,
+    AetherAuthorityProof? Authority = null);
 
 public sealed record AetherImage(
     long Clock,
