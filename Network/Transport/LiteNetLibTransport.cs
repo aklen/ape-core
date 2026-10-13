@@ -13,14 +13,28 @@ namespace Ape.Core.Network.Transport;
 /// </summary>
 public class LiteNetLibTransport : INetworkTransport, INetEventListener
 {
+    private const byte BulkChannel = 1;
+    private const int MaxBulkPacketBytes = 272 * 1024;
+    private const int MaxBulkQueuedBytesPerPeer = 4 * 1024 * 1024;
+    private const int MaxBulkQueuedPacketsPerPeer = 64;
+    private const int BulkPacketsPerPoll = 4;
+    private const int BulkBytesPerPoll = 272 * 1024;
+
     private string _transportType = "litenetlib";
 
     private readonly ILogger _logger;
     private readonly NetManager _netManager;
     private readonly Dictionary<string, NetPeer> _peers = new();
+    private readonly Dictionary<string, BulkQueue> _bulkQueues = new(StringComparer.Ordinal);
     private bool _isRunning;
     private bool _isServer;
     private string _localPeerId = string.Empty;  // Empty = not connected/started
+
+    private sealed class BulkQueue
+    {
+        public readonly Queue<byte[]> Packets = new();
+        public int Bytes;
+    }
 
     public event Action<string>? OnPeerConnected;
     public event Action<string>? OnPeerDisconnected;
@@ -44,7 +58,7 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
     public LiteNetLibTransport(ILogger logger)
     {
         _logger = logger;
-        _netManager = new NetManager(this);
+        _netManager = new NetManager(this) { ChannelsCount = BulkChannel + 1 };
     }
 
     public void StartServer(int port, string? peerName = null, string? role = null)
@@ -116,11 +130,36 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
         }
     }
 
+    public bool TrySendBulk(string peerId, byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        if (!_isRunning || data.Length > MaxBulkPacketBytes)
+            return false;
+
+        lock (_peers)
+        {
+            if (!_peers.ContainsKey(peerId))
+                return false;
+            if (!_bulkQueues.TryGetValue(peerId, out var queue))
+            {
+                queue = new BulkQueue();
+                _bulkQueues.Add(peerId, queue);
+            }
+            if (queue.Packets.Count >= MaxBulkQueuedPacketsPerPeer
+                || queue.Bytes > MaxBulkQueuedBytesPerPeer - data.Length)
+                return false;
+            queue.Packets.Enqueue(data.ToArray());
+            queue.Bytes += data.Length;
+            return true;
+        }
+    }
+
     public void PollEvents()
     {
         if (_isRunning)
         {
             _netManager.PollEvents();
+            DrainBulkQueues();
         }
     }
 
@@ -130,7 +169,11 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
             return;
 
         _netManager.Stop();
-        _peers.Clear();
+        lock (_peers)
+        {
+            _peers.Clear();
+            _bulkQueues.Clear();
+        }
         _isRunning = false;
         
         _logger.LogInfo("[LiteNetLibTransport] Stopped");
@@ -225,6 +268,7 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
         lock (_peers)
         {
             _peers[peerId] = peer;
+            _bulkQueues[peerId] = new BulkQueue();
         }
         
         // Log connection
@@ -246,6 +290,7 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
         lock (_peers)
         {
             _peers.Remove(peerId);
+            _bulkQueues.Remove(peerId);
         }
         
         _logger.LogInfo($"[LiteNetLibTransport] Peer disconnected: {peerId} (reason: {disconnectInfo.Reason})");
@@ -284,6 +329,43 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
             default:
                 _logger.LogWarning($"[LiteNetLibTransport] Unknown message type: {messageType} from peer {peerId}");
                 break;
+        }
+    }
+
+    private void DrainBulkQueues()
+    {
+        lock (_peers)
+        {
+            foreach (var (peerId, queue) in _bulkQueues)
+            {
+                if (!_peers.TryGetValue(peerId, out var peer))
+                    continue;
+
+                var sentPackets = 0;
+                var sentBytes = 0;
+                while (queue.Packets.TryPeek(out var packet)
+                    && sentPackets < BulkPacketsPerPoll
+                    && (sentPackets == 0 || sentBytes <= BulkBytesPerPoll - packet.Length))
+                {
+                    try
+                    {
+                        var writer = new NetDataWriter();
+                        writer.Put((byte)0);
+                        writer.Put(packet);
+                        peer.Send(writer, BulkChannel, DeliveryMethod.ReliableOrdered);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(
+                            $"[LiteNetLibTransport] Bulk send to peer {peerId} remains queued: {ex.Message}");
+                        break;
+                    }
+                    queue.Packets.Dequeue();
+                    queue.Bytes -= packet.Length;
+                    sentPackets++;
+                    sentBytes += packet.Length;
+                }
+            }
         }
     }
     

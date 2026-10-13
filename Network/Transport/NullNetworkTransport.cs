@@ -32,6 +32,12 @@ public sealed class NullNetworkTransport : INetworkTransport
 
     public void SendUnreliable(string peerId, byte[] data) { }
 
+    public bool TrySendBulk(string peerId, byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        return false;
+    }
+
     public void PollEvents() { }
 
     public void Stop() { }

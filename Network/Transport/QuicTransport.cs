@@ -26,7 +26,7 @@ namespace Ape.Core.Network.Transport;
 [SupportedOSPlatform("linux")]
 [SupportedOSPlatform("macos")]
 [SupportedOSPlatform("windows")]
-public class QuicTransport : INetworkTransport, IBulkNetworkTransport
+public class QuicTransport : INetworkTransport
 {
     private const byte MessageTypeNormal = 0;
     private const byte MessageTypeFileChunk = 1;

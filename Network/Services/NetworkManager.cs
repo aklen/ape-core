@@ -21,7 +21,7 @@ namespace Ape.Core.Network.Services;
 [SupportedOSPlatform("linux")]
 [SupportedOSPlatform("macos")]
 [SupportedOSPlatform("windows")]
-public class NetworkManager : INetworkManager, IPrincipalSigner, IBulkNetworkSender, ICoreService, IDisposable
+public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, IDisposable
 {
     public string ServiceId => "core-network-manager";
     public string Name => "Network Manager";
@@ -71,15 +71,10 @@ public class NetworkManager : INetworkManager, IPrincipalSigner, IBulkNetworkSen
         return true;
     }
 
-    bool IBulkNetworkSender.TrySendBulk(string connectionId, byte[] data)
+    public bool TrySendBulk(string connectionId, byte[] data)
     {
         ArgumentNullException.ThrowIfNull(data);
-        if (!_transport.GetConnectedPeers().Contains(connectionId, StringComparer.Ordinal))
-            return false;
-        if (_transport is IBulkNetworkTransport bulk)
-            return bulk.TrySendBulk(connectionId, data);
-        _transport.SendReliable(connectionId, data);
-        return true;
+        return _transport.TrySendBulk(connectionId, data);
     }
 
     /// <summary>

@@ -230,6 +230,11 @@ Treat QUIC as the primary transport. Put bounded bulk traffic on a persistent QU
 stream separate from reliable scene state; never open one QUIC stream per Aether
 chunk. A synchronous admission result means only that the bounded transport queue
 accepted the bytes. Keep the application packet queued when admission is full.
+Expose this only through `INetworkManager.TrySendBulk`. Require every
+`INetworkTransport` implementation to provide the same bounded, copy-owning
+admission contract. Transport selection may change the wire mechanism, but it must
+not change Aether's API or introduce a capability cast or an implicit fallback to
+the scene-state send path. LiteNetLib uses a separate reliable ordered channel.
 Require an explicit reader-principal set for published checkpoints; successful
 handshake authentication alone is not authorization to read scene state.
 

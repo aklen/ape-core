@@ -17,7 +17,6 @@ public sealed class AetherCheckpointLink : IDisposable
 {
     public const int MaximumReadersPerArtifact = 64;
     private readonly INetworkManager _network;
-    private readonly IBulkNetworkSender _bulk;
     private readonly IChunkStore _chunkStore;
     private readonly TimeProvider _time;
     private readonly TimeSpan _retryAfter;
@@ -53,8 +52,6 @@ public sealed class AetherCheckpointLink : IDisposable
         TimeSpan? retryAfter = null)
     {
         _network = network ?? throw new ArgumentNullException(nameof(network));
-        _bulk = network as IBulkNetworkSender
-            ?? throw new ArgumentException("Network manager has no bounded bulk plane.", nameof(network));
         _chunkStore = chunkStore ?? throw new ArgumentNullException(nameof(chunkStore));
         RequirePositive(maxIncomingMessages, nameof(maxIncomingMessages));
         RequirePositive(maxIncomingBytes, nameof(maxIncomingBytes));
@@ -205,7 +202,7 @@ public sealed class AetherCheckpointLink : IDisposable
             && (outgoingMessages == 0 || outgoingBytes <= outgoingByteBudget - next.Data.Length))
         {
             if (!IsAuthenticatedConnection(next.ConnectionId, next.PrincipalId)
-                || !_bulk.TrySendBulk(next.ConnectionId, next.Data))
+                || !_network.TrySendBulk(next.ConnectionId, next.Data))
                 break;
             _outgoing.Dequeue();
             _outgoingBytes -= next.Data.Length;

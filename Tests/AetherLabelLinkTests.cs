@@ -989,6 +989,12 @@ public sealed class AetherLabelLinkTests
 
         public void SendReliable(string peerId, byte[] data) => Take(peerId, data);
 
+        public bool TrySendBulk(string peerId, byte[] data)
+        {
+            Take(peerId, data);
+            return true;
+        }
+
         public void SendUnreliable(string peerId, byte[] data) => Take(peerId, data);
 
         private void Take(string connectionId, byte[] data)

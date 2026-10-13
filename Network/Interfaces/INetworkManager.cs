@@ -60,6 +60,16 @@ public interface INetworkManager
     void Send(string peerId, byte[] data, bool reliable = true);
 
     /// <summary>
+    /// Try to admit one bulk packet to the selected transport's bounded queue.
+    /// A successful return transfers an owned copy to the transport; it does not
+    /// acknowledge remote receipt, application, or durable storage.
+    /// </summary>
+    /// <param name="connectionId">Current connection identifier used for addressing.</param>
+    /// <param name="data">Packet to copy into the transport queue.</param>
+    /// <returns><see langword="true"/> when admitted; otherwise <see langword="false"/> so the caller can retry.</returns>
+    bool TrySendBulk(string connectionId, byte[] data);
+
+    /// <summary>
     /// Process network events. Should be called regularly.
     /// </summary>
     void PollEvents();

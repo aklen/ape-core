@@ -85,15 +85,20 @@ public sealed class AetherCheckpointLinkTests
     }
 
     [Fact]
-    public void Network_manager_routes_bulk_to_the_optional_transport_plane()
+    public void Network_manager_routes_bulk_through_the_transport_interface()
     {
         var transport = new BulkTransport();
         transport.ConnectPeer("7");
         using var network = new NetworkManager(transport, "local", allowUnauthenticated: true);
+        var payload = new byte[] { 1, 2, 3 };
 
-        Assert.True(((IBulkNetworkSender)network).TrySendBulk("7", [1, 2, 3]));
+        Assert.True(network.TrySendBulk("7", payload));
+        payload[0] = 9;
+        transport.AcceptBulk = false;
+        Assert.False(network.TrySendBulk("7", [4]));
 
         Assert.Equal(1, transport.BulkSends);
+        Assert.Equal(new byte[] { 1, 2, 3 }, transport.LastBulk);
         Assert.Equal(0, transport.ReliableSends);
     }
 
@@ -201,7 +206,7 @@ public sealed class AetherCheckpointLinkTests
         return AetherCheckpoint.Create(reducer, "entity-1", owner);
     }
 
-    private sealed class FakeNetwork : INetworkManager, IBulkNetworkSender
+    private sealed class FakeNetwork : INetworkManager
     {
         private readonly Dictionary<string, PeerConnectionContext> _peers = new(StringComparer.Ordinal);
         private readonly List<(string ConnectionId, byte[] Data)> _sent = [];
@@ -244,7 +249,7 @@ public sealed class AetherCheckpointLinkTests
             _pumpStart = 0;
             return result;
         }
-        bool IBulkNetworkSender.TrySendBulk(string connectionId, byte[] data)
+        public bool TrySendBulk(string connectionId, byte[] data)
         {
             if (!_peers.ContainsKey(connectionId) || !AcceptBulk) return false;
             _sent.Add((connectionId, data.ToArray()));
@@ -263,13 +268,15 @@ public sealed class AetherCheckpointLinkTests
     }
 
 #pragma warning disable CS0067
-    private sealed class BulkTransport : INetworkTransport, IBulkNetworkTransport
+    private sealed class BulkTransport : INetworkTransport
     {
         private readonly List<string> _peers = [];
         public string TransportType => "bulk-test";
         public string LocalPeerId => "local";
         public int BulkSends { get; private set; }
         public int ReliableSends { get; private set; }
+        public bool AcceptBulk { get; set; } = true;
+        public byte[]? LastBulk { get; private set; }
         public event Action<string>? OnPeerConnected;
         public event Action<string>? OnPeerDisconnected;
         public event Action<string, byte[], int>? OnDataReceived;
@@ -277,7 +284,13 @@ public sealed class AetherCheckpointLinkTests
         public event Action<string, Guid, int, long, string[]>? OnFileManifestReceived;
         public event Action<string, Guid, int>? OnFileChunkRequested;
         public void ConnectPeer(string id) { _peers.Add(id); OnPeerConnected?.Invoke(id); }
-        public bool TrySendBulk(string peerId, byte[] data) { BulkSends++; return true; }
+        public bool TrySendBulk(string peerId, byte[] data)
+        {
+            if (!AcceptBulk) return false;
+            BulkSends++;
+            LastBulk = data.ToArray();
+            return true;
+        }
         public void SendReliable(string peerId, byte[] data) => ReliableSends++;
         public void SendUnreliable(string peerId, byte[] data) { }
         public IEnumerable<string> GetConnectedPeers() => _peers;

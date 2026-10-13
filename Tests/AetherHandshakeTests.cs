@@ -1091,6 +1091,12 @@ public sealed class AetherHandshakeTests
 
         public void SendReliable(string peerId, byte[] data) => Take(data);
 
+        public bool TrySendBulk(string peerId, byte[] data)
+        {
+            Take(data);
+            return true;
+        }
+
         public void SendUnreliable(string peerId, byte[] data) => Take(data);
 
         public IEnumerable<string> GetConnectedPeers() => _peers;

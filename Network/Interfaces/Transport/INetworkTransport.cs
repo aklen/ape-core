@@ -64,6 +64,16 @@ public interface INetworkTransport : IDisposable
     void SendUnreliable(string peerId, byte[] data);
 
     /// <summary>
+    /// Try to admit one bulk packet to this transport's bounded queue.
+    /// Every transport implements the same admission contract, although its
+    /// wire mechanism may be a QUIC stream, an ordered channel, or another plane.
+    /// </summary>
+    /// <param name="peerId">Current transport connection identifier.</param>
+    /// <param name="data">Packet to copy into the transport queue.</param>
+    /// <returns><see langword="true"/> when admitted; otherwise <see langword="false"/>.</returns>
+    bool TrySendBulk(string peerId, byte[] data);
+
+    /// <summary>
     /// Process incoming/outgoing packets. Must be called regularly (e.g., in main loop).
     /// </summary>
     void PollEvents();
