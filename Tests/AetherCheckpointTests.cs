@@ -46,6 +46,58 @@ public sealed class AetherCheckpointTests
     }
 
     [Fact]
+    public void Covered_operation_is_rejected_after_its_digest_is_forgotten()
+    {
+        using var ownerDir = new TempDir();
+        using var saveDir = new TempDir();
+        using var owner = new NetworkManager("none", ownerDir.Path);
+        var actor = AetherActorId.Format(owner.PrincipalId, "s1");
+        var source = new AetherReducer(1);
+        source.DefineField("label", "lww");
+        source.Apply(Signed(owner, new AetherOperation("create", "entity-1", owner.PrincipalId,
+            actor, 1, 1, Empty(), AetherEffect.CreateEntity, entityTypeId: TestStubEntity.RegistryTypeId,
+            creatorId: owner.PrincipalId, ownerId: owner.PrincipalId)), observeClock: true);
+        source.Apply(new AetherOperation("label-1", "entity-1", owner.PrincipalId, actor, 2, 2,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("alpha") }), observeClock: true);
+        source.Apply(new AetherOperation("publish", "entity-1", owner.PrincipalId, actor, 3, 3,
+            Empty(), AetherEffect.Publish, "catalog"), observeClock: true);
+
+        Assert.False(source.Remembers("label-1"));
+        Assert.False(source.Covers("label-1"));
+        var artifact = AetherCheckpoint.Create(source, "entity-1", owner);
+        var restored = AetherCheckpoint.LoadPinned(artifact.ToArray(), artifact.Sha256);
+        Assert.False(restored.Remembers("label-1"));
+        Assert.True(restored.Covers("create"));
+        Assert.True(restored.Covers("label-1"));
+        Assert.True(restored.Covers("publish"));
+        Assert.False(restored.Covers("later"));
+
+        var clock = restored.Clock;
+        var replay = new AetherOperation("label-1", "entity-1", owner.PrincipalId, actor, 2, 2,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("alpha") });
+        var rewritten = new AetherOperation("label-1", "entity-1", owner.PrincipalId, actor, 4, 4,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("stolen") });
+        var replayError = Assert.Throws<AetherProtocolException>(() => restored.Apply(replay, observeClock: true));
+        var rewriteError = Assert.Throws<AetherProtocolException>(() => restored.Apply(rewritten, observeClock: true));
+        Assert.Equal("Operation is inside checkpoint coverage.", replayError.Message);
+        Assert.Equal("Operation is inside checkpoint coverage.", rewriteError.Message);
+        Assert.Equal(clock, restored.Clock);
+        Assert.Equal("alpha", restored.ResolveLww("entity-1", "label")?.Text);
+
+        source.Apply(rewritten, observeClock: true);
+        Assert.Equal("stolen", source.ResolveLww("entity-1", "label")?.Text);
+        restored.Apply(new AetherOperation("label-2", "entity-1", owner.PrincipalId, actor, 4, 4,
+            new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("beta") }), observeClock: true);
+        Assert.Equal("beta", restored.ResolveLww("entity-1", "label")?.Text);
+
+        new AetherArchive(saveDir.Path).Save(restored);
+        var loaded = new AetherArchive(saveDir.Path).Load();
+        Assert.True(loaded.Covers("label-1"));
+        var savedError = Assert.Throws<AetherProtocolException>(() => loaded.Apply(replay, observeClock: true));
+        Assert.Equal("Operation is inside checkpoint coverage.", savedError.Message);
+    }
+
+    [Fact]
     public void Bootstrap_rejects_a_wrong_pin_before_parsing_state()
     {
         using var dir = new TempDir();

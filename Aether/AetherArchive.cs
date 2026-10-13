@@ -13,7 +13,7 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    internal const ushort StateFormatVersion = 10;
+    internal const ushort StateFormatVersion = 11;
     private const byte ContributionRecord = 0x10;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;
@@ -148,9 +148,11 @@ public sealed class AetherArchive
         var deletions = ReadDeletions(reader);
         var ownership = ReadOwnership(reader);
         var cursors = ReadCursors(reader);
+        var coverage = ReadCoverage(reader);
         reader.End();
 
         reducer.MergeImage(new AetherImage(clock, fields, seen, deleted, visibility, membership, entities, deletions, ownership));
+        reducer.InstallCoverage(coverage);
         reducer.RestoreSaveThrough(saveThrough);
         foreach (var cursor in cursors)
             reducer.RestoreActorSequence(cursor.ActorId, cursor.Sequence, cursor.Lamport, cursor.OperationId);
@@ -477,7 +479,19 @@ public sealed class AetherArchive
             WriteText(buffer, cursor.OperationId ?? "");
         }
 
+        WriteTexts(buffer, reducer.CoverageIds());
         return buffer.ToArray();
+    }
+
+    private static string[] ReadCoverage(Reader reader)
+    {
+        var count = reader.U32();
+        if (count > AetherReducer.MaxCoverageCount)
+            throw new AetherProtocolException("Checkpoint coverage is too large.");
+        var ids = new string[count];
+        for (var i = 0; i < count; i++)
+            ids[i] = reader.Text();
+        return ids;
     }
 
     private static byte[] EncodeOperation(AetherOperation op, long clock)

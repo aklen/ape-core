@@ -7,6 +7,7 @@ namespace Ape.Core.Aether;
 public sealed class AetherReducer
 {
     public const int DefaultDedupCapacity = 1024;
+    public const int MaxCoverageCount = 4096;
 
     private readonly int _dedupCapacity;
     private readonly Dictionary<string, FieldSchema> _fields = new(StringComparer.Ordinal);
@@ -21,6 +22,7 @@ public sealed class AetherReducer
     private readonly Dictionary<MembershipKey, MembershipState> _membership = new();
     private readonly Dictionary<string, StoredEntity> _entities = new(StringComparer.Ordinal);
     private readonly Dictionary<string, StoredOwnership> _ownership = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _coverage = new(StringComparer.Ordinal);
     private long _clock;
     private long _saveSequence;
 
@@ -66,11 +68,71 @@ public sealed class AetherReducer
 
     public bool Remembers(string operationId) => _digests.ContainsKey(operationId);
 
+    public bool Covers(string operationId) =>
+        !string.IsNullOrEmpty(operationId) && _coverage.Contains(operationId);
+
     /// <summary>
     /// True only when the original operation payload is still stored.
     /// The dedup window keeps digests, so this slice cannot replay a delta.
     /// </summary>
     public bool CanReplay(string operationId) => false;
+
+    internal string[] CoverageIds() =>
+        _coverage.OrderBy(id => id, StringComparer.Ordinal).ToArray();
+
+    internal string[] HeadOperationIds(string entityId)
+    {
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        void Add(string? operationId)
+        {
+            if (string.IsNullOrEmpty(operationId))
+                throw new AetherProtocolException("Checkpoint coverage is missing an operation id.");
+            if (!ids.Add(operationId))
+                return;
+            if (ids.Count > MaxCoverageCount)
+                throw new AetherProtocolException("Checkpoint coverage is too large.");
+        }
+
+        Add(GetEntity(entityId)?.OperationId);
+        foreach (var field in _records.Values)
+        {
+            if (string.Equals(field.Key.EntityId, entityId, StringComparison.Ordinal))
+                Add(field.OperationId);
+        }
+
+        if (_visibility.TryGetValue(entityId, out var visibility))
+            Add(visibility.OperationId);
+        foreach (var mark in _membership)
+        {
+            if (string.Equals(mark.Key.EntityId, entityId, StringComparison.Ordinal))
+                Add(mark.Value.OperationId);
+        }
+
+        if (_ownership.TryGetValue(entityId, out var ownership))
+            Add(ownership.OperationId);
+        if (_deletions.TryGetValue(entityId, out var deletion))
+            Add(deletion.OperationId);
+        return ids.OrderBy(id => id, StringComparer.Ordinal).ToArray();
+    }
+
+    internal void InstallCoverage(IReadOnlyList<string> operationIds)
+    {
+        ArgumentNullException.ThrowIfNull(operationIds);
+        if (operationIds.Count > MaxCoverageCount)
+            throw new AetherProtocolException("Checkpoint coverage is too large.");
+        var next = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var operationId in operationIds)
+        {
+            if (string.IsNullOrEmpty(operationId))
+                throw new AetherProtocolException("Checkpoint coverage is missing an operation id.");
+            if (!next.Add(operationId))
+                throw new AetherProtocolException("Checkpoint coverage repeats an operation.");
+        }
+
+        _coverage.Clear();
+        foreach (var operationId in next)
+            _coverage.Add(operationId);
+    }
 
     public void DefineField(string fieldId, string resolver, long min = long.MinValue, long max = long.MaxValue)
     {
@@ -301,6 +363,8 @@ public sealed class AetherReducer
     /// Fold an operation. A newly admitted remote op sets the clock to max(clock, lamport) + 1,
     /// including when the remote Lamport is older. An exact duplicate still in the window leaves the clock alone.
     /// Evicting an id from the window does not reject any other operation.
+    /// An id named by checkpoint coverage is rejected once the window has forgotten it.
+    /// That rejection does not compare the payload.
     /// The returned clock is the clock after this call, paired with this operation.
     /// A sequence of at least 1 is checked before anything changes, then recorded with its Lamport and operation id.
     /// </summary>
@@ -339,6 +403,9 @@ public sealed class AetherReducer
                 throw new AetherProtocolException($"Operation '{op.Id}' changed payload.");
             return;
         }
+
+        if (_coverage.Contains(op.Id))
+            throw new AetherProtocolException("Operation is inside checkpoint coverage.");
 
         RejectActorClaim(op);
         if (op.Effect != AetherEffect.Write)

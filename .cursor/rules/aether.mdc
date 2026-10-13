@@ -231,9 +231,9 @@ Bootstrap checkpoints are bounded, versioned, canonical state heads, not a hidde
 history. Scope authority per entity. Verify an out-of-band pin before parsing state,
 then verify the current owner's signature and retained lifecycle proofs before
 installing a fresh reducer. An embedded signing key is not its own trust root.
-Keep checkpoint I/O and chunk transport outside the frame. Do not call a bootstrap
-checkpoint a policy cutover or dedup-coverage proof unless it explicitly carries
-and validates those contracts.
+Keep checkpoint I/O and chunk transport outside the frame. A checkpoint names the
+operation ids on that entity's current records. A forgotten id in that set is
+rejected without comparing the payload. The checkpoint is not a policy cutover.
 
 Move checkpoint bytes through the generic content-addressed file path. Manifests
 must bound total bytes, chunk bytes, and chunk count before allocation. Treat the

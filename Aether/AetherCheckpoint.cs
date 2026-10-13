@@ -37,6 +37,7 @@ public static class AetherCheckpoint
         RequireAuthorityHead(source, entityId);
         var selected = SelectEntity(source, entityId);
         ValidateLoaded(selected, entityId, owner);
+        selected.InstallCoverage(selected.HeadOperationIds(entityId));
         var state = AetherArchive.EncodeState(selected);
         var signingPayload = SigningPayload(entityId, owner, state);
         if (!signer.TrySignPrincipal(signingPayload, out var publicKey, out var signature))
@@ -103,6 +104,10 @@ public static class AetherCheckpoint
 
         var reducer = AetherArchive.DecodeState(state);
         ValidateLoaded(reducer, entityId, issuer);
+        var covered = reducer.CoverageIds();
+        var head = reducer.HeadOperationIds(entityId);
+        if (covered.Length != head.Length || head.Any(id => !reducer.Covers(id)))
+            throw new AetherProtocolException("Checkpoint coverage does not match its state.");
         return reducer;
     }
 
