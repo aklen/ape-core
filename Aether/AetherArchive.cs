@@ -13,7 +13,7 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    private const ushort FormatVersion = 9;
+    internal const ushort StateFormatVersion = 9;
     private const byte ContributionRecord = 0x10;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;
@@ -53,7 +53,7 @@ public sealed class AetherArchive
         ArgumentNullException.ThrowIfNull(reducer);
         Directory.CreateDirectory(_directory);
         var generation = ReadGeneration(SnapshotPath) + 1;
-        var body = EncodeSnapshotBody(reducer);
+        var body = EncodeState(reducer);
         WriteDurable(SnapshotPath, Finish(SnapshotMagic, generation, body), commitReplacement);
         if (!commitReplacement)
             return;
@@ -97,17 +97,33 @@ public sealed class AetherArchive
             throw new AetherProtocolException("No snapshot to load.");
 
         var snapshot = ReadFramed(SnapshotPath, SnapshotMagic);
-        var reader = new Reader(snapshot.Body);
+        var reducer = DecodeState(snapshot.Body);
+
+        if (File.Exists(LogPath))
+        {
+            var logHeader = ReadHeader(LogPath, LogMagic);
+            if (logHeader.Generation == snapshot.Generation)
+                Replay(reducer, File.ReadAllBytes(LogPath));
+        }
+
+        return reducer;
+    }
+
+    internal static AetherReducer DecodeState(byte[] body)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        var reader = new Reader(body);
         var saveThrough = reader.I64();
         if (saveThrough < 0)
             throw new AetherProtocolException("Snapshot save sequence is invalid.");
-        var capacity = checked((int)reader.U32());
-        if (capacity < 1)
+        var encodedCapacity = reader.U32();
+        if (encodedCapacity is 0 or > int.MaxValue)
             throw new AetherProtocolException("Snapshot dedup capacity is invalid.");
+        var capacity = (int)encodedCapacity;
 
         var reducer = new AetherReducer(capacity);
         var clock = reader.I64();
-        var schemaCount = reader.U32();
+        var schemaCount = reader.Count("Snapshot schema count");
         for (var i = 0; i < schemaCount; i++)
         {
             var id = reader.Text();
@@ -138,13 +154,6 @@ public sealed class AetherArchive
         reducer.RestoreSaveThrough(saveThrough);
         foreach (var cursor in cursors)
             reducer.RestoreActorSequence(cursor.ActorId, cursor.Sequence, cursor.Lamport, cursor.OperationId);
-
-        if (File.Exists(LogPath))
-        {
-            var logHeader = ReadHeader(LogPath, LogMagic);
-            if (logHeader.Generation == snapshot.Generation)
-                Replay(reducer, File.ReadAllBytes(LogPath));
-        }
 
         return reducer;
     }
@@ -193,8 +202,8 @@ public sealed class AetherArchive
 
     private static List<StoredField> ReadFields(Reader reader)
     {
-        var count = reader.U32();
-        var fields = new List<StoredField>(checked((int)count));
+        var count = reader.Count("Snapshot field count");
+        var fields = new List<StoredField>(count);
         for (var i = 0; i < count; i++)
         {
             var entityId = reader.Text();
@@ -227,8 +236,8 @@ public sealed class AetherArchive
 
     private static List<SeenOperation> ReadSeen(Reader reader)
     {
-        var count = reader.U32();
-        var seen = new List<SeenOperation>(checked((int)count));
+        var count = reader.Count("Snapshot dedup count");
+        var seen = new List<SeenOperation>(count);
         for (var i = 0; i < count; i++)
             seen.Add(new SeenOperation(reader.Text(), reader.Text(), reader.I64()));
         return seen;
@@ -236,8 +245,8 @@ public sealed class AetherArchive
 
     private static List<string> ReadTexts(Reader reader)
     {
-        var count = reader.U32();
-        var values = new List<string>(checked((int)count));
+        var count = reader.Count("Snapshot text count");
+        var values = new List<string>(count);
         for (var i = 0; i < count; i++)
             values.Add(reader.Text());
         return values;
@@ -245,8 +254,8 @@ public sealed class AetherArchive
 
     private static List<VisibilityMark> ReadVisibility(Reader reader)
     {
-        var count = reader.U32();
-        var marks = new List<VisibilityMark>(checked((int)count));
+        var count = reader.Count("Snapshot visibility count");
+        var marks = new List<VisibilityMark>(count);
         for (var i = 0; i < count; i++)
             marks.Add(new VisibilityMark(reader.Text(), new FieldVersion(reader.I64(), reader.Text()), reader.U8() == 1));
         return marks;
@@ -254,8 +263,8 @@ public sealed class AetherArchive
 
     private static List<MembershipMark> ReadMembership(Reader reader)
     {
-        var count = reader.U32();
-        var marks = new List<MembershipMark>(checked((int)count));
+        var count = reader.Count("Snapshot membership count");
+        var marks = new List<MembershipMark>(count);
         for (var i = 0; i < count; i++)
         {
             var entityId = reader.Text();
@@ -269,8 +278,8 @@ public sealed class AetherArchive
 
     private static List<StoredEntity> ReadEntities(Reader reader)
     {
-        var count = reader.U32();
-        var entities = new List<StoredEntity>(checked((int)count));
+        var count = reader.Count("Snapshot entity count");
+        var entities = new List<StoredEntity>(count);
         for (var i = 0; i < count; i++)
         {
             var entityId = reader.Text();
@@ -297,8 +306,8 @@ public sealed class AetherArchive
 
     private static List<StoredDeletion> ReadDeletions(Reader reader)
     {
-        var count = reader.U32();
-        var deletions = new List<StoredDeletion>(checked((int)count));
+        var count = reader.Count("Snapshot deletion count");
+        var deletions = new List<StoredDeletion>(count);
         for (var i = 0; i < count; i++)
         {
             var entityId = reader.Text();
@@ -315,7 +324,7 @@ public sealed class AetherArchive
 
     private static List<StoredOwnership> ReadOwnership(Reader reader)
     {
-        var count = checked((int)reader.U32());
+        var count = reader.Count("Snapshot ownership count");
         var rows = new List<StoredOwnership>(count);
         for (var i = 0; i < count; i++)
         {
@@ -335,14 +344,14 @@ public sealed class AetherArchive
 
     private static List<ActorCursor> ReadCursors(Reader reader)
     {
-        var count = reader.U32();
-        var cursors = new List<ActorCursor>(checked((int)count));
+        var count = reader.Count("Snapshot actor count");
+        var cursors = new List<ActorCursor>(count);
         for (var i = 0; i < count; i++)
             cursors.Add(new ActorCursor(reader.Text(), reader.I64(), reader.I64(), reader.Text()));
         return cursors;
     }
 
-    private static byte[] EncodeSnapshotBody(AetherReducer reducer)
+    internal static byte[] EncodeState(AetherReducer reducer)
     {
         var image = reducer.Capture();
         using var buffer = new MemoryStream();
@@ -598,7 +607,7 @@ public sealed class AetherArchive
     {
         var framed = new byte[HeaderLength + body.Length + 32];
         magic.CopyTo(framed);
-        BinaryPrimitives.WriteUInt16BigEndian(framed.AsSpan(4), FormatVersion);
+        BinaryPrimitives.WriteUInt16BigEndian(framed.AsSpan(4), StateFormatVersion);
         BinaryPrimitives.WriteInt64BigEndian(framed.AsSpan(6), generation);
         BinaryPrimitives.WriteUInt32BigEndian(framed.AsSpan(14), (uint)body.Length);
         SHA256.HashData(framed.AsSpan(0, HeaderPrefixLength)).CopyTo(framed.AsSpan(HeaderPrefixLength));
@@ -762,7 +771,7 @@ public sealed class AetherArchive
             throw new AetherProtocolException("Archive header checksum failed.");
 
         var version = BinaryPrimitives.ReadUInt16BigEndian(header.AsSpan(4));
-        if (version != FormatVersion)
+        if (version != StateFormatVersion)
             throw new AetherProtocolException($"Archive format {version} is unknown.");
         var generation = BinaryPrimitives.ReadInt64BigEndian(header.AsSpan(6));
         var bodyLength = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(14));
@@ -804,7 +813,7 @@ public sealed class AetherArchive
         if (!magic.IsEmpty && !bytes.AsSpan(0, 4).SequenceEqual(magic))
             throw new AetherProtocolException("Archive file magic is unknown.");
         var version = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(4));
-        if (version != FormatVersion)
+        if (version != StateFormatVersion)
             throw new AetherProtocolException($"Archive format {version} is unknown.");
         var generation = BinaryPrimitives.ReadInt64BigEndian(bytes.AsSpan(6));
         var length = BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(14));
@@ -889,6 +898,14 @@ public sealed class AetherArchive
         {
             var bytes = Bytes(4);
             return BinaryPrimitives.ReadUInt32BigEndian(bytes);
+        }
+
+        public int Count(string name)
+        {
+            var count = U32();
+            if (count > int.MaxValue || count > Remaining)
+                throw new AetherProtocolException($"{name} is invalid.");
+            return (int)count;
         }
 
         public long I64()

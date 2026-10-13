@@ -211,6 +211,14 @@ Document clock/session recovery, snapshot scope, and durable acknowledgement.
 When persistence is implemented, test interrupted snapshot replacement, journal
 replay, and truncated tails. Do not require full historical replay for startup.
 
+Bootstrap checkpoints are bounded, versioned, canonical state heads, not a hidden
+history. Scope authority per entity. Verify an out-of-band pin before parsing state,
+then verify the current owner's signature and retained lifecycle proofs before
+installing a fresh reducer. An embedded signing key is not its own trust root.
+Keep checkpoint I/O and chunk transport outside the frame. Do not call a bootstrap
+checkpoint a policy cutover or dedup-coverage proof unless it explicitly carries
+and validates those contracts.
+
 ## Test contracts, not just implementation agreement
 
 Use handwritten expected results and adversarial small examples. Cover relevant
