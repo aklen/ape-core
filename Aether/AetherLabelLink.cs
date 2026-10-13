@@ -14,6 +14,7 @@ namespace Ape.Core.Aether;
 public sealed class AetherLabelLink : IDisposable
 {
     private readonly INetworkManager _network;
+    private readonly IPrincipalSigner? _principalSigner;
     private readonly AetherHost _host;
     private readonly ISceneManager _scene;
     private readonly ILogger _logger;
@@ -26,6 +27,7 @@ public sealed class AetherLabelLink : IDisposable
     private readonly TimeProvider _time;
     private readonly TimeSpan _unidentifiedLifetime;
     private readonly bool _allowUnauthenticated;
+    private readonly Func<AetherOperation, AetherOperation>? _authoritySeal;
     private readonly HashSet<long> _localIds = new();
     private readonly Queue<AetherOperation> _outgoing = new();
     private readonly Queue<HeldOperation> _held = new();
@@ -75,6 +77,8 @@ public sealed class AetherLabelLink : IDisposable
         _time = time ?? TimeProvider.System;
         _unidentifiedLifetime = unidentifiedLifetime ?? TimeSpan.FromSeconds(5);
         _allowUnauthenticated = allowUnauthenticated;
+        _principalSigner = network as IPrincipalSigner;
+        _authoritySeal = _principalSigner?.HasPrincipalSigner == true ? SealAuthority : null;
         _network = network ?? throw new ArgumentNullException(nameof(network));
         _host = host ?? throw new ArgumentNullException(nameof(host));
         _scene = scene ?? throw new ArgumentNullException(nameof(scene));
@@ -141,7 +145,7 @@ public sealed class AetherLabelLink : IDisposable
         ObjectDisposedException.ThrowIf(_stopped, this);
         if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
             return AetherAdmit.Full;
-        var admit = _host.TryAcceptLocalCreate(_entityId, entityTypeId, _writerId, _actorId);
+        var admit = _host.TryAcceptLocalCreate(_entityId, entityTypeId, _writerId, _actorId, _authoritySeal);
         if (admit.Kind == AetherAdmitKind.Queued)
             _localIds.Add(admit.RequestId);
         return admit;
@@ -152,7 +156,7 @@ public sealed class AetherLabelLink : IDisposable
         ObjectDisposedException.ThrowIf(_stopped, this);
         if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
             return AetherAdmit.Full;
-        var admit = _host.TryAcceptLocalDelete(_entityId, _writerId, _actorId);
+        var admit = _host.TryAcceptLocalDelete(_entityId, _writerId, _actorId, _authoritySeal);
         if (admit.Kind == AetherAdmitKind.Queued)
             _localIds.Add(admit.RequestId);
         return admit;
@@ -163,7 +167,7 @@ public sealed class AetherLabelLink : IDisposable
         ObjectDisposedException.ThrowIf(_stopped, this);
         if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
             return AetherAdmit.Full;
-        var admit = _host.TryAcceptLocalTransfer(_entityId, newOwnerId, _writerId, _actorId);
+        var admit = _host.TryAcceptLocalTransfer(_entityId, newOwnerId, _writerId, _actorId, _authoritySeal);
         if (admit.Kind == AetherAdmitKind.Queued)
             _localIds.Add(admit.RequestId);
         return admit;
@@ -257,7 +261,7 @@ public sealed class AetherLabelLink : IDisposable
             return;
         }
 
-        AcceptRemote(peer.PrincipalId, operation, fields);
+        AcceptRemote(peer.PrincipalId, peer.IsAuthenticated, operation, fields);
     }
 
     private void OnPeerConnected(string peerId) => CatchUp();
@@ -293,7 +297,7 @@ public sealed class AetherLabelLink : IDisposable
             _unidentifiedBytes -= held.Data.Length;
             if (!TryReadRemote(held.Data, out var operation, out var fields))
                 continue;
-            AcceptRemote(peer.PrincipalId, operation, fields);
+            AcceptRemote(peer.PrincipalId, peer.IsAuthenticated, operation, fields);
         }
     }
 
@@ -407,7 +411,11 @@ public sealed class AetherLabelLink : IDisposable
         return true;
     }
 
-    private void AcceptRemote(string principalId, AetherOperation? operation, IReadOnlyList<StoredField>? fields)
+    private void AcceptRemote(
+        string principalId,
+        bool authenticated,
+        AetherOperation? operation,
+        IReadOnlyList<StoredField>? fields)
     {
         if (fields is not null)
         {
@@ -416,23 +424,23 @@ public sealed class AetherLabelLink : IDisposable
         }
 
         LastRemoteFault = null;
-        var admit = _host.TryAcceptRemote(operation!, principalId);
+        var admit = _host.TryAcceptRemote(operation!, principalId, requireAuthorityProof: authenticated);
         LastRemoteAdmit = admit;
         if (admit.Kind == AetherAdmitKind.Refused)
         {
             LastRemoteFault = admit.Reason;
             if (IsMissingDependency(admit.Reason))
-                HoldOperation(principalId, operation!);
+                HoldOperation(principalId, authenticated, operation!);
             return;
         }
 
         if (admit.Kind == AetherAdmitKind.Queued)
             return;
 
-        HoldOperation(principalId, operation!);
+        HoldOperation(principalId, authenticated, operation!);
     }
 
-    private void HoldOperation(string principalId, AetherOperation operation)
+    private void HoldOperation(string principalId, bool authenticated, AetherOperation operation)
     {
         if (_held.Any(held => held.Operation.Id == operation.Id))
             return;
@@ -442,7 +450,7 @@ public sealed class AetherLabelLink : IDisposable
             return;
         }
 
-        _held.Enqueue(new HeldOperation(principalId, operation));
+        _held.Enqueue(new HeldOperation(principalId, authenticated, operation));
     }
 
     private void AdmitHeld()
@@ -451,7 +459,7 @@ public sealed class AetherLabelLink : IDisposable
         for (var i = 0; i < waiting; i++)
         {
             var held = _held.Dequeue();
-            var admit = _host.TryAcceptRemote(held.Operation, held.PrincipalId);
+            var admit = _host.TryAcceptRemote(held.Operation, held.PrincipalId, held.Authenticated);
             LastRemoteAdmit = admit;
             if (admit.Kind == AetherAdmitKind.Refused)
             {
@@ -642,7 +650,8 @@ public sealed class AetherLabelLink : IDisposable
         AetherEffect.CreateEntity,
         entityTypeId: entity.EntityTypeId,
         creatorId: entity.CreatorId,
-        ownerId: entity.OwnerId);
+        ownerId: entity.OwnerId,
+        authority: entity.Authority);
 
     private static AetherOperation DeletionOperation(StoredDeletion deletion) => new(
         deletion.OperationId,
@@ -652,12 +661,21 @@ public sealed class AetherLabelLink : IDisposable
         deletion.Sequence,
         deletion.Version.Lamport,
         new Dictionary<string, FieldValue>(),
-        AetherEffect.DeleteEntity);
+        AetherEffect.DeleteEntity,
+        authority: deletion.Authority);
 
     private static AetherOperation OwnershipOperation(StoredOwnership row) => new(
         row.OperationId, row.EntityId, row.PreviousOwnerId, row.Version.ActorId, row.Sequence, row.Version.Lamport,
         new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
-        newOwnerId: row.OwnerId, priorOwnerOperationId: row.PriorOperationId);
+        newOwnerId: row.OwnerId, priorOwnerOperationId: row.PriorOperationId, authority: row.Authority);
+
+    private AetherOperation SealAuthority(AetherOperation operation)
+    {
+        if (_principalSigner is null
+            || !_principalSigner.TrySignPrincipal(operation.AuthorityPayload(), out var publicKey, out var signature))
+            return operation;
+        return AetherAuthority.Seal(operation, publicKey, signature);
+    }
 
     private static bool IsMissingDependency(string? reason) =>
         string.Equals(reason, "Delete entity owner is unknown.", StringComparison.Ordinal)
@@ -666,7 +684,7 @@ public sealed class AetherLabelLink : IDisposable
         || string.Equals(reason, "Ownership transfer is not issued by the entity owner.", StringComparison.Ordinal)
         || string.Equals(reason, "Ownership transfer prior operation does not match.", StringComparison.Ordinal);
 
-    private readonly record struct HeldOperation(string PrincipalId, AetherOperation Operation);
+    private readonly record struct HeldOperation(string PrincipalId, bool Authenticated, AetherOperation Operation);
 
     private readonly record struct HeldContribution(string PrincipalId, IReadOnlyList<StoredField> Fields);
 

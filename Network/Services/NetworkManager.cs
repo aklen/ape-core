@@ -21,7 +21,7 @@ namespace Ape.Core.Network.Services;
 [SupportedOSPlatform("linux")]
 [SupportedOSPlatform("macos")]
 [SupportedOSPlatform("windows")]
-public class NetworkManager : INetworkManager, ICoreService, IDisposable
+public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, IDisposable
 {
     public string ServiceId => "core-network-manager";
     public string Name => "Network Manager";
@@ -51,9 +51,25 @@ public class NetworkManager : INetworkManager, ICoreService, IDisposable
 
     /// <summary>
     /// Durable writer id. A profile key sends its public-key fingerprint. <see cref="LocalPeerId"/> stays the process instance.
-    /// A checked handshake is not create, owner, or delete authority.
+    /// A checked handshake proves key presence. Signed lifecycle operations retain authorship; reducer rules grant authority.
     /// </summary>
     public string PrincipalId { get; }
+
+    bool IPrincipalSigner.HasPrincipalSigner => _signer is not null;
+
+    bool IPrincipalSigner.TrySignPrincipal(ReadOnlySpan<byte> payload, out byte[] publicKey, out byte[] signature)
+    {
+        if (_signer is null)
+        {
+            publicKey = [];
+            signature = [];
+            return false;
+        }
+
+        publicKey = _signer.PublicKey.ToArray();
+        signature = _signer.Sign(payload);
+        return true;
+    }
 
     /// <summary>
     /// Network role of this instance ("server", "client", "peer").

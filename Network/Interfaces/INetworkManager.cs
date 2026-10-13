@@ -13,7 +13,7 @@ public interface INetworkManager
 
     /// <summary>
     /// Durable writer id. A profile sends the fingerprint of its public key, not <see cref="LocalPeerId"/>.
-    /// A checked handshake shows that this key is present. Create, owner, and delete authority do not use it.
+    /// A checked handshake shows that this key is present. Signed lifecycle operations use it as authorship proof; reducer rules grant authority.
     /// </summary>
     string PrincipalId { get; }
 

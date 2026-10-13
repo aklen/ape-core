@@ -71,8 +71,12 @@ A failed handshake does not enter the queue. A replay fails because the
 transcript includes this connection's fresh nonce. A send the transport does
 not accept stays pending as the same bytes. The proof authenticates a principal's
 initial self-create: writer, actor peer, creator, and initial owner must all be that
-principal before the request enters the queue. Delete requires the authenticated
-principal to equal the current owner. Ownership transfer is explicit, is issued by
+principal before the request enters the queue. Authenticated Create, Transfer, and
+Delete carry the original principal public key and an end-to-end signature over a
+versioned canonical envelope. Verify the fingerprint, signature, operation id, entity,
+effect, version, and lifecycle metadata before the host queue. Preserve that proof in
+the wire, snapshot, log, and catch-up envelope. A signature proves authorship; reducer
+rules grant authority. Delete requires the authenticated principal to equal the current owner. Ownership transfer is explicit, is issued by
 that current owner, and names the operation that established it. Keep creator,
 initial owner, and current owner separate. Never resolve two transfers from the same
 prior ownership operation by arrival order or actor id; that is owner equivocation,

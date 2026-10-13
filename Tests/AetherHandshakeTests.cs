@@ -20,6 +20,51 @@ namespace Ape.Core.Tests;
 public sealed class AetherHandshakeTests
 {
     [Fact]
+    public void Authenticated_transfer_grants_delete_to_the_new_owner()
+    {
+        var time = new ManualTime();
+        using var leftDir = new TempDir();
+        using var rightDir = new TempDir();
+        using var left = Side.Create(leftDir.Path, time);
+        using var right = Side.Create(rightDir.Path, time);
+        var leftServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var rightServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var leftStore = Store();
+        var rightStore = Store();
+        using var leftLink = new AetherLabelLink(left.Network, new AetherHost(leftStore, 4096, 8),
+            leftServices.GetRequiredService<ISceneManager>(), leftServices.GetRequiredService<ILogger>(),
+            "entity-1", left.Principal.Id, "session-1", "catalog");
+        using var rightLink = new AetherLabelLink(right.Network, new AetherHost(rightStore, 4096, 8),
+            rightServices.GetRequiredService<ISceneManager>(), rightServices.GetRequiredService<ILogger>(),
+            "entity-1", right.Principal.Id, "session-1", "catalog");
+        Exchange(left, right);
+
+        Assert.Equal(AetherAdmitKind.Queued, leftLink.SubmitCreate(TestStubEntity.RegistryTypeId).Kind);
+        leftLink.Pump();
+        right.Receive(left.Transport.Sent[0]);
+        rightLink.Pump();
+
+        Assert.Equal(AetherAdmitKind.Queued, leftLink.SubmitOwnershipTransfer(right.Principal.Id).Kind);
+        leftLink.Pump();
+        var transferPacket = left.Transport.Sent[1];
+        Assert.True(AetherWire.TryDecode(transferPacket, "entity-1", "label", out var transfer, out _));
+        Assert.True(AetherAuthority.Verify(transfer!));
+        right.Receive(transferPacket);
+        rightLink.Pump();
+
+        Assert.Equal(right.Principal.Id, leftStore.GetOwner("entity-1"));
+        Assert.Equal(right.Principal.Id, rightStore.GetOwner("entity-1"));
+        Assert.Equal(AetherAdmitKind.Queued, rightLink.SubmitDelete().Kind);
+        rightLink.Pump();
+        var deletePacket = Assert.Single(right.Transport.Sent);
+        left.Receive(deletePacket);
+        leftLink.Pump();
+
+        Assert.True(leftStore.IsDeleted("entity-1"));
+        Assert.True(rightStore.IsDeleted("entity-1"));
+    }
+
+    [Fact]
     public void Authenticated_create_builds_the_registered_entity_on_the_remote_scene()
     {
         var time = new ManualTime();

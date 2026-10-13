@@ -4,7 +4,7 @@ namespace Ape.Core.Network;
 
 /// <summary>
 /// Mutual nonce exchange and a signature over one versioned transcript.
-/// A checked signature shows that the profile key is present. It does not grant authority.
+/// A checked signature shows that the profile key is present. It does not by itself grant authority.
 /// </summary>
 public static class PrincipalHandshake
 {

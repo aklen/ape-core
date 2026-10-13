@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Text;
+using Ape.Core.Network;
 
 namespace Ape.Core.Aether;
 
@@ -37,14 +38,25 @@ public sealed class AetherHost
     public int PendingCount => _inbox.Count + _outbox.Count;
 
     /// <summary>
-    /// Queues a remote write when its writer and actor peer are <paramref name="principalId"/>.
+    /// Queues a remote write when its writer and actor peer are the connection principal.
+    /// Authenticated lifecycle traffic must carry its retained authority proof.
     /// The socket slot is not a writer. Refusal happens before the queue.
     /// </summary>
-    public AetherAdmit TryAcceptRemote(AetherOperation op, string principalId)
+    public AetherAdmit TryAcceptRemote(AetherOperation op, PeerConnectionContext peer) =>
+        TryAcceptRemote(op, peer.PrincipalId, peer.IsAuthenticated);
+
+    internal AetherAdmit TryAcceptRemote(AetherOperation op, string principalId) =>
+        TryAcceptRemote(op, principalId, requireAuthorityProof: false);
+
+    internal AetherAdmit TryAcceptRemote(AetherOperation op, string principalId, bool requireAuthorityProof)
     {
         ArgumentNullException.ThrowIfNull(op);
         if (!BindsToPeer(op.WriterId, op.ActorId, principalId))
             return AetherAdmit.Refused("Actor is not on this connection.");
+        if (requireAuthorityProof
+            && op.Effect is AetherEffect.CreateEntity or AetherEffect.TransferOwnership or AetherEffect.DeleteEntity
+            && !AetherAuthority.Verify(op))
+            return AetherAdmit.Refused("Authority proof is invalid.");
         if (op.Effect == AetherEffect.CreateEntity
             && (!string.Equals(op.CreatorId, principalId, StringComparison.Ordinal)
                 || !string.Equals(op.OwnerId, principalId, StringComparison.Ordinal)))
@@ -118,18 +130,25 @@ public sealed class AetherHost
         string entityId,
         string entityTypeId,
         string writerId,
-        string actorId)
+        string actorId,
+        Func<AetherOperation, AetherOperation>? seal = null)
     {
-        var bytes = BaseBytes + Utf8(entityId) + Utf8(entityTypeId) + Utf8(writerId) + Utf8(actorId) + 16;
+        var bytes = BaseBytes + Utf8(entityId) + Utf8(entityTypeId) + Utf8(writerId) + Utf8(actorId) + 16
+            + AuthorityReservation(seal);
         return TryEnqueue(new Pending(
             null,
-            new LocalWrite(entityId, writerId, actorId, new Dictionary<string, FieldValue>(), entityTypeId),
+            new LocalWrite(entityId, writerId, actorId, new Dictionary<string, FieldValue>(), entityTypeId, seal: seal),
             bytes));
     }
 
-    public AetherAdmit TryAcceptLocalDelete(string entityId, string writerId, string actorId)
+    public AetherAdmit TryAcceptLocalDelete(
+        string entityId,
+        string writerId,
+        string actorId,
+        Func<AetherOperation, AetherOperation>? seal = null)
     {
-        var bytes = BaseBytes + Utf8(entityId) + Utf8(writerId) + Utf8(actorId) + 16;
+        var bytes = BaseBytes + Utf8(entityId) + Utf8(writerId) + Utf8(actorId) + 16
+            + AuthorityReservation(seal);
         return TryEnqueue(new Pending(
             null,
             new LocalWrite(
@@ -137,16 +156,23 @@ public sealed class AetherHost
                 writerId,
                 actorId,
                 new Dictionary<string, FieldValue>(),
-                effect: AetherEffect.DeleteEntity),
+                effect: AetherEffect.DeleteEntity,
+                seal: seal),
             bytes));
     }
 
-    public AetherAdmit TryAcceptLocalTransfer(string entityId, string newOwnerId, string writerId, string actorId)
+    public AetherAdmit TryAcceptLocalTransfer(
+        string entityId,
+        string newOwnerId,
+        string writerId,
+        string actorId,
+        Func<AetherOperation, AetherOperation>? seal = null)
     {
-        var bytes = BaseBytes + Utf8(entityId) + Utf8(newOwnerId) + Utf8(writerId) + Utf8(actorId) + 32;
+        var bytes = BaseBytes + Utf8(entityId) + Utf8(newOwnerId) + Utf8(writerId) + Utf8(actorId) + 32
+            + AuthorityReservation(seal);
         return TryEnqueue(new Pending(null,
             new LocalWrite(entityId, writerId, actorId, new Dictionary<string, FieldValue>(),
-                effect: AetherEffect.TransferOwnership, newOwnerId: newOwnerId), bytes));
+                effect: AetherEffect.TransferOwnership, newOwnerId: newOwnerId, seal: seal), bytes));
     }
 
     public IReadOnlyList<AetherOutcome> Drain() => Drain(int.MaxValue, int.MaxValue, beforeFold: null);
@@ -280,6 +306,7 @@ public sealed class AetherHost
             + Utf8(op.OwnerId)
             + Utf8(op.NewOwnerId)
             + Utf8(op.PriorOwnerOperationId)
+            + AuthorityBytes(op.Authority)
             + 16;
         foreach (var (fieldId, value) in op.Changes)
             bytes += Utf8(fieldId) + Utf8(value.Text) + 8;
@@ -374,16 +401,19 @@ public sealed class AetherHost
                             write.EntityId,
                             write.EntityTypeId!,
                             write.WriterId,
-                            write.ActorId),
+                            write.ActorId,
+                            write.Seal),
                         AetherEffect.DeleteEntity => Reducer.StampLocalDelete(
                             write.EntityId,
                             write.WriterId,
-                            write.ActorId),
+                            write.ActorId,
+                            write.Seal),
                         AetherEffect.TransferOwnership => Reducer.StampLocalTransfer(
                             write.EntityId,
                             write.NewOwnerId!,
                             write.WriterId,
-                            write.ActorId),
+                            write.ActorId,
+                            write.Seal),
                         _ => Reducer.StampLocal(write.EntityId, write.WriterId, write.ActorId, write.Changes),
                     };
                 }
@@ -416,6 +446,12 @@ public sealed class AetherHost
 
     private static int Utf8(string? value) => value is null ? 0 : Encoding.UTF8.GetByteCount(value);
 
+    private static int AuthorityReservation(Func<AetherOperation, AetherOperation>? seal) =>
+        seal is null ? 4 : 4 + PrincipalHandshake.MaxPublicKeyBytes + PrincipalHandshake.MaxSignatureBytes;
+
+    private static int AuthorityBytes(AetherAuthorityProof? proof) =>
+        proof is null ? 4 : 4 + proof.PublicKey.Length + proof.Signature.Length;
+
     private sealed class LocalWrite(
         string entityId,
         string writerId,
@@ -423,7 +459,8 @@ public sealed class AetherHost
         Dictionary<string, FieldValue> changes,
         string? entityTypeId = null,
         AetherEffect effect = AetherEffect.Write,
-        string? newOwnerId = null)
+        string? newOwnerId = null,
+        Func<AetherOperation, AetherOperation>? seal = null)
     {
         public string EntityId { get; } = entityId;
         public string WriterId { get; } = writerId;
@@ -432,6 +469,7 @@ public sealed class AetherHost
         public string? EntityTypeId { get; } = entityTypeId;
         public AetherEffect Effect { get; } = entityTypeId is null ? effect : AetherEffect.CreateEntity;
         public string? NewOwnerId { get; } = newOwnerId;
+        public Func<AetherOperation, AetherOperation>? Seal { get; } = seal;
     }
 
     private sealed class Pending

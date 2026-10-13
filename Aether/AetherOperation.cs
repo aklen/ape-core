@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Collections.ObjectModel;
 using System.Security.Cryptography;
 using System.Text;
+using Ape.Core.Network;
 
 namespace Ape.Core.Aether;
 
@@ -37,7 +38,8 @@ public sealed class AetherOperation
         string? creatorId = null,
         string? ownerId = null,
         string? newOwnerId = null,
-        string? priorOwnerOperationId = null)
+        string? priorOwnerOperationId = null,
+        AetherAuthorityProof? authority = null)
     {
         Id = id ?? throw new ArgumentNullException(nameof(id));
         EntityId = entityId ?? throw new ArgumentNullException(nameof(entityId));
@@ -86,6 +88,9 @@ public sealed class AetherOperation
             throw new AetherProtocolException("This operation has no ownership metadata.");
         }
 
+        if (authority is not null && effect is not (AetherEffect.CreateEntity or AetherEffect.TransferOwnership or AetherEffect.DeleteEntity))
+            throw new AetherProtocolException("This operation has no authority proof.");
+
         Effect = effect;
         PublicationId = publicationId;
         EntityTypeId = entityTypeId;
@@ -93,6 +98,7 @@ public sealed class AetherOperation
         OwnerId = ownerId;
         NewOwnerId = newOwnerId;
         PriorOwnerOperationId = priorOwnerOperationId;
+        Authority = authority is null ? null : new AetherAuthorityProof(authority.PublicKey, authority.Signature);
         Changes = new ReadOnlyDictionary<string, FieldValue>(stored);
         Digest = ComputeDigest(EntityId, WriterId, ActorId, Sequence, Lamport, Changes, effect, publicationId, entityTypeId, creatorId, ownerId, newOwnerId, priorOwnerOperationId);
     }
@@ -120,10 +126,21 @@ public sealed class AetherOperation
     public string? OwnerId { get; }
     public string? NewOwnerId { get; }
     public string? PriorOwnerOperationId { get; }
+    public AetherAuthorityProof? Authority { get; }
 
     public IReadOnlyDictionary<string, FieldValue> Changes { get; }
 
     public string Digest { get; }
+
+    public byte[] AuthorityPayload()
+    {
+        using var buffer = new MemoryStream();
+        WriteString(buffer, "ape-aether-authority-v1");
+        WriteString(buffer, Id);
+        WriteSemantic(buffer, EntityId, WriterId, ActorId, Sequence, Lamport, Changes, Effect,
+            PublicationId, EntityTypeId, CreatorId, OwnerId, NewOwnerId, PriorOwnerOperationId);
+        return buffer.ToArray();
+    }
 
     public static string ComputeDigest(
         string entityId,
@@ -141,6 +158,27 @@ public sealed class AetherOperation
         string? priorOwnerOperationId = null)
     {
         using var buffer = new MemoryStream();
+        WriteSemantic(buffer, entityId, writerId, actorId, sequence, lamport, changes, effect,
+            publicationId, entityTypeId, creatorId, ownerId, newOwnerId, priorOwnerOperationId);
+        return Convert.ToHexString(SHA256.HashData(buffer.ToArray()));
+    }
+
+    private static void WriteSemantic(
+        Stream buffer,
+        string entityId,
+        string writerId,
+        string actorId,
+        long sequence,
+        long lamport,
+        IReadOnlyDictionary<string, FieldValue> changes,
+        AetherEffect effect,
+        string? publicationId,
+        string? entityTypeId,
+        string? creatorId,
+        string? ownerId,
+        string? newOwnerId,
+        string? priorOwnerOperationId)
+    {
         buffer.WriteByte((byte)effect);
         WriteString(buffer, publicationId ?? "");
         WriteString(buffer, entityTypeId ?? "");
@@ -169,8 +207,6 @@ public sealed class AetherOperation
                 WriteString(buffer, value.Text);
             }
         }
-
-        return Convert.ToHexString(SHA256.HashData(buffer.ToArray()));
     }
 
     private static void WriteString(Stream buffer, string value)
@@ -187,5 +223,50 @@ public sealed class AetherOperation
         Span<byte> encoded = stackalloc byte[8];
         BinaryPrimitives.WriteInt64BigEndian(encoded, value);
         buffer.Write(encoded);
+    }
+}
+
+public sealed class AetherAuthorityProof : IEquatable<AetherAuthorityProof>
+{
+    private readonly byte[] _publicKey;
+    private readonly byte[] _signature;
+
+    public AetherAuthorityProof(ReadOnlySpan<byte> publicKey, ReadOnlySpan<byte> signature)
+    {
+        if (publicKey.IsEmpty || publicKey.Length > PrincipalHandshake.MaxPublicKeyBytes
+            || signature.IsEmpty || signature.Length > PrincipalHandshake.MaxSignatureBytes)
+            throw new AetherProtocolException("Authority proof is invalid.");
+        _publicKey = publicKey.ToArray();
+        _signature = signature.ToArray();
+    }
+
+    public ReadOnlySpan<byte> PublicKey => _publicKey;
+    public ReadOnlySpan<byte> Signature => _signature;
+
+    public bool Equals(AetherAuthorityProof? other) => other is not null
+        && PublicKey.SequenceEqual(other.PublicKey)
+        && Signature.SequenceEqual(other.Signature);
+
+    public override bool Equals(object? obj) => Equals(obj as AetherAuthorityProof);
+    public override int GetHashCode() => HashCode.Combine(
+        Convert.ToHexString(SHA256.HashData(PublicKey)),
+        Convert.ToHexString(SHA256.HashData(Signature)));
+}
+
+public static class AetherAuthority
+{
+    public static AetherOperation Seal(AetherOperation operation, ReadOnlySpan<byte> publicKey, ReadOnlySpan<byte> signature) =>
+        new(operation.Id, operation.EntityId, operation.WriterId, operation.ActorId, operation.Sequence, operation.Lamport,
+            operation.Changes, operation.Effect, operation.PublicationId, operation.EntityTypeId, operation.CreatorId,
+            operation.OwnerId, operation.NewOwnerId, operation.PriorOwnerOperationId,
+            new AetherAuthorityProof(publicKey, signature));
+
+    public static bool Verify(AetherOperation operation)
+    {
+        if (operation.Authority is not { } proof || !DurablePrincipal.IsCanonicalP256(proof.PublicKey))
+            return false;
+        var fingerprint = Convert.ToHexString(SHA256.HashData(proof.PublicKey)).ToLowerInvariant();
+        return string.Equals(fingerprint, operation.WriterId, StringComparison.Ordinal)
+            && DurablePrincipal.Verify(proof.PublicKey, operation.AuthorityPayload(), proof.Signature);
     }
 }

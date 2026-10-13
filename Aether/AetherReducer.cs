@@ -138,7 +138,8 @@ public sealed class AetherReducer
         string entityId,
         string entityTypeId,
         string writerId,
-        string actorId)
+        string actorId,
+        Func<AetherOperation, AetherOperation>? seal = null)
     {
         if (string.IsNullOrEmpty(actorId))
             throw new AetherProtocolException("Actor sequence is missing.");
@@ -157,6 +158,7 @@ public sealed class AetherReducer
             creatorId: writerId,
             ownerId: writerId);
         RejectBeforeAdmit(stamped);
+        stamped = Seal(stamped, seal);
         AetherWire.Encode(stamped);
         _clock = nextClock;
         _nextSequence[actorId] = sequence;
@@ -164,7 +166,11 @@ public sealed class AetherReducer
         return stamped;
     }
 
-    public AetherOperation StampLocalDelete(string entityId, string writerId, string actorId)
+    public AetherOperation StampLocalDelete(
+        string entityId,
+        string writerId,
+        string actorId,
+        Func<AetherOperation, AetherOperation>? seal = null)
     {
         if (string.IsNullOrEmpty(actorId))
             throw new AetherProtocolException("Actor sequence is missing.");
@@ -180,6 +186,7 @@ public sealed class AetherReducer
             new Dictionary<string, FieldValue>(),
             AetherEffect.DeleteEntity);
         RejectBeforeAdmit(stamped);
+        stamped = Seal(stamped, seal);
         AetherWire.Encode(stamped);
         _clock = nextClock;
         _nextSequence[actorId] = sequence;
@@ -187,7 +194,12 @@ public sealed class AetherReducer
         return stamped;
     }
 
-    public AetherOperation StampLocalTransfer(string entityId, string newOwnerId, string writerId, string actorId)
+    public AetherOperation StampLocalTransfer(
+        string entityId,
+        string newOwnerId,
+        string writerId,
+        string actorId,
+        Func<AetherOperation, AetherOperation>? seal = null)
     {
         if (string.IsNullOrEmpty(actorId))
             throw new AetherProtocolException("Actor sequence is missing.");
@@ -201,11 +213,28 @@ public sealed class AetherReducer
             new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
             newOwnerId: newOwnerId, priorOwnerOperationId: prior);
         RejectBeforeAdmit(stamped);
+        stamped = Seal(stamped, seal);
         AetherWire.Encode(stamped);
         _clock = nextClock;
         _nextSequence[actorId] = sequence;
         _frontiers[actorId] = new ActorFrontier(sequence, nextClock, stamped.Id);
         return stamped;
+    }
+
+    private static AetherOperation Seal(
+        AetherOperation operation,
+        Func<AetherOperation, AetherOperation>? seal)
+    {
+        if (seal is null)
+            return operation;
+        var sealedOperation = seal(operation)
+            ?? throw new AetherProtocolException("Authority signer returned no operation.");
+        if (!string.Equals(operation.Id, sealedOperation.Id, StringComparison.Ordinal)
+            || !string.Equals(operation.Digest, sealedOperation.Digest, StringComparison.Ordinal)
+            || sealedOperation.Authority is null
+            || !AetherAuthority.Verify(sealedOperation))
+            throw new AetherProtocolException("Authority signer changed or did not sign the operation.");
+        return sealedOperation;
     }
 
     /// <summary>
@@ -254,6 +283,8 @@ public sealed class AetherReducer
         RejectActorClaim(op);
         if (op.Effect != AetherEffect.Write)
         {
+            if (op.Effect is AetherEffect.CreateEntity or AetherEffect.TransferOwnership or AetherEffect.DeleteEntity)
+                RequireAuthorityWhenPresent(op);
             var version = new FieldVersion(op.Lamport, op.ActorId);
             switch (op.Effect)
             {
@@ -534,7 +565,8 @@ public sealed class AetherReducer
         && string.Equals(row.PriorOperationId, op.PriorOwnerOperationId, StringComparison.Ordinal)
         && string.Equals(row.OperationId, op.Id, StringComparison.Ordinal)
         && row.Sequence == op.Sequence
-        && row.Version == new FieldVersion(op.Lamport, op.ActorId);
+        && row.Version == new FieldVersion(op.Lamport, op.ActorId)
+        && Equals(row.Authority, op.Authority);
 
     public bool IsSharedVisible(string entityId) =>
         !_visibility.TryGetValue(entityId, out var state) || !state.Hidden;
@@ -776,7 +808,8 @@ public sealed class AetherReducer
         op.WriterId,
         new FieldVersion(op.Lamport, op.ActorId),
         op.Id,
-        op.Sequence);
+        op.Sequence,
+        op.Authority);
 
     private static void RequireDeletion(StoredDeletion deletion, StoredEntity entity, string ownerId)
     {
@@ -790,6 +823,16 @@ public sealed class AetherReducer
             || !string.Equals(deletion.WriterId, ownerId, StringComparison.Ordinal)
             || !ActorBelongsTo(deletion.Version.ActorId, ownerId))
             throw new AetherProtocolException("Delete is not issued by the entity owner.");
+        RequireAuthorityWhenPresent(new AetherOperation(
+            deletion.OperationId, deletion.EntityId, deletion.WriterId, deletion.Version.ActorId,
+            deletion.Sequence, deletion.Version.Lamport, new Dictionary<string, FieldValue>(),
+            AetherEffect.DeleteEntity, authority: deletion.Authority));
+    }
+
+    private static void RequireAuthorityWhenPresent(AetherOperation operation)
+    {
+        if (operation.Authority is not null && !AetherAuthority.Verify(operation))
+            throw new AetherProtocolException("Authority proof is invalid.");
     }
 
     private void RejectOwnership(AetherOperation op)
@@ -818,7 +861,7 @@ public sealed class AetherReducer
             return existing;
         var generation = _ownership.TryGetValue(op.EntityId, out var current) ? checked(current.Generation + 1) : 1;
         return new StoredOwnership(op.EntityId, op.WriterId, op.NewOwnerId!, op.PriorOwnerOperationId!, generation,
-            new FieldVersion(op.Lamport, op.ActorId), op.Id, op.Sequence);
+            new FieldVersion(op.Lamport, op.ActorId), op.Id, op.Sequence, op.Authority);
     }
 
     private static void RequireOwnership(StoredOwnership row)
@@ -830,6 +873,10 @@ public sealed class AetherReducer
             || string.Equals(row.PreviousOwnerId, row.OwnerId, StringComparison.Ordinal)
             || !ActorBelongsTo(row.Version.ActorId, row.PreviousOwnerId))
             throw new AetherProtocolException("Ownership metadata is invalid.");
+        RequireAuthorityWhenPresent(new AetherOperation(
+            row.OperationId, row.EntityId, row.PreviousOwnerId, row.Version.ActorId, row.Sequence,
+            row.Version.Lamport, new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
+            newOwnerId: row.OwnerId, priorOwnerOperationId: row.PriorOperationId, authority: row.Authority));
     }
 
     private List<StoredOwnership> FoldOwnership(IReadOnlyList<StoredOwnership>? rows, IReadOnlyList<StoredEntity> entities)
@@ -892,7 +939,8 @@ public sealed class AetherReducer
         op.OwnerId!,
         new FieldVersion(op.Lamport, op.ActorId),
         op.Id,
-        op.Sequence);
+        op.Sequence,
+        op.Authority);
 
     private static void RequireCreation(StoredEntity entity)
     {
@@ -909,6 +957,11 @@ public sealed class AetherReducer
         if (!AetherActorId.TryParse(entity.Version.ActorId, out var actor)
             || !string.Equals(actor.PeerId, entity.CreatorId, StringComparison.Ordinal))
             throw new AetherProtocolException("Create actor is not its creator.");
+        RequireAuthorityWhenPresent(new AetherOperation(
+            entity.OperationId, entity.EntityId, entity.CreatorId, entity.Version.ActorId, entity.Sequence,
+            entity.Version.Lamport, new Dictionary<string, FieldValue>(), AetherEffect.CreateEntity,
+            entityTypeId: entity.EntityTypeId, creatorId: entity.CreatorId, ownerId: entity.OwnerId,
+            authority: entity.Authority));
     }
 
     private static void RejectEntityConflict(StoredEntity existing, StoredEntity candidate)
@@ -1292,14 +1345,16 @@ public sealed record StoredEntity(
     string OwnerId,
     FieldVersion Version,
     string OperationId,
-    long Sequence);
+    long Sequence,
+    AetherAuthorityProof? Authority = null);
 
 public sealed record StoredDeletion(
     string EntityId,
     string WriterId,
     FieldVersion Version,
     string OperationId,
-    long Sequence);
+    long Sequence,
+    AetherAuthorityProof? Authority = null);
 
 public sealed record StoredOwnership(
     string EntityId,
@@ -1309,7 +1364,8 @@ public sealed record StoredOwnership(
     long Generation,
     FieldVersion Version,
     string OperationId,
-    long Sequence);
+    long Sequence,
+    AetherAuthorityProof? Authority = null);
 
 public readonly record struct SeenOperation(string Id, string Digest, long Lamport);
 

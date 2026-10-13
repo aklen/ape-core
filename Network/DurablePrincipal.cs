@@ -18,7 +18,7 @@ namespace Ape.Core.Network;
 /// A recovered temporary file is opened exclusively, checked as a canonical P-256 key, flushed again, and only then renamed.
 /// An existing principal is accepted only after the profile directory is flushed again.
 /// The parent of the profile directory must already exist. Open may create the profile directory, and it flushes that parent before it accepts the principal.
-/// A damaged or shared file does not open. Possession of this key is not create, owner, or delete authority.
+/// A damaged or shared file does not open. Possession of this key proves authorship when it signs an operation; reducer rules grant authority.
 /// </summary>
 public sealed class DurablePrincipal : IDisposable
 {

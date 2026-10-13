@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
+using Ape.Core.Network;
 
 namespace Ape.Core.Aether;
 
@@ -14,7 +15,7 @@ public static class AetherWire
     public const byte CreateType = 0x32;
     public const byte DeleteType = 0x33;
     public const byte TransferType = 0x34;
-    public const ushort WireVersion = 1;
+    public const ushort WireVersion = 2;
     public const string LabelRule = "lww";
     public const int MaxPacketBytes = 65_536;
     public const int MaxFieldCount = 64;
@@ -85,6 +86,7 @@ public static class AetherWire
         ReserveText(ref size, op.EntityTypeId!);
         ReserveText(ref size, op.CreatorId!);
         ReserveText(ref size, op.OwnerId!);
+        ReserveProof(ref size, op.Authority);
 
         using var body = new MemoryStream(size);
         body.WriteByte(CreateType);
@@ -98,6 +100,7 @@ public static class AetherWire
         WriteText(body, op.EntityTypeId!);
         WriteText(body, op.CreatorId!);
         WriteText(body, op.OwnerId!);
+        WriteProof(body, op.Authority);
         return WithChecksum(body.ToArray());
     }
 
@@ -110,6 +113,7 @@ public static class AetherWire
         ReserveText(ref size, op.WriterId);
         ReserveText(ref size, op.ActorId);
         Reserve(ref size, 8 + 8);
+        ReserveProof(ref size, op.Authority);
 
         using var body = new MemoryStream(size);
         body.WriteByte(DeleteType);
@@ -120,6 +124,7 @@ public static class AetherWire
         WriteText(body, op.ActorId);
         WriteI64(body, op.Sequence);
         WriteI64(body, op.Lamport);
+        WriteProof(body, op.Authority);
         return WithChecksum(body.ToArray());
     }
 
@@ -127,15 +132,26 @@ public static class AetherWire
     {
         var size = 0;
         Reserve(ref size, 1 + 2);
-        ReserveText(ref size, op.Id); ReserveText(ref size, op.EntityId); ReserveText(ref size, op.WriterId);
-        ReserveText(ref size, op.ActorId); Reserve(ref size, 16);
-        ReserveText(ref size, op.NewOwnerId!); ReserveText(ref size, op.PriorOwnerOperationId!);
+        ReserveText(ref size, op.Id);
+        ReserveText(ref size, op.EntityId);
+        ReserveText(ref size, op.WriterId);
+        ReserveText(ref size, op.ActorId);
+        Reserve(ref size, 16);
+        ReserveText(ref size, op.NewOwnerId!);
+        ReserveText(ref size, op.PriorOwnerOperationId!);
+        ReserveProof(ref size, op.Authority);
         using var body = new MemoryStream(size);
         body.WriteByte(TransferType);
         WriteU16(body, WireVersion);
-        WriteText(body, op.Id); WriteText(body, op.EntityId); WriteText(body, op.WriterId); WriteText(body, op.ActorId);
-        WriteI64(body, op.Sequence); WriteI64(body, op.Lamport);
-        WriteText(body, op.NewOwnerId!); WriteText(body, op.PriorOwnerOperationId!);
+        WriteText(body, op.Id);
+        WriteText(body, op.EntityId);
+        WriteText(body, op.WriterId);
+        WriteText(body, op.ActorId);
+        WriteI64(body, op.Sequence);
+        WriteI64(body, op.Lamport);
+        WriteText(body, op.NewOwnerId!);
+        WriteText(body, op.PriorOwnerOperationId!);
+        WriteProof(body, op.Authority);
         return WithChecksum(body.ToArray());
     }
 
@@ -306,6 +322,7 @@ public static class AetherWire
         var entityTypeId = reader.Text();
         var creatorId = reader.Text();
         var ownerId = reader.Text();
+        var authority = ReadProof(ref reader);
         reader.End();
         if (!string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
             throw new AetherProtocolException("Entity is not on this link.");
@@ -320,7 +337,8 @@ public static class AetherWire
             AetherEffect.CreateEntity,
             entityTypeId: entityTypeId,
             creatorId: creatorId,
-            ownerId: ownerId);
+            ownerId: ownerId,
+            authority: authority);
     }
 
     private static AetherOperation DecodeDelete(ref Reader reader, string entityId)
@@ -331,6 +349,7 @@ public static class AetherWire
         var actorId = reader.Text();
         var sequence = reader.I64();
         var lamport = reader.I64();
+        var authority = ReadProof(ref reader);
         reader.End();
         if (!string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
             throw new AetherProtocolException("Entity is not on this link.");
@@ -342,19 +361,60 @@ public static class AetherWire
             sequence,
             lamport,
             new Dictionary<string, FieldValue>(),
-            AetherEffect.DeleteEntity);
+            AetherEffect.DeleteEntity,
+            authority: authority);
     }
 
     private static AetherOperation DecodeTransfer(ref Reader reader, string entityId)
     {
-        var id = reader.Text(); var encodedEntity = reader.Text(); var writerId = reader.Text(); var actorId = reader.Text();
-        var sequence = reader.I64(); var lamport = reader.I64(); var newOwnerId = reader.Text(); var prior = reader.Text();
+        var id = reader.Text();
+        var encodedEntity = reader.Text();
+        var writerId = reader.Text();
+        var actorId = reader.Text();
+        var sequence = reader.I64();
+        var lamport = reader.I64();
+        var newOwnerId = reader.Text();
+        var prior = reader.Text();
+        var authority = ReadProof(ref reader);
         reader.End();
         if (!string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
             throw new AetherProtocolException("Entity is not on this link.");
         return new AetherOperation(id, encodedEntity, writerId, actorId, sequence, lamport,
             new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
-            newOwnerId: newOwnerId, priorOwnerOperationId: prior);
+            newOwnerId: newOwnerId, priorOwnerOperationId: prior, authority: authority);
+    }
+
+    private static void ReserveProof(ref int size, AetherAuthorityProof? proof)
+    {
+        Reserve(ref size, 4);
+        if (proof is null)
+            return;
+        Reserve(ref size, proof.PublicKey.Length + proof.Signature.Length);
+    }
+
+    private static void WriteProof(Stream body, AetherAuthorityProof? proof)
+    {
+        WriteU16(body, checked((ushort)(proof is null ? 0 : proof.PublicKey.Length)));
+        if (proof is not null) body.Write(proof.PublicKey);
+        WriteU16(body, checked((ushort)(proof is null ? 0 : proof.Signature.Length)));
+        if (proof is not null) body.Write(proof.Signature);
+    }
+
+    private static AetherAuthorityProof? ReadProof(ref Reader reader)
+    {
+        var keyLength = reader.U16();
+        if (keyLength > PrincipalHandshake.MaxPublicKeyBytes)
+            throw new AetherProtocolException("Authority proof is invalid.");
+        var key = reader.Bytes(keyLength);
+        var signatureLength = reader.U16();
+        if (signatureLength > PrincipalHandshake.MaxSignatureBytes)
+            throw new AetherProtocolException("Authority proof is invalid.");
+        var signature = reader.Bytes(signatureLength);
+        if (keyLength == 0 && signatureLength == 0)
+            return null;
+        if (keyLength == 0 || signatureLength == 0)
+            throw new AetherProtocolException("Authority proof is invalid.");
+        return new AetherAuthorityProof(key, signature);
     }
 
     private static IReadOnlyList<StoredField> DecodeContributions(byte[] data)
@@ -479,6 +539,8 @@ public static class AetherWire
                 throw new AetherProtocolException(PacketTooLarge);
             return Encoding.UTF8.GetString(Take((int)length));
         }
+
+        public byte[] Bytes(int count) => Take(count).ToArray();
 
         public void End()
         {

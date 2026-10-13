@@ -98,7 +98,7 @@ public sealed class AetherLabelLinkTests
             3,
             new Dictionary<string, FieldValue> { ["label"] = FieldValue.Label("beta") }));
         packet[1] = 0;
-        packet[2] = 2;
+        packet[2] = 3;
         var hash = System.Security.Cryptography.SHA256.HashData(packet.AsSpan(0, packet.Length - 32));
         hash.CopyTo(packet, packet.Length - 32);
         left.Transport.Deliver("peer-b", packet);

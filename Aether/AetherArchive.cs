@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
+using Ape.Core.Network;
 
 namespace Ape.Core.Aether;
 
@@ -12,7 +13,7 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    private const ushort FormatVersion = 8;
+    private const ushort FormatVersion = 9;
     private const byte ContributionRecord = 0x10;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;
@@ -279,6 +280,7 @@ public sealed class AetherArchive
             var version = new FieldVersion(reader.I64(), reader.Text());
             var operationId = reader.Text();
             var sequence = reader.I64();
+            var authority = ReadProof(reader);
             entities.Add(new StoredEntity(
                 entityId,
                 entityTypeId,
@@ -286,7 +288,8 @@ public sealed class AetherArchive
                 ownerId,
                 version,
                 operationId,
-                sequence));
+                sequence,
+                authority));
         }
 
         return entities;
@@ -303,7 +306,8 @@ public sealed class AetherArchive
             var version = new FieldVersion(reader.I64(), reader.Text());
             var operationId = reader.Text();
             var sequence = reader.I64();
-            deletions.Add(new StoredDeletion(entityId, writerId, version, operationId, sequence));
+            var authority = ReadProof(reader);
+            deletions.Add(new StoredDeletion(entityId, writerId, version, operationId, sequence, authority));
         }
 
         return deletions;
@@ -314,8 +318,18 @@ public sealed class AetherArchive
         var count = checked((int)reader.U32());
         var rows = new List<StoredOwnership>(count);
         for (var i = 0; i < count; i++)
-            rows.Add(new StoredOwnership(reader.Text(), reader.Text(), reader.Text(), reader.Text(), reader.I64(),
-                new FieldVersion(reader.I64(), reader.Text()), reader.Text(), reader.I64()));
+        {
+            var entityId = reader.Text();
+            var previousOwnerId = reader.Text();
+            var ownerId = reader.Text();
+            var priorOperationId = reader.Text();
+            var generation = reader.I64();
+            var version = new FieldVersion(reader.I64(), reader.Text());
+            var operationId = reader.Text();
+            var sequence = reader.I64();
+            rows.Add(new StoredOwnership(entityId, previousOwnerId, ownerId, priorOperationId, generation,
+                version, operationId, sequence, ReadProof(reader)));
+        }
         return rows;
     }
 
@@ -398,6 +412,7 @@ public sealed class AetherArchive
             WriteText(buffer, entity.Version.ActorId);
             WriteText(buffer, entity.OperationId);
             WriteI64(buffer, entity.Sequence);
+            WriteProof(buffer, entity.Authority);
         }
 
         WriteU32(buffer, (uint)(image.Deletions?.Count ?? 0));
@@ -409,6 +424,7 @@ public sealed class AetherArchive
             WriteText(buffer, deletion.Version.ActorId);
             WriteText(buffer, deletion.OperationId);
             WriteI64(buffer, deletion.Sequence);
+            WriteProof(buffer, deletion.Authority);
         }
 
         WriteU32(buffer, (uint)(image.Ownership?.Count ?? 0));
@@ -418,6 +434,7 @@ public sealed class AetherArchive
             WriteText(buffer, row.PriorOperationId); WriteI64(buffer, row.Generation);
             WriteI64(buffer, row.Version.Lamport); WriteText(buffer, row.Version.ActorId);
             WriteText(buffer, row.OperationId); WriteI64(buffer, row.Sequence);
+            WriteProof(buffer, row.Authority);
         }
 
         WriteU32(buffer, (uint)reducer.ActorCursors.Count);
@@ -446,6 +463,7 @@ public sealed class AetherArchive
         WriteText(buffer, op.OwnerId ?? "");
         WriteText(buffer, op.NewOwnerId ?? "");
         WriteText(buffer, op.PriorOwnerOperationId ?? "");
+        WriteProof(buffer, op.Authority);
         WriteI64(buffer, op.Sequence);
         WriteI64(buffer, op.Lamport);
         WriteU32(buffer, (uint)op.Changes.Count);
@@ -537,6 +555,7 @@ public sealed class AetherArchive
         var ownerId = reader.Text();
         var newOwnerId = reader.Text();
         var priorOwnerOperationId = reader.Text();
+        var authority = ReadProof(reader);
         var sequence = reader.I64();
         var lamport = reader.I64();
         var count = reader.U32();
@@ -571,7 +590,8 @@ public sealed class AetherArchive
             effect == AetherEffect.CreateEntity ? creatorId : null,
             effect == AetherEffect.CreateEntity ? ownerId : null,
             effect == AetherEffect.TransferOwnership ? newOwnerId : null,
-            effect == AetherEffect.TransferOwnership ? priorOwnerOperationId : null), clock);
+            effect == AetherEffect.TransferOwnership ? priorOwnerOperationId : null,
+            authority), clock);
     }
 
     private static byte[] Finish(ReadOnlySpan<byte> magic, long generation, byte[] body)
@@ -805,6 +825,31 @@ public sealed class AetherArchive
         var bytes = Encoding.UTF8.GetBytes(value);
         WriteU32(buffer, (uint)bytes.Length);
         buffer.Write(bytes);
+    }
+
+    private static void WriteProof(Stream buffer, AetherAuthorityProof? proof)
+    {
+        WriteU32(buffer, (uint)(proof is null ? 0 : proof.PublicKey.Length));
+        if (proof is not null) buffer.Write(proof.PublicKey);
+        WriteU32(buffer, (uint)(proof is null ? 0 : proof.Signature.Length));
+        if (proof is not null) buffer.Write(proof.Signature);
+    }
+
+    private static AetherAuthorityProof? ReadProof(Reader reader)
+    {
+        var keyLength = reader.U32();
+        if (keyLength > PrincipalHandshake.MaxPublicKeyBytes)
+            throw new AetherProtocolException("Authority proof is invalid.");
+        var key = reader.Bytes((int)keyLength);
+        var signatureLength = reader.U32();
+        if (signatureLength > PrincipalHandshake.MaxSignatureBytes)
+            throw new AetherProtocolException("Authority proof is invalid.");
+        var signature = reader.Bytes((int)signatureLength);
+        if (keyLength == 0 && signatureLength == 0)
+            return null;
+        if (keyLength == 0 || signatureLength == 0)
+            throw new AetherProtocolException("Authority proof is invalid.");
+        return new AetherAuthorityProof(key, signature);
     }
 
     private static void WriteU32(Stream buffer, uint value)

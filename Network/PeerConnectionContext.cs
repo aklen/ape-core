@@ -6,7 +6,7 @@ namespace Ape.Core.Network;
 /// <see cref="PrincipalId"/> is the remote profile's public-key fingerprint, or a claim when no key was checked.
 /// It is not the process instance id.
 /// <see cref="IsAuthenticated"/> is true only after the signed handshake checks.
-/// That proof is not create, owner, or delete authority.
+/// That proof is not by itself create, owner, or delete authority.
 /// </summary>
 public readonly record struct PeerConnectionContext(
     string ConnectionId,
