@@ -27,9 +27,23 @@ public struct AetherScratch
     public string? SceneEntityKey;
     public string? LabelPropertyName;
     public string? SumPropertyName;
+    public bool ProjectScene;
+    public List<AetherSceneRow>? SceneRows;
     public List<ISceneCommitRequest>? SceneCommits;
     public List<AetherOutcome>? Outcomes;
 }
+
+/// <summary>
+/// One living or deleted entity projected by the scene link. The commit stage walks these rows in one tick.
+/// </summary>
+public readonly record struct AetherSceneRow(
+    string EntityId,
+    string TypeId,
+    string CreatorId,
+    string OwnerId,
+    bool Deleted,
+    string? Label,
+    long Sum);
 
 public static class AetherFrame
 {
@@ -81,6 +95,12 @@ public static class AetherFrame
 
         public void Execute(ref AetherScratch scratch)
         {
+            if (scratch.ProjectScene)
+            {
+                ResolveScene(ref scratch);
+                return;
+            }
+
             scratch.ResolvedDeleted = scratch.Reducer.IsDeleted(scratch.EntityId);
             scratch.ResolvedEntity = scratch.Reducer.GetEntity(scratch.EntityId);
             scratch.ResolvedSharedVisible = scratch.Reducer.IsSharedVisible(scratch.EntityId);
@@ -98,6 +118,34 @@ public static class AetherFrame
             if (!string.IsNullOrEmpty(scratch.SumFieldId))
                 scratch.ResolvedSum = scratch.Reducer.ResolveSum(scratch.EntityId, scratch.SumFieldId);
         }
+
+        private static void ResolveScene(ref AetherScratch scratch)
+        {
+            scratch.SceneRows ??= new List<AetherSceneRow>();
+            scratch.SceneRows.Clear();
+            foreach (var entity in scratch.Reducer.Entities)
+            {
+                var deleted = scratch.Reducer.IsDeleted(entity.EntityId);
+                var visible = scratch.Reducer.IsSharedVisible(entity.EntityId);
+                string? label = null;
+                long sum = 0;
+                if (!deleted && visible)
+                {
+                    label = scratch.Reducer.ResolveLww(entity.EntityId, scratch.LabelFieldId)?.Text;
+                    if (!string.IsNullOrEmpty(scratch.SumFieldId))
+                        sum = scratch.Reducer.ResolveSum(entity.EntityId, scratch.SumFieldId);
+                }
+
+                scratch.SceneRows.Add(new AetherSceneRow(
+                    entity.EntityId,
+                    entity.EntityTypeId,
+                    entity.CreatorId,
+                    scratch.Reducer.GetOwner(entity.EntityId) ?? entity.OwnerId,
+                    deleted,
+                    label,
+                    sum));
+            }
+        }
     }
 
     private sealed class SceneCommitStage : IStage<AetherScratch>
@@ -108,6 +156,12 @@ public static class AetherFrame
         {
             scratch.SceneCommits ??= new List<ISceneCommitRequest>();
             scratch.SceneCommits.Clear();
+            if (scratch.ProjectScene)
+            {
+                CommitScene(ref scratch);
+                return;
+            }
+
             if (string.IsNullOrEmpty(scratch.SceneEntityKey))
                 return;
 
@@ -140,6 +194,42 @@ public static class AetherFrame
                     scratch.SceneEntityKey,
                     scratch.SumPropertyName,
                     scratch.ResolvedSum));
+            }
+        }
+
+        private static void CommitScene(ref AetherScratch scratch)
+        {
+            if (scratch.SceneRows is null)
+                return;
+
+            foreach (var row in scratch.SceneRows)
+            {
+                if (row.Deleted)
+                {
+                    scratch.SceneCommits!.Add(new RemoveRegisteredEntityCommitRequest(row.EntityId));
+                    continue;
+                }
+
+                scratch.SceneCommits!.Add(new EnsureAetherEntityCommitRequest(
+                    row.TypeId,
+                    row.EntityId,
+                    row.CreatorId,
+                    row.OwnerId));
+                if (!string.IsNullOrEmpty(scratch.LabelPropertyName))
+                {
+                    scratch.SceneCommits.Add(new SetSceneEntityPropertyCommitRequest(
+                        row.EntityId,
+                        scratch.LabelPropertyName,
+                        row.Label));
+                }
+
+                if (!string.IsNullOrEmpty(scratch.SumPropertyName))
+                {
+                    scratch.SceneCommits.Add(new SetSceneEntityPropertyCommitRequest(
+                        row.EntityId,
+                        scratch.SumPropertyName,
+                        row.Sum));
+                }
             }
         }
     }

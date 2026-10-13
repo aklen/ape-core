@@ -950,6 +950,155 @@ public sealed class AetherHandshakeTests
         AssertAuthenticated(left, left.Slot, right.Principal.Id);
     }
 
+    [Fact]
+    public void Three_authenticated_peers_project_two_entities_once()
+    {
+        var time = new ManualTime();
+        using var aDir = new TempDir();
+        using var bDir = new TempDir();
+        using var cDir = new TempDir();
+        using var a = Side.Create(aDir.Path, time);
+        using var b = Side.Create(bDir.Path, time);
+        using var c = Side.Create(cDir.Path, time);
+        var aServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var bServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var cServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var aScene = aServices.GetRequiredService<ISceneManager>();
+        var bScene = bServices.GetRequiredService<ISceneManager>();
+        var cScene = cServices.GetRequiredService<ISceneManager>();
+        var aStore = SceneStore();
+        var bStore = SceneStore();
+        var cStore = SceneStore();
+        using var aLink = SceneLink(a, aStore, aServices);
+        using var bLink = SceneLink(b, bStore, bServices);
+        using var cLink = SceneLink(c, cStore, cServices);
+
+        Exchange(a, b);
+        var bFromA = b.Slot;
+        Exchange(a, c);
+        var cFromA = c.Slot;
+        Exchange(b, c);
+
+        Assert.Equal(AetherAdmitKind.Queued, aLink.SubmitCreate("cube", TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, aLink.SubmitCreate("sphere", TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, aLink.SubmitLabel("cube", "red").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, aLink.SubmitOffset("cube", 4).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, aLink.SubmitLabel("sphere", "blue").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, aLink.SubmitOffset("sphere", 9).Kind);
+        var sent = a.Transport.Sent.Count;
+        aLink.Pump();
+        DeliverNew(a, sent, b, bFromA, c, cFromA);
+        bLink.Pump();
+        cLink.Pump();
+
+        AssertScene(aScene, aStore, a.Principal.Id);
+        AssertScene(bScene, bStore, a.Principal.Id);
+        AssertScene(cScene, cStore, a.Principal.Id);
+        var cube = bScene.GetEntity("cube");
+        var sphere = bScene.GetEntity("sphere");
+        bLink.Pump();
+        Assert.Same(cube, bScene.GetEntity("cube"));
+        Assert.Same(sphere, bScene.GetEntity("sphere"));
+
+        ((SceneManager)bScene).DeliverReplica(new Ape.Core.Event.Models.ReplicaReceivedEvent
+        {
+            ReplicaId = "cube",
+            OwnerId = "intruder",
+            TypeName = typeof(TestStubEntity).AssemblyQualifiedName!,
+            Payload = [1],
+            SenderId = "replica",
+        });
+        Assert.Same(cube, bScene.GetEntity("cube"));
+        Assert.Equal(a.Principal.Id, Assert.IsType<TestStubEntity>(cube).OwnerId);
+
+        b.Transport.DisconnectSlot(bFromA);
+        Assert.Same(cube, bScene.GetEntity("cube"));
+        Assert.Same(sphere, bScene.GetEntity("sphere"));
+        Assert.Equal("red", Assert.IsType<TestStubEntity>(bScene.GetEntity("cube")).Label);
+        Assert.Equal(9, Assert.IsType<TestStubEntity>(cScene.GetEntity("sphere")).Offset);
+
+        var again = cScene.GetEntity("cube");
+        var catchUp = a.Transport.Sent.Count;
+        aLink.CatchUp();
+        aLink.Pump();
+        DeliverNew(a, catchUp, b, bFromA, c, cFromA);
+        cLink.Pump();
+        Assert.Same(again, cScene.GetEntity("cube"));
+        Assert.Equal("blue", Assert.IsType<TestStubEntity>(cScene.GetEntity("sphere")).Label);
+    }
+
+    [Fact]
+    public void A_full_scene_queue_does_not_create_the_second_entity()
+    {
+        var time = new ManualTime();
+        using var dir = new TempDir();
+        using var side = Side.Create(dir.Path, time);
+        var services = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var scene = services.GetRequiredService<ISceneManager>();
+        var store = SceneStore();
+        using var link = new AetherSceneLink(
+            side.Network,
+            new AetherHost(store, 4096, 1),
+            scene,
+            services.GetRequiredService<ILogger>(),
+            side.Principal.Id,
+            "session-1");
+
+        Assert.Equal(AetherAdmitKind.Queued, link.SubmitCreate("cube", TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Full, link.SubmitCreate("sphere", TestStubEntity.RegistryTypeId).Kind);
+        link.Pump();
+
+        Assert.IsType<TestStubEntity>(scene.GetEntity("cube"));
+        Assert.Null(scene.GetEntity("sphere"));
+        Assert.Null(store.GetEntity("sphere"));
+    }
+
+    private static void DeliverNew(Side sender, int sentBefore, Side left, string leftSlot, Side right, string rightSlot)
+    {
+        var seen = new List<byte[]>();
+        foreach (var packet in sender.Transport.Sent.Skip(sentBefore))
+        {
+            if (seen.Any(existing => existing.AsSpan().SequenceEqual(packet)))
+                continue;
+            seen.Add(packet);
+            left.Transport.DeliverSlot(leftSlot, packet);
+            right.Transport.DeliverSlot(rightSlot, packet);
+        }
+    }
+
+    private static void AssertScene(ISceneManager scene, AetherReducer store, string principal)
+    {
+        var cube = Assert.IsType<TestStubEntity>(scene.GetEntity("cube"));
+        var sphere = Assert.IsType<TestStubEntity>(scene.GetEntity("sphere"));
+        Assert.Equal("red", cube.Label);
+        Assert.Equal(4, cube.Offset);
+        Assert.Equal("blue", sphere.Label);
+        Assert.Equal(9, sphere.Offset);
+        Assert.Equal(principal, cube.OwnerId);
+        Assert.Equal(principal, sphere.OwnerId);
+        Assert.Equal(principal, store.GetEntity("cube")!.CreatorId);
+        Assert.Equal(principal, store.GetEntity("sphere")!.CreatorId);
+        Assert.Equal(principal, store.GetOwner("cube"));
+        Assert.Equal(principal, store.GetOwner("sphere"));
+        Assert.Null(scene.GetEntity("extra"));
+    }
+
+    private static AetherSceneLink SceneLink(Side side, AetherReducer store, IServiceProvider services) =>
+        new(
+            side.Network,
+            new AetherHost(store, 65_536, 64),
+            services.GetRequiredService<ISceneManager>(),
+            services.GetRequiredService<ILogger>(),
+            side.Principal.Id,
+            "session-1");
+
+    private static AetherReducer SceneStore()
+    {
+        var reducer = Store();
+        reducer.DefineField("offset", "sumContributions");
+        return reducer;
+    }
+
     private static Completed Exchange(Side left, Side right)
     {
         left.Open();

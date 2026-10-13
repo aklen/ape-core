@@ -32,6 +32,7 @@ public class SceneManager : ISceneManager, ICoreService
     private readonly ConcurrentDictionary<string, INode> _nodes = new();
     private readonly ConcurrentDictionary<string, INode> _nodesByPath = new();
     private readonly ConcurrentDictionary<string, IEntity> _entities = new();
+    private readonly HashSet<string> _aetherEntities = new(StringComparer.Ordinal);
     private readonly object _pathGenerationLock = new object();
     private IReplicaManager _replicaManager = null!;  // Set in Initialize()
     private IEventManager _eventManager = null!;      // Set in Initialize()
@@ -126,8 +127,29 @@ public class SceneManager : ISceneManager, ICoreService
         }
     }
 
+    /// <summary>
+    /// The reducer already stores this id. A replica create must not build a second object.
+    /// </summary>
+    internal void NoteAetherEntity(string entityId)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(entityId);
+        _aetherEntities.Add(entityId);
+    }
+
+    internal void DeliverReplica(ReplicaReceivedEvent evt)
+    {
+        using (SceneMutationScope.Begin())
+            OnReplicaReceivedCore(evt);
+    }
+
     private void OnReplicaReceivedCore(ReplicaReceivedEvent evt)
     {
+        if (_aetherEntities.Contains(evt.ReplicaId))
+        {
+            _logger.LogWarning($"[SceneManager] Remote entity '{evt.ReplicaId}' is projected by Aether — skip");
+            return;
+        }
+
         _logger.LogDebug($"🔥 [SceneManager] OnReplicaReceived CALLED for '{evt.ReplicaId}' of type '{evt.TypeName}'");
         _logger.LogDebug($"[SceneManager] Received ReplicaReceivedEvent for '{evt.ReplicaId}' of type '{evt.TypeName}'");
 

@@ -200,6 +200,10 @@ does not prove convergence. Keep local and remote durable operations on the
 same admission path. Only the designated COMMIT stage writes the scene.
 Disk and socket work must not block the tick; completion arrives through a
 bounded inbox. Pending lookup never turns an Update into a Create.
+A scene link may project every living entity of one registered type through
+those same three stages. The commit stage iterates the entities. It does not
+add a stage or a host drain per entity. The projected fields are the label and
+one sum. The replica create path does not create an id the reducer already stores.
 
 ## Treat persistence as protocol state
 

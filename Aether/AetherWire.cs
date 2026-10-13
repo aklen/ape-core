@@ -261,7 +261,27 @@ public static class AetherWire
         }
     }
 
-    private static AetherOperation Decode(byte[] data, string entityId, string fieldId)
+    /// <summary>
+    /// Reads a lifecycle or label packet without pinning one entity or one field.
+    /// The caller decides which entities and fields belong on its link.
+    /// </summary>
+    public static bool TryDecodeAny(byte[] data, out AetherOperation? operation, out string? fault)
+    {
+        try
+        {
+            operation = Decode(data, null, null);
+            fault = null;
+            return true;
+        }
+        catch (AetherProtocolException ex)
+        {
+            operation = null;
+            fault = ex.Message;
+            return false;
+        }
+    }
+
+    private static AetherOperation Decode(byte[] data, string? entityId, string? fieldId)
     {
         if (data.Length < 33 || data.Length > MaxPacketBytes
             || (data[0] != PacketType && data[0] != CreateType && data[0] != DeleteType && data[0] != TransferType))
@@ -296,9 +316,9 @@ public static class AetherWire
         var encodedField = reader.Text();
         var label = reader.Text();
         reader.End();
-        if (!string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
+        if (entityId is not null && !string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
             throw new AetherProtocolException("Entity is not on this link.");
-        if (!string.Equals(encodedField, fieldId, StringComparison.Ordinal))
+        if (fieldId is not null && !string.Equals(encodedField, fieldId, StringComparison.Ordinal))
             throw new AetherProtocolException("Field is not on this link.");
 
         return new AetherOperation(
@@ -311,7 +331,7 @@ public static class AetherWire
             new Dictionary<string, FieldValue> { [encodedField] = FieldValue.Label(label) });
     }
 
-    private static AetherOperation DecodeCreate(ref Reader reader, string entityId)
+    private static AetherOperation DecodeCreate(ref Reader reader, string? entityId)
     {
         var id = reader.Text();
         var encodedEntity = reader.Text();
@@ -324,7 +344,7 @@ public static class AetherWire
         var ownerId = reader.Text();
         var authority = ReadProof(ref reader);
         reader.End();
-        if (!string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
+        if (entityId is not null && !string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
             throw new AetherProtocolException("Entity is not on this link.");
         return new AetherOperation(
             id,
@@ -341,7 +361,7 @@ public static class AetherWire
             authority: authority);
     }
 
-    private static AetherOperation DecodeDelete(ref Reader reader, string entityId)
+    private static AetherOperation DecodeDelete(ref Reader reader, string? entityId)
     {
         var id = reader.Text();
         var encodedEntity = reader.Text();
@@ -351,7 +371,7 @@ public static class AetherWire
         var lamport = reader.I64();
         var authority = ReadProof(ref reader);
         reader.End();
-        if (!string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
+        if (entityId is not null && !string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
             throw new AetherProtocolException("Entity is not on this link.");
         return new AetherOperation(
             id,
@@ -365,7 +385,7 @@ public static class AetherWire
             authority: authority);
     }
 
-    private static AetherOperation DecodeTransfer(ref Reader reader, string entityId)
+    private static AetherOperation DecodeTransfer(ref Reader reader, string? entityId)
     {
         var id = reader.Text();
         var encodedEntity = reader.Text();
@@ -377,7 +397,7 @@ public static class AetherWire
         var prior = reader.Text();
         var authority = ReadProof(ref reader);
         reader.End();
-        if (!string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
+        if (entityId is not null && !string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
             throw new AetherProtocolException("Entity is not on this link.");
         return new AetherOperation(id, encodedEntity, writerId, actorId, sequence, lamport,
             new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,

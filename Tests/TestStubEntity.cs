@@ -19,4 +19,7 @@ internal sealed partial class TestStubEntity : Entity
 
     [Key(104)]
     public string? Label { get; set; }
+
+    [Key(105)]
+    public long Offset { get; set; }
 }
