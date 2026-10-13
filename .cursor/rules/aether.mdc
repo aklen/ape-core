@@ -226,6 +226,12 @@ only detects damage. Verify exact chunk length and hash before storage, verify s
 chunks again on resume and assembly, and verify the complete pinned artifact before
 installing it. Resume from verified chunks rather than retaining a full transfer in
 RAM. Give requests and chunk sends a fair budget beside state updates and live media.
+Treat QUIC as the primary transport. Put bounded bulk traffic on a persistent QUIC
+stream separate from reliable scene state; never open one QUIC stream per Aether
+chunk. A synchronous admission result means only that the bounded transport queue
+accepted the bytes. Keep the application packet queued when admission is full.
+Require an explicit reader-principal set for published checkpoints; successful
+handshake authentication alone is not authorization to read scene state.
 
 ## Test contracts, not just implementation agreement
 

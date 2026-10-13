@@ -139,7 +139,7 @@ public static class ApeSystem
         var networkModuleEnabled = moduleTable.IsModuleEnabled(coreConfig, NetworkModuleIds.ModuleId);
         var enableNetwork = networkModuleEnabled && (networkSection?.GetBool("enabled") ?? false);
         var networkTransportType = enableNetwork
-            ? (networkSection?.GetString("transport", "none") ?? "none")
+            ? (networkSection?.GetString("transport", "quic") ?? "quic")
             : "none";
 
         var serviceCollection = new ServiceCollection();

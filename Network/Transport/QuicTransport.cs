@@ -16,9 +16,9 @@ namespace Ape.Core.Network.Transport;
 /// Provides TLS 1.3 encrypted communication with multiplexed streams.
 /// <para>
 /// Phase C: app data uses persistent unidirectional streams with length-prefixed
-/// framing (not one stream per message). <see cref="SendReliable"/> and
-/// <see cref="SendUnreliable"/> each keep a dedicated outbound stream per peer so
-/// telemetry is not head-of-line blocked behind large media writes.
+/// framing (not one stream per message). <see cref="SendReliable"/>,
+/// <see cref="SendUnreliable"/>, and the bounded bulk plane each keep a dedicated
+/// outbound stream per peer so scene state is not head-of-line blocked behind chunks.
 /// Native QUIC datagrams are not yet exposed by System.Net.Quic — unreliable
 /// traffic still rides a reliable stream until that API lands.
 /// </para>
@@ -26,7 +26,7 @@ namespace Ape.Core.Network.Transport;
 [SupportedOSPlatform("linux")]
 [SupportedOSPlatform("macos")]
 [SupportedOSPlatform("windows")]
-public class QuicTransport : INetworkTransport
+public class QuicTransport : INetworkTransport, IBulkNetworkTransport
 {
     private const byte MessageTypeNormal = 0;
     private const byte MessageTypeFileChunk = 1;
@@ -36,6 +36,9 @@ public class QuicTransport : INetworkTransport
 
     /// <summary>Upper bound for a single framed app-data payload (media keyframes can be multi‑MB).</summary>
     private const int MaxFramedMessageBytes = 64 * 1024 * 1024;
+    private const int MaxBulkPacketBytes = 272 * 1024;
+    private const int MaxBulkQueuedBytes = 4 * 1024 * 1024;
+    private const int MaxBulkQueuedPackets = 64;
 
     private string _transportType = "quic";
 
@@ -64,6 +67,11 @@ public class QuicTransport : INetworkTransport
     {
         public readonly OutboundChannel Reliable = new("reliable");
         public readonly OutboundChannel Unreliable = new("unreliable");
+        public readonly OutboundChannel Bulk = new("bulk");
+        public readonly object BulkGate = new();
+        public readonly Queue<byte[]> BulkQueue = new();
+        public int BulkBytes;
+        public bool BulkDraining;
     }
 
     private sealed class OutboundChannel(string name)
@@ -320,14 +328,26 @@ public class QuicTransport : INetworkTransport
 
         DisposeOutboundChannel(peerId, channels.Reliable);
         DisposeOutboundChannel(peerId, channels.Unreliable);
+        DisposeOutboundChannel(peerId, channels.Bulk);
+        lock (channels.BulkGate)
+        {
+            channels.BulkQueue.Clear();
+            channels.BulkBytes = 0;
+            channels.BulkDraining = false;
+        }
     }
 
     private void DisposeOutboundChannel(string peerId, OutboundChannel channel)
     {
+        var entered = false;
         try
         {
             if (!channel.WriteLock.Wait(TimeSpan.FromSeconds(1)))
+            {
                 _logger.LogWarning($"[QuicTransport] Timed out waiting to dispose {channel.Name} stream for peer {peerId}");
+                return;
+            }
+            entered = true;
         }
         catch (ObjectDisposedException)
         {
@@ -343,7 +363,8 @@ public class QuicTransport : INetworkTransport
         }
         finally
         {
-            try { channel.WriteLock.Release(); } catch (ObjectDisposedException) { /* ignore */ }
+            if (entered)
+                try { channel.WriteLock.Release(); } catch (ObjectDisposedException) { /* ignore */ }
         }
     }
 
@@ -539,7 +560,7 @@ public class QuicTransport : INetworkTransport
         if (!_isRunning || data == null)
             return;
 
-        _ = SendFramedAsync(peerId, data, unreliable: false);
+        _ = SendFramedAsync(peerId, data, unreliable: false, bulk: false);
     }
 
     public void SendUnreliable(string peerId, byte[] data)
@@ -549,10 +570,50 @@ public class QuicTransport : INetworkTransport
 
         // Separate persistent stream (not datagrams — System.Net.Quic has no datagram API yet).
         // Keeps telemetry off the media write lock / stream HOL queue.
-        _ = SendFramedAsync(peerId, data, unreliable: true);
+        _ = SendFramedAsync(peerId, data, unreliable: true, bulk: false);
     }
 
-    private async Task SendFramedAsync(string peerId, byte[] data, bool unreliable)
+    public bool TrySendBulk(string peerId, byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        if (!_isRunning || !_connections.ContainsKey(peerId) || data.Length > MaxBulkPacketBytes)
+            return false;
+        var channels = _peerSendChannels.GetOrAdd(peerId, static _ => new PeerSendChannels());
+        lock (channels.BulkGate)
+        {
+            if (channels.BulkQueue.Count >= MaxBulkQueuedPackets
+                || channels.BulkBytes > MaxBulkQueuedBytes - data.Length)
+                return false;
+            channels.BulkQueue.Enqueue(data.ToArray());
+            channels.BulkBytes += data.Length;
+            if (channels.BulkDraining)
+                return true;
+            channels.BulkDraining = true;
+        }
+        _ = DrainBulkAsync(peerId, channels);
+        return true;
+    }
+
+    private async Task DrainBulkAsync(string peerId, PeerSendChannels channels)
+    {
+        while (!_cts.IsCancellationRequested)
+        {
+            byte[] packet;
+            lock (channels.BulkGate)
+            {
+                if (channels.BulkQueue.Count == 0)
+                {
+                    channels.BulkDraining = false;
+                    return;
+                }
+                packet = channels.BulkQueue.Dequeue();
+                channels.BulkBytes -= packet.Length;
+            }
+            await SendFramedAsync(peerId, packet, unreliable: false, bulk: true);
+        }
+    }
+
+    private async Task SendFramedAsync(string peerId, byte[] data, bool unreliable, bool bulk)
     {
         if (!_connections.TryGetValue(peerId, out var connection))
             return;
@@ -565,7 +626,7 @@ public class QuicTransport : INetworkTransport
         }
 
         var channels = _peerSendChannels.GetOrAdd(peerId, static _ => new PeerSendChannels());
-        var channel = unreliable ? channels.Unreliable : channels.Reliable;
+        var channel = bulk ? channels.Bulk : unreliable ? channels.Unreliable : channels.Reliable;
 
         try
         {

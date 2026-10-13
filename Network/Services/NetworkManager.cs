@@ -21,7 +21,7 @@ namespace Ape.Core.Network.Services;
 [SupportedOSPlatform("linux")]
 [SupportedOSPlatform("macos")]
 [SupportedOSPlatform("windows")]
-public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, IDisposable
+public class NetworkManager : INetworkManager, IPrincipalSigner, IBulkNetworkSender, ICoreService, IDisposable
 {
     public string ServiceId => "core-network-manager";
     public string Name => "Network Manager";
@@ -71,6 +71,17 @@ public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, I
         return true;
     }
 
+    bool IBulkNetworkSender.TrySendBulk(string connectionId, byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        if (!_transport.GetConnectedPeers().Contains(connectionId, StringComparer.Ordinal))
+            return false;
+        if (_transport is IBulkNetworkTransport bulk)
+            return bulk.TrySendBulk(connectionId, data);
+        _transport.SendReliable(connectionId, data);
+        return true;
+    }
+
     /// <summary>
     /// Network role of this instance ("server", "client", "peer").
     /// </summary>
@@ -81,7 +92,7 @@ public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, I
     /// Transport must be created at construction time (not in Initialize).
     /// Logger will be resolved from DI in Initialize().
     /// </summary>
-    public NetworkManager(string transportType = "litenetlib", string? profileDirectory = null)
+    public NetworkManager(string transportType = "quic", string? profileDirectory = null)
     {
         // Temporary logger until DI provides the real one
         var tempLogger = new LogManager("console");

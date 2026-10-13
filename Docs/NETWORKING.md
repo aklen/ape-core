@@ -6,6 +6,8 @@ Covers replica broadcast and subscriptions, config-driven access control, and co
 
 **Related:** [ARCHITECTURE.md](https://github.com/aklen/ape-skeleton/blob/main/docs/ARCHITECTURE.md) · [DETERMINISM.md](./DETERMINISM.md)
 
+QUIC is the primary transport and the default when the network module is enabled without an explicit transport. Reliable scene state, best-effort/telemetry traffic, and bounded bulk transfer use separate persistent QUIC streams per peer. The checkpoint bulk sender has a bounded admission queue; application schedulers retain a packet and retry when that queue is full. LiteNetLib remains an explicit compatibility choice.
+
 ---
 
 # Part I — Replication design and roadmap
