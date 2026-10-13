@@ -82,6 +82,9 @@ public abstract class Replica : IReplica
 
     [IgnoreMember]
     private readonly HashSet<string> _yieldedToAether = new(StringComparer.Ordinal);
+
+    [IgnoreMember]
+    private bool _handledByAether;
     
     /// <summary>
     /// Internal setter for EventManager dependency.
@@ -124,6 +127,8 @@ public abstract class Replica : IReplica
     public virtual void Deserialize(ReadOnlyMemory<byte> data)
     {
         SceneMutationScope.ThrowIfInactive();
+        if (_handledByAether)
+            return;
         var type = GetType();
         var deserialized = MessagePackSerializer.Deserialize(type, data, GetMessagePackOptions());
         
@@ -297,6 +302,13 @@ public abstract class Replica : IReplica
         _yieldedToAether.Add(propertyName);
     }
 
+    /// <summary>
+    /// The reducer stores this entity. Replica create, update, and delete do not write it.
+    /// </summary>
+    public void YieldEntityToAether() => _handledByAether = true;
+
+    internal bool IsHandledByAether => _handledByAether;
+
     public void NotifyPropertyChanged(string propertyName)
     {
         OnPropertyChanged(propertyName);
@@ -308,6 +320,9 @@ public abstract class Replica : IReplica
     /// </summary>
     public bool HasChanges()
     {
+        if (_handledByAether)
+            return false;
+
         var properties = GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Where(p => p.CanRead && p.GetCustomAttribute<KeyAttribute>() != null);
         

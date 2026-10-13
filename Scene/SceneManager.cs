@@ -134,6 +134,8 @@ public class SceneManager : ISceneManager, ICoreService
     {
         ArgumentException.ThrowIfNullOrEmpty(entityId);
         _aetherEntities.Add(entityId);
+        if (_entities.TryGetValue(entityId, out var entity) && entity is Replica replica)
+            replica.YieldEntityToAether();
     }
 
     internal void DeliverReplica(ReplicaReceivedEvent evt)
@@ -364,6 +366,9 @@ public class SceneManager : ISceneManager, ICoreService
             replica.OwnerId = ownerId;
             replica.IsLocal = true;
         }
+
+        if (entity is Replica handled && _aetherEntities.Contains(dictionaryKey))
+            handled.YieldEntityToAether();
 
         if (entity is Base baseObj)
             baseObj.SceneManager = this;

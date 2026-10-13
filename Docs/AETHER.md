@@ -109,7 +109,7 @@ The same network gives each path its own limit and schedule. A large file copy m
 
 New work serves this replacement and writes those same scene objects. It does not grow a second scene graph.
 
-A field or entity that has moved is handled only here. The old deserialize path must not write it. Projecting a resolved value into the scene is not a local edit, so that write must not be sent again.
+A field or entity that has moved is handled only here. The old deserialize path must not write it. Projecting a resolved value into the scene is not a local edit, so that write must not be sent again. A scene entity the reducer stores is marked before the replica registry accepts it. A replica create, update, full sync, or initial sync does not write or announce that entity. A replica delete leaves it in place. The scene commit removes it when the reducer stores the tombstone. An entity the reducer does not store still follows the replica path.
 
 A current Create, Update, or FullSync blob is not an operation. It does not carry field versions, the original writer, or the rule version. Those travel in a versioned wire format. The receiver does not invent them from arrival order.
 

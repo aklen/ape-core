@@ -7,6 +7,7 @@ using Ape.Core.Logging;
 using Ape.Core.Network;
 using Ape.Core.Network.Services;
 using Ape.Core.Network.Transport;
+using Ape.Core.Replication;
 using Ape.Core.Scene;
 using Ape.Core.Scene.Commit;
 using Microsoft.Extensions.DependencyInjection;
@@ -1331,6 +1332,56 @@ public sealed class AetherHandshakeTests
         Assert.IsType<TestStubEntity>(ownerServices.GetRequiredService<ISceneManager>().GetEntity("cube"));
         Assert.Null(quietServices.GetRequiredService<ISceneManager>().GetEntity("cube"));
         Assert.False(quietStore.IsMember("cube", "catalog"));
+    }
+
+    [Fact]
+    public void A_replica_update_or_delete_leaves_a_projected_entity()
+    {
+        var time = new ManualTime();
+        using var dir = new TempDir();
+        using var side = Side.Create(dir.Path, time);
+        var services = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var scene = services.GetRequiredService<ISceneManager>();
+        var replicas = services.GetRequiredService<IReplicaManager>();
+        var store = SceneStore();
+        using var link = SceneLink(side, store, services);
+
+        Assert.Equal(AetherAdmitKind.Queued, link.SubmitCreate("cube", TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, link.SubmitLabel("cube", "red").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, link.SubmitOffset("cube", 4).Kind);
+        link.Pump();
+        Assert.Equal(AetherAdmitKind.Queued, link.SubmitPublish("cube").Kind);
+        link.Pump();
+
+        var cube = Assert.IsType<TestStubEntity>(scene.GetEntity("cube"));
+        Assert.Equal("red", cube.Label);
+        Assert.Equal(4, cube.Offset);
+        Assert.Same(cube, replicas.GetReplica("cube"));
+
+        var incoming = new TestStubEntity { Id = "cube", Counter = 99, Label = "stolen", Offset = 50 };
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.Update, incoming));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.FullSync, incoming));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildDeletePacket("cube"));
+
+        Assert.Same(cube, scene.GetEntity("cube"));
+        Assert.Same(cube, replicas.GetReplica("cube"));
+        Assert.Equal("red", cube.Label);
+        Assert.Equal(4, cube.Offset);
+        Assert.Equal(0, cube.Counter);
+        Assert.Equal(side.Principal.Id, cube.OwnerId);
+        Assert.False(store.IsDeleted("cube"));
+
+        TestStubEntity plain;
+        using (SceneMutationScope.Begin())
+            plain = Assert.IsType<TestStubEntity>(scene.CreateRegisteredEntity(TestStubEntity.RegistryTypeId, "plain", side.Principal.Id));
+        plain.Counter = 1;
+        var changed = new TestStubEntity { Id = "plain", Counter = 5 };
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.Update, changed));
+        Assert.Equal(5, plain.Counter);
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildDeletePacket("plain"));
+        Assert.Null(scene.GetEntity("plain"));
+        Assert.Null(replicas.GetReplica("plain"));
+        Assert.Same(cube, scene.GetEntity("cube"));
     }
 
     [Fact]

@@ -212,7 +212,10 @@ an id the reducer already stores. An authenticated peer may name entity
 ids for one connection. The scene link then sends that connection only this
 peer's own envelopes for those ids. No list keeps the full catch-up. An empty
 list receives nothing. Disconnect clears the list. The list does not grant
-publication membership or owner authority.
+publication membership or owner authority. A scene entity the reducer stores
+is not written or removed by a replica update or delete. The scene commit
+removes it when the reducer stores the tombstone. An entity the reducer does
+not store still follows the replica path.
 
 ## Treat persistence as protocol state
 

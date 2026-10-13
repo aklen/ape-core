@@ -148,9 +148,9 @@ public class ReplicaManager : IReplicaManager, ICoreService
                 IsLocal = replica.IsLocal  // Keep for now, will remove later
             });
 
-            // Only broadcast if we own this replica
+            // Only broadcast if we own this replica. An Aether entity leaves on its own wire.
             bool weOwnThis = replica.OwnerId == _networkManager.LocalPeerId;
-            if (weOwnThis)
+            if (weOwnThis && !HandledByAether(replica))
             {
                 try
                 {
@@ -181,6 +181,9 @@ public class ReplicaManager : IReplicaManager, ICoreService
                 ReplicaId = replicaId
             });
 
+            if (HandledByAether(replica))
+                return;
+
             // Send Delete packet to subscribed peers (or broadcast if no access control)
             try
             {
@@ -209,8 +212,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
             var localPeerId = _networkManager.LocalPeerId;
             foreach (var replica in _replicas.Values.Where(r => r.OwnerId == localPeerId))
             {
-                // Skip if no changes since last snapshot
-                if (!replica.HasChanges())
+                if (HandledByAether(replica) || !replica.HasChanges())
                     continue;
 
                 try
@@ -257,6 +259,9 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
         foreach (var replica in _replicas.Values.Where(r => r.OwnerId == localPeerId))
         {
+            if (HandledByAether(replica))
+                continue;
+
             var recipients = _accessControl?.GetSubscribedPeers(replica.UniquePath);
             if (recipients != null && !recipients.Contains(peerId))
                 continue;
@@ -321,6 +326,12 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
             if (_replicas.TryGetValue(parsedReplicaId, out var replica))
             {
+                if (HandledByAether(replica))
+                {
+                    _logger.LogWarning($"[ReplicaManager] Replica '{parsedReplicaId}' is projected by Aether — skip");
+                    return;
+                }
+
                 // Update existing replica
                 _logger.LogDebug($"Received {packetType} packet for existing replica '{parsedReplicaId}' - deserializing...");
                 using (SceneMutationScope.Begin())
@@ -373,6 +384,12 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
     private void HandleDeletePacket(string replicaId)
     {
+        if (_replicas.TryGetValue(replicaId, out var existing) && HandledByAether(existing))
+        {
+            _logger.LogWarning($"[ReplicaManager] Replica '{replicaId}' is projected by Aether — skip delete");
+            return;
+        }
+
         if (_replicas.TryRemove(replicaId, out var replica))
         {
             var replicaType = replica.GetType().Name;
@@ -436,6 +453,9 @@ public class ReplicaManager : IReplicaManager, ICoreService
         _networkManager.Broadcast(packet, reliable: true);
         _logger.LogDebug($"[ReplicaManager] Sent Subscribe for {pathPattern}");
     }
+
+    private static bool HandledByAether(IReplica replica) =>
+        replica is Replica handled && handled.IsHandledByAether;
 
     public void Unsubscribe(string pathPattern)
     {
