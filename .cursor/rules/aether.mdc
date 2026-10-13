@@ -203,7 +203,10 @@ bounded inbox. Pending lookup never turns an Update into a Create.
 A scene link may project every living entity of one registered type through
 those same three stages. The commit stage iterates the entities. It does not
 add a stage or a host drain per entity. The projected fields are the label and
-one sum. The replica create path does not create an id the reducer already stores.
+one sum, and only when the entity is living, shared-visible, and a member of
+the link's publication. Hide and publication are owner operations. A non-owner
+is refused before the reducer changes. The replica create path does not create
+an id the reducer already stores.
 
 ## Treat persistence as protocol state
 

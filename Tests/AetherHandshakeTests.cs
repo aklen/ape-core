@@ -991,6 +991,14 @@ public sealed class AetherHandshakeTests
         bLink.Pump();
         cLink.Pump();
 
+        Assert.Equal(AetherAdmitKind.Queued, aLink.SubmitPublish("cube").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, aLink.SubmitPublish("sphere").Kind);
+        sent = a.Transport.Sent.Count;
+        aLink.Pump();
+        DeliverNew(a, sent, b, bFromA, c, cFromA);
+        bLink.Pump();
+        cLink.Pump();
+
         AssertScene(aScene, aStore, a.Principal.Id);
         AssertScene(bScene, bStore, a.Principal.Id);
         AssertScene(cScene, cStore, a.Principal.Id);
@@ -1028,6 +1036,81 @@ public sealed class AetherHandshakeTests
     }
 
     [Fact]
+    public void Publication_and_hide_gate_the_shared_fields()
+    {
+        var time = new ManualTime();
+        using var ownerDir = new TempDir();
+        using var otherDir = new TempDir();
+        using var owner = Side.Create(ownerDir.Path, time);
+        using var other = Side.Create(otherDir.Path, time);
+        var ownerServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var otherServices = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var ownerScene = ownerServices.GetRequiredService<ISceneManager>();
+        var otherScene = otherServices.GetRequiredService<ISceneManager>();
+        var ownerStore = SceneStore();
+        var otherStore = SceneStore();
+        using var ownerLink = SceneLink(owner, ownerStore, ownerServices);
+        using var otherLink = SceneLink(other, otherStore, otherServices);
+        Exchange(owner, other);
+        var otherFromOwner = other.Slot;
+
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitCreate("cube", TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitCreate("sphere", TestStubEntity.RegistryTypeId).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitLabel("cube", "red").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitOffset("cube", 4).Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitLabel("sphere", "blue").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitOffset("sphere", 9).Kind);
+        var sent = owner.Transport.Sent.Count;
+        ownerLink.Pump();
+        DeliverOne(owner, sent, other, otherFromOwner);
+        otherLink.Pump();
+
+        var cube = Assert.IsType<TestStubEntity>(otherScene.GetEntity("cube"));
+        var sphere = Assert.IsType<TestStubEntity>(otherScene.GetEntity("sphere"));
+        Assert.Null(cube.Label);
+        Assert.Equal(0, cube.Offset);
+        Assert.Null(sphere.Label);
+        Assert.Equal(0, sphere.Offset);
+
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitPublish("cube").Kind);
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitPublish("sphere").Kind);
+        sent = owner.Transport.Sent.Count;
+        ownerLink.Pump();
+        DeliverOne(owner, sent, other, otherFromOwner);
+        otherLink.Pump();
+        Assert.Equal("red", cube.Label);
+        Assert.Equal(4, cube.Offset);
+        Assert.Equal("blue", sphere.Label);
+        Assert.Equal(9, sphere.Offset);
+        Assert.Equal(owner.Principal.Id, otherStore.GetOwner("cube"));
+
+        Assert.Equal(AetherAdmitKind.Refused, otherLink.SubmitPublish("cube").Kind);
+        Assert.Equal(AetherAdmitKind.Refused, otherLink.SubmitHide("cube").Kind);
+        var clock = otherStore.Clock;
+        otherLink.Pump();
+        Assert.Equal(clock, otherStore.Clock);
+        Assert.True(otherStore.IsMember("cube", "catalog"));
+        Assert.True(otherStore.IsSharedVisible("cube"));
+
+        Assert.Equal(AetherAdmitKind.Queued, ownerLink.SubmitHide("cube").Kind);
+        sent = owner.Transport.Sent.Count;
+        ownerLink.Pump();
+        DeliverOne(owner, sent, other, otherFromOwner);
+        otherLink.Pump();
+        Assert.Same(cube, otherScene.GetEntity("cube"));
+        Assert.Null(cube.Label);
+        Assert.Equal(0, cube.Offset);
+        Assert.Equal("blue", sphere.Label);
+        Assert.Equal(9, sphere.Offset);
+        Assert.False(otherStore.IsSharedVisible("cube"));
+        Assert.Equal(4, otherStore.RawContribution("cube", owner.Principal.Id, "offset"));
+
+        other.Transport.DisconnectSlot(otherFromOwner);
+        Assert.Same(cube, otherScene.GetEntity("cube"));
+        Assert.Same(sphere, otherScene.GetEntity("sphere"));
+    }
+
+    [Fact]
     public void A_full_scene_queue_does_not_create_the_second_entity()
     {
         var time = new ManualTime();
@@ -1051,6 +1134,18 @@ public sealed class AetherHandshakeTests
         Assert.IsType<TestStubEntity>(scene.GetEntity("cube"));
         Assert.Null(scene.GetEntity("sphere"));
         Assert.Null(store.GetEntity("sphere"));
+    }
+
+    private static void DeliverOne(Side sender, int sentBefore, Side receiver, string slot)
+    {
+        var seen = new List<byte[]>();
+        foreach (var packet in sender.Transport.Sent.Skip(sentBefore))
+        {
+            if (seen.Any(existing => existing.AsSpan().SequenceEqual(packet)))
+                continue;
+            seen.Add(packet);
+            receiver.Transport.DeliverSlot(slot, packet);
+        }
     }
 
     private static void DeliverNew(Side sender, int sentBefore, Side left, string leftSlot, Side right, string rightSlot)

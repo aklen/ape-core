@@ -88,7 +88,10 @@ public sealed class AetherOperation
             throw new AetherProtocolException("This operation has no ownership metadata.");
         }
 
-        if (authority is not null && effect is not (AetherEffect.CreateEntity or AetherEffect.TransferOwnership or AetherEffect.DeleteEntity))
+        if (authority is not null && effect is not (
+                AetherEffect.CreateEntity or AetherEffect.TransferOwnership or AetherEffect.DeleteEntity
+                or AetherEffect.HideShared or AetherEffect.RestoreShared
+                or AetherEffect.Publish or AetherEffect.WithdrawPublication))
             throw new AetherProtocolException("This operation has no authority proof.");
 
         Effect = effect;

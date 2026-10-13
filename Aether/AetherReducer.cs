@@ -166,6 +166,66 @@ public sealed class AetherReducer
         return stamped;
     }
 
+    public AetherOperation StampLocalHide(
+        string entityId,
+        string writerId,
+        string actorId,
+        bool hidden,
+        Func<AetherOperation, AetherOperation>? seal = null)
+    {
+        if (string.IsNullOrEmpty(actorId))
+            throw new AetherProtocolException("Actor sequence is missing.");
+        var nextClock = NextClock(_clock);
+        var sequence = NextSequence(actorId);
+        var stamped = new AetherOperation(
+            $"{actorId}/{sequence.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
+            entityId,
+            writerId,
+            actorId,
+            sequence,
+            nextClock,
+            new Dictionary<string, FieldValue>(),
+            hidden ? AetherEffect.HideShared : AetherEffect.RestoreShared);
+        RejectBeforeAdmit(stamped);
+        stamped = Seal(stamped, seal);
+        AetherWire.Encode(stamped);
+        _clock = nextClock;
+        _nextSequence[actorId] = sequence;
+        _frontiers[actorId] = new ActorFrontier(sequence, nextClock, stamped.Id);
+        return stamped;
+    }
+
+    public AetherOperation StampLocalPublication(
+        string entityId,
+        string publicationId,
+        string writerId,
+        string actorId,
+        bool published,
+        Func<AetherOperation, AetherOperation>? seal = null)
+    {
+        if (string.IsNullOrEmpty(actorId))
+            throw new AetherProtocolException("Actor sequence is missing.");
+        var nextClock = NextClock(_clock);
+        var sequence = NextSequence(actorId);
+        var stamped = new AetherOperation(
+            $"{actorId}/{sequence.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
+            entityId,
+            writerId,
+            actorId,
+            sequence,
+            nextClock,
+            new Dictionary<string, FieldValue>(),
+            published ? AetherEffect.Publish : AetherEffect.WithdrawPublication,
+            publicationId);
+        RejectBeforeAdmit(stamped);
+        stamped = Seal(stamped, seal);
+        AetherWire.Encode(stamped);
+        _clock = nextClock;
+        _nextSequence[actorId] = sequence;
+        _frontiers[actorId] = new ActorFrontier(sequence, nextClock, stamped.Id);
+        return stamped;
+    }
+
     public AetherOperation StampLocalDelete(
         string entityId,
         string writerId,
@@ -292,15 +352,19 @@ public sealed class AetherReducer
                     RejectDeletion(op);
                     return;
                 case AetherEffect.HideShared:
+                    RejectOwnerLifecycle(op);
                     RejectVisibility(op.EntityId, version, hidden: true);
                     return;
                 case AetherEffect.RestoreShared:
+                    RejectOwnerLifecycle(op);
                     RejectVisibility(op.EntityId, version, hidden: false);
                     return;
                 case AetherEffect.WithdrawPublication:
+                    RejectOwnerLifecycle(op);
                     RejectMembership(op.EntityId, op.PublicationId!, version, published: false);
                     return;
                 case AetherEffect.Publish:
+                    RejectOwnerLifecycle(op);
                     RejectMembership(op.EntityId, op.PublicationId!, version, published: true);
                     return;
                 case AetherEffect.CreateEntity:
@@ -780,6 +844,19 @@ public sealed class AetherReducer
         }
 
         return folded.Values.ToList();
+    }
+
+    private void RejectOwnerLifecycle(AetherOperation op)
+    {
+        RequireAuthorityWhenPresent(op);
+        var owner = GetOwner(op.EntityId);
+        if (owner is null)
+            return;
+        var visibility = op.Effect is AetherEffect.HideShared or AetherEffect.RestoreShared;
+        if (!string.Equals(op.WriterId, owner, StringComparison.Ordinal))
+            throw new AetherProtocolException(visibility
+                ? "Hide is not issued by the entity owner."
+                : "Publication is not issued by the entity owner.");
     }
 
     private void RejectCreation(AetherOperation op)

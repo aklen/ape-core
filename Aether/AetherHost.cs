@@ -55,8 +55,15 @@ public sealed class AetherHost
             return AetherAdmit.Refused("Actor is not on this connection.");
         if (requireAuthorityProof
             && op.Effect is AetherEffect.CreateEntity or AetherEffect.TransferOwnership or AetherEffect.DeleteEntity
+                or AetherEffect.HideShared or AetherEffect.RestoreShared
+                or AetherEffect.Publish or AetherEffect.WithdrawPublication
             && !AetherAuthority.Verify(op))
             return AetherAdmit.Refused("Authority proof is invalid.");
+        if (requireAuthorityProof
+            && op.Effect is AetherEffect.HideShared or AetherEffect.RestoreShared
+                or AetherEffect.Publish or AetherEffect.WithdrawPublication
+            && !OwnsLifecycle(op.EntityId, principalId, op.Effect is AetherEffect.HideShared or AetherEffect.RestoreShared, out var lifecycle))
+            return lifecycle;
         if (op.Effect == AetherEffect.CreateEntity
             && (!string.Equals(op.CreatorId, principalId, StringComparison.Ordinal)
                 || !string.Equals(op.OwnerId, principalId, StringComparison.Ordinal)))
@@ -139,6 +146,39 @@ public sealed class AetherHost
             null,
             new LocalWrite(entityId, writerId, actorId, new Dictionary<string, FieldValue>(), entityTypeId, seal: seal),
             bytes));
+    }
+
+    public AetherAdmit TryAcceptLocalHide(
+        string entityId,
+        string writerId,
+        string actorId,
+        bool hidden,
+        Func<AetherOperation, AetherOperation>? seal = null)
+    {
+        if (!OwnsLifecycle(entityId, writerId, visibility: true, out var refused))
+            return refused;
+        var bytes = BaseBytes + Utf8(entityId) + Utf8(writerId) + Utf8(actorId) + 16 + AuthorityReservation(seal);
+        return TryEnqueue(new Pending(null, new LocalWrite(
+            entityId, writerId, actorId, new Dictionary<string, FieldValue>(),
+            effect: hidden ? AetherEffect.HideShared : AetherEffect.RestoreShared, seal: seal), bytes));
+    }
+
+    public AetherAdmit TryAcceptLocalPublish(
+        string entityId,
+        string publicationId,
+        string writerId,
+        string actorId,
+        bool published,
+        Func<AetherOperation, AetherOperation>? seal = null)
+    {
+        if (!OwnsLifecycle(entityId, writerId, visibility: false, out var refused))
+            return refused;
+        var bytes = BaseBytes + Utf8(entityId) + Utf8(publicationId) + Utf8(writerId) + Utf8(actorId) + 16
+            + AuthorityReservation(seal);
+        return TryEnqueue(new Pending(null, new LocalWrite(
+            entityId, writerId, actorId, new Dictionary<string, FieldValue>(),
+            effect: published ? AetherEffect.Publish : AetherEffect.WithdrawPublication,
+            publicationId: publicationId, seal: seal), bytes));
     }
 
     public AetherAdmit TryAcceptLocalDelete(
@@ -414,6 +454,14 @@ public sealed class AetherHost
                             write.WriterId,
                             write.ActorId,
                             write.Seal),
+                        AetherEffect.HideShared => Reducer.StampLocalHide(
+                            write.EntityId, write.WriterId, write.ActorId, hidden: true, write.Seal),
+                        AetherEffect.RestoreShared => Reducer.StampLocalHide(
+                            write.EntityId, write.WriterId, write.ActorId, hidden: false, write.Seal),
+                        AetherEffect.Publish => Reducer.StampLocalPublication(
+                            write.EntityId, write.PublicationId!, write.WriterId, write.ActorId, published: true, write.Seal),
+                        AetherEffect.WithdrawPublication => Reducer.StampLocalPublication(
+                            write.EntityId, write.PublicationId!, write.WriterId, write.ActorId, published: false, write.Seal),
                         _ => Reducer.StampLocal(write.EntityId, write.WriterId, write.ActorId, write.Changes),
                     };
                 }
@@ -446,6 +494,29 @@ public sealed class AetherHost
 
     private static int Utf8(string? value) => value is null ? 0 : Encoding.UTF8.GetByteCount(value);
 
+    private bool OwnsLifecycle(string entityId, string writerId, bool visibility, out AetherAdmit refused)
+    {
+        var owner = Reducer.GetOwner(entityId);
+        if (owner is null)
+        {
+            refused = AetherAdmit.Refused(visibility
+                ? "Hide entity owner is unknown."
+                : "Publication entity owner is unknown.");
+            return false;
+        }
+
+        if (!string.Equals(owner, writerId, StringComparison.Ordinal))
+        {
+            refused = AetherAdmit.Refused(visibility
+                ? "Hide is not issued by the entity owner."
+                : "Publication is not issued by the entity owner.");
+            return false;
+        }
+
+        refused = default;
+        return true;
+    }
+
     private static int AuthorityReservation(Func<AetherOperation, AetherOperation>? seal) =>
         seal is null ? 4 : 4 + PrincipalHandshake.MaxPublicKeyBytes + PrincipalHandshake.MaxSignatureBytes;
 
@@ -460,6 +531,7 @@ public sealed class AetherHost
         string? entityTypeId = null,
         AetherEffect effect = AetherEffect.Write,
         string? newOwnerId = null,
+        string? publicationId = null,
         Func<AetherOperation, AetherOperation>? seal = null)
     {
         public string EntityId { get; } = entityId;
@@ -469,6 +541,7 @@ public sealed class AetherHost
         public string? EntityTypeId { get; } = entityTypeId;
         public AetherEffect Effect { get; } = entityTypeId is null ? effect : AetherEffect.CreateEntity;
         public string? NewOwnerId { get; } = newOwnerId;
+        public string? PublicationId { get; } = publicationId;
         public Func<AetherOperation, AetherOperation>? Seal { get; } = seal;
     }
 

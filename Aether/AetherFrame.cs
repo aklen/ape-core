@@ -127,9 +127,11 @@ public static class AetherFrame
             {
                 var deleted = scratch.Reducer.IsDeleted(entity.EntityId);
                 var visible = scratch.Reducer.IsSharedVisible(entity.EntityId);
+                var member = !string.IsNullOrEmpty(scratch.PublicationId)
+                    && scratch.Reducer.IsMember(entity.EntityId, scratch.PublicationId!);
                 string? label = null;
                 long sum = 0;
-                if (!deleted && visible)
+                if (!deleted && visible && member)
                 {
                     label = scratch.Reducer.ResolveLww(entity.EntityId, scratch.LabelFieldId)?.Text;
                     if (!string.IsNullOrEmpty(scratch.SumFieldId))

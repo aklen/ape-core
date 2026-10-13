@@ -15,6 +15,10 @@ public static class AetherWire
     public const byte CreateType = 0x32;
     public const byte DeleteType = 0x33;
     public const byte TransferType = 0x34;
+    public const byte HideType = 0x35;
+    public const byte RestoreType = 0x36;
+    public const byte PublishType = 0x37;
+    public const byte WithdrawType = 0x38;
     public const ushort WireVersion = 2;
     public const string LabelRule = "lww";
     public const int MaxPacketBytes = 65_536;
@@ -22,7 +26,9 @@ public static class AetherWire
     public const string PacketTooLarge = "State packet is too large.";
 
     public static bool IsStatePacket(ReadOnlySpan<byte> data) =>
-        !data.IsEmpty && (data[0] == PacketType || data[0] == ContributionType || data[0] == CreateType || data[0] == DeleteType || data[0] == TransferType);
+        !data.IsEmpty && (data[0] == PacketType || data[0] == ContributionType || data[0] == CreateType
+            || data[0] == DeleteType || data[0] == TransferType || data[0] == HideType || data[0] == RestoreType
+            || data[0] == PublishType || data[0] == WithdrawType);
 
     public static bool IsContributionPacket(ReadOnlySpan<byte> data) =>
         !data.IsEmpty && data[0] == ContributionType;
@@ -42,6 +48,10 @@ public static class AetherWire
             return EncodeDelete(op);
         if (op.Effect == AetherEffect.TransferOwnership)
             return EncodeTransfer(op);
+        if (op.Effect is AetherEffect.HideShared or AetherEffect.RestoreShared)
+            return EncodeVisibility(op);
+        if (op.Effect is AetherEffect.Publish or AetherEffect.WithdrawPublication)
+            return EncodeMembership(op);
         if (op.Effect != AetherEffect.Write || op.Changes.Count != 1)
             throw new AetherProtocolException("This packet carries one label write.");
         var field = op.Changes.Single();
@@ -151,6 +161,54 @@ public static class AetherWire
         WriteI64(body, op.Lamport);
         WriteText(body, op.NewOwnerId!);
         WriteText(body, op.PriorOwnerOperationId!);
+        WriteProof(body, op.Authority);
+        return WithChecksum(body.ToArray());
+    }
+
+    private static byte[] EncodeVisibility(AetherOperation op)
+    {
+        var size = 0;
+        Reserve(ref size, 1 + 2);
+        ReserveText(ref size, op.Id);
+        ReserveText(ref size, op.EntityId);
+        ReserveText(ref size, op.WriterId);
+        ReserveText(ref size, op.ActorId);
+        Reserve(ref size, 8 + 8);
+        ReserveProof(ref size, op.Authority);
+        using var body = new MemoryStream(size);
+        body.WriteByte(op.Effect == AetherEffect.HideShared ? HideType : RestoreType);
+        WriteU16(body, WireVersion);
+        WriteText(body, op.Id);
+        WriteText(body, op.EntityId);
+        WriteText(body, op.WriterId);
+        WriteText(body, op.ActorId);
+        WriteI64(body, op.Sequence);
+        WriteI64(body, op.Lamport);
+        WriteProof(body, op.Authority);
+        return WithChecksum(body.ToArray());
+    }
+
+    private static byte[] EncodeMembership(AetherOperation op)
+    {
+        var size = 0;
+        Reserve(ref size, 1 + 2);
+        ReserveText(ref size, op.Id);
+        ReserveText(ref size, op.EntityId);
+        ReserveText(ref size, op.WriterId);
+        ReserveText(ref size, op.ActorId);
+        Reserve(ref size, 8 + 8);
+        ReserveText(ref size, op.PublicationId!);
+        ReserveProof(ref size, op.Authority);
+        using var body = new MemoryStream(size);
+        body.WriteByte(op.Effect == AetherEffect.Publish ? PublishType : WithdrawType);
+        WriteU16(body, WireVersion);
+        WriteText(body, op.Id);
+        WriteText(body, op.EntityId);
+        WriteText(body, op.WriterId);
+        WriteText(body, op.ActorId);
+        WriteI64(body, op.Sequence);
+        WriteI64(body, op.Lamport);
+        WriteText(body, op.PublicationId!);
         WriteProof(body, op.Authority);
         return WithChecksum(body.ToArray());
     }
@@ -284,7 +342,8 @@ public static class AetherWire
     private static AetherOperation Decode(byte[] data, string? entityId, string? fieldId)
     {
         if (data.Length < 33 || data.Length > MaxPacketBytes
-            || (data[0] != PacketType && data[0] != CreateType && data[0] != DeleteType && data[0] != TransferType))
+            || (data[0] != PacketType && data[0] != CreateType && data[0] != DeleteType && data[0] != TransferType
+                && data[0] != HideType && data[0] != RestoreType && data[0] != PublishType && data[0] != WithdrawType))
             throw new AetherProtocolException(data.Length > MaxPacketBytes
                 ? PacketTooLarge
                 : "State packet is truncated.");
@@ -304,6 +363,10 @@ public static class AetherWire
             return DecodeDelete(ref reader, entityId);
         if (packetType == TransferType)
             return DecodeTransfer(ref reader, entityId);
+        if (packetType is HideType or RestoreType)
+            return DecodeVisibility(ref reader, entityId, packetType == HideType);
+        if (packetType is PublishType or WithdrawType)
+            return DecodeMembership(ref reader, entityId, packetType == PublishType);
         var rule = reader.Text();
         if (!string.Equals(rule, LabelRule, StringComparison.Ordinal))
             throw new AetherProtocolException("Rule is not lww.");
@@ -402,6 +465,45 @@ public static class AetherWire
         return new AetherOperation(id, encodedEntity, writerId, actorId, sequence, lamport,
             new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
             newOwnerId: newOwnerId, priorOwnerOperationId: prior, authority: authority);
+    }
+
+    private static AetherOperation DecodeVisibility(ref Reader reader, string? entityId, bool hidden)
+    {
+        var id = reader.Text();
+        var encodedEntity = reader.Text();
+        var writerId = reader.Text();
+        var actorId = reader.Text();
+        var sequence = reader.I64();
+        var lamport = reader.I64();
+        var authority = ReadProof(ref reader);
+        reader.End();
+        if (entityId is not null && !string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
+            throw new AetherProtocolException("Entity is not on this link.");
+        return new AetherOperation(
+            id, encodedEntity, writerId, actorId, sequence, lamport,
+            new Dictionary<string, FieldValue>(),
+            hidden ? AetherEffect.HideShared : AetherEffect.RestoreShared,
+            authority: authority);
+    }
+
+    private static AetherOperation DecodeMembership(ref Reader reader, string? entityId, bool published)
+    {
+        var id = reader.Text();
+        var encodedEntity = reader.Text();
+        var writerId = reader.Text();
+        var actorId = reader.Text();
+        var sequence = reader.I64();
+        var lamport = reader.I64();
+        var publicationId = reader.Text();
+        var authority = ReadProof(ref reader);
+        reader.End();
+        if (entityId is not null && !string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
+            throw new AetherProtocolException("Entity is not on this link.");
+        return new AetherOperation(
+            id, encodedEntity, writerId, actorId, sequence, lamport,
+            new Dictionary<string, FieldValue>(),
+            published ? AetherEffect.Publish : AetherEffect.WithdrawPublication,
+            publicationId, authority: authority);
     }
 
     private static void ReserveProof(ref int size, AetherAuthorityProof? proof)

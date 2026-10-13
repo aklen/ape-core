@@ -20,12 +20,15 @@ public sealed class AetherSceneLink : IDisposable
     private readonly ILogger _logger;
     private readonly string _writerId;
     private readonly string _actorId;
+    private readonly string _publicationId;
     private readonly string _labelFieldId;
     private readonly string _sumFieldId;
     private readonly string _labelProperty;
     private readonly string _sumProperty;
     private readonly int _maxOutgoing;
     private readonly Func<AetherOperation, AetherOperation>? _authoritySeal;
+    private readonly Dictionary<string, AetherOperation> _ownVisibility = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, AetherOperation> _ownMembership = new(StringComparer.Ordinal);
     private readonly HashSet<long> _localIds = new();
     private readonly Queue<byte[]> _outgoing = new();
     private readonly Queue<HeldOperation> _held = new();
@@ -43,6 +46,7 @@ public sealed class AetherSceneLink : IDisposable
         ILogger logger,
         string writerId,
         string sessionId,
+        string publicationId = "catalog",
         string labelFieldId = "label",
         string sumFieldId = "offset",
         string labelPropertyName = "Label",
@@ -59,6 +63,7 @@ public sealed class AetherSceneLink : IDisposable
         _scene = scene ?? throw new ArgumentNullException(nameof(scene));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _writerId = writerId ?? throw new ArgumentNullException(nameof(writerId));
+        _publicationId = publicationId ?? throw new ArgumentNullException(nameof(publicationId));
         _actorId = AetherActorId.Format(writerId, sessionId);
         _labelFieldId = labelFieldId ?? throw new ArgumentNullException(nameof(labelFieldId));
         _sumFieldId = sumFieldId ?? throw new ArgumentNullException(nameof(sumFieldId));
@@ -75,6 +80,7 @@ public sealed class AetherSceneLink : IDisposable
             FrameByteBudget = 1_000_000,
             LabelFieldId = labelFieldId,
             SumFieldId = sumFieldId,
+            PublicationId = publicationId,
             ProjectScene = true,
             LabelPropertyName = labelPropertyName,
             SumPropertyName = sumPropertyName,
@@ -104,6 +110,18 @@ public sealed class AetherSceneLink : IDisposable
         ObjectDisposedException.ThrowIf(_stopped, this);
         return SubmitField(entityId, _labelFieldId, FieldValue.Label(label));
     }
+
+    public AetherAdmit SubmitPublish(string entityId) =>
+        SubmitLifecycle(entityId, publish: true);
+
+    public AetherAdmit SubmitWithdraw(string entityId) =>
+        SubmitLifecycle(entityId, publish: false);
+
+    public AetherAdmit SubmitHide(string entityId) =>
+        SubmitVisibility(entityId, hidden: true);
+
+    public AetherAdmit SubmitRestore(string entityId) =>
+        SubmitVisibility(entityId, hidden: false);
 
     public AetherAdmit SubmitOffset(string entityId, long offset)
     {
@@ -141,6 +159,7 @@ public sealed class AetherSceneLink : IDisposable
                 _localIds.Remove(outcome.RequestId);
                 if (outcome.Kind != AetherOutcomeKind.Applied || outcome.Result is not { Operation: { } operation })
                     continue;
+                Note(operation);
                 if (_outgoing.Count >= _maxOutgoing)
                     continue;
                 _outgoing.Enqueue(EncodeLive(operation));
@@ -159,6 +178,30 @@ public sealed class AetherSceneLink : IDisposable
         _stopped = true;
         _network.OnPeerConnected -= OnPeerConnected;
         _network.OnDataReceived -= OnData;
+    }
+
+    private AetherAdmit SubmitLifecycle(string entityId, bool publish)
+    {
+        ObjectDisposedException.ThrowIf(_stopped, this);
+        ArgumentException.ThrowIfNullOrEmpty(entityId);
+        if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
+            return AetherAdmit.Full;
+        var admit = _host.TryAcceptLocalPublish(entityId, _publicationId, _writerId, _actorId, publish, _authoritySeal);
+        if (admit.Kind == AetherAdmitKind.Queued)
+            _localIds.Add(admit.RequestId);
+        return admit;
+    }
+
+    private AetherAdmit SubmitVisibility(string entityId, bool hidden)
+    {
+        ObjectDisposedException.ThrowIf(_stopped, this);
+        ArgumentException.ThrowIfNullOrEmpty(entityId);
+        if (_localIds.Count + _outgoing.Count >= _maxOutgoing)
+            return AetherAdmit.Full;
+        var admit = _host.TryAcceptLocalHide(entityId, _writerId, _actorId, hidden, _authoritySeal);
+        if (admit.Kind == AetherAdmitKind.Queued)
+            _localIds.Add(admit.RequestId);
+        return admit;
     }
 
     private AetherAdmit SubmitField(string entityId, string fieldId, FieldValue value)
@@ -382,6 +425,11 @@ public sealed class AetherSceneLink : IDisposable
                 packets.Add(AetherWire.Encode(DeletionOperation(deletion)));
         }
 
+        foreach (var operation in _ownVisibility.Values.OrderBy(operation => operation.EntityId, StringComparer.Ordinal))
+            packets.Add(AetherWire.Encode(operation));
+        foreach (var operation in _ownMembership.Values.OrderBy(operation => operation.EntityId, StringComparer.Ordinal))
+            packets.Add(AetherWire.Encode(operation));
+
         var fields = OwnFields();
         foreach (var entityId in fields
                      .Select(field => field.Key.EntityId)
@@ -436,6 +484,17 @@ public sealed class AetherSceneLink : IDisposable
             replica.YieldPropertyToAether(_labelProperty);
             replica.YieldPropertyToAether(_sumProperty);
         }
+    }
+
+    private void Note(AetherOperation operation)
+    {
+        if (!string.Equals(operation.WriterId, _writerId, StringComparison.Ordinal))
+            return;
+        if (operation.Effect is AetherEffect.HideShared or AetherEffect.RestoreShared)
+            _ownVisibility[operation.EntityId] = operation;
+        if (operation.Effect is AetherEffect.Publish or AetherEffect.WithdrawPublication
+            && string.Equals(operation.PublicationId, _publicationId, StringComparison.Ordinal))
+            _ownMembership[operation.EntityId] = operation;
     }
 
     private static byte[] EncodeLive(AetherOperation operation)
@@ -508,7 +567,9 @@ public sealed class AetherSceneLink : IDisposable
         || string.Equals(reason, "Delete is not issued by the entity owner.", StringComparison.Ordinal)
         || string.Equals(reason, "Ownership transfer entity is unknown.", StringComparison.Ordinal)
         || string.Equals(reason, "Ownership transfer is not issued by the entity owner.", StringComparison.Ordinal)
-        || string.Equals(reason, "Ownership transfer prior operation does not match.", StringComparison.Ordinal);
+        || string.Equals(reason, "Ownership transfer prior operation does not match.", StringComparison.Ordinal)
+        || string.Equals(reason, "Hide entity owner is unknown.", StringComparison.Ordinal)
+        || string.Equals(reason, "Publication entity owner is unknown.", StringComparison.Ordinal);
 
     private readonly record struct HeldOperation(string PrincipalId, AetherOperation Operation);
 

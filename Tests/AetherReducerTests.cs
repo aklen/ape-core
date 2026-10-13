@@ -635,6 +635,31 @@ public sealed class AetherReducerTests
     }
 
     [Fact]
+    public void A_non_owner_cannot_hide_or_publish()
+    {
+        var store = NewStore();
+        Apply(store, CreateEntity());
+        var clock = store.Clock;
+        var records = store.RecordCount;
+        var hide = new AetherOperation(
+            "hide", "entity-1", "peer-B", "peer-B/s1", 1, 10,
+            new Dictionary<string, FieldValue>(), AetherEffect.HideShared);
+        var publish = new AetherOperation(
+            "pub", "entity-1", "peer-B", "peer-B/s1", 1, 11,
+            new Dictionary<string, FieldValue>(), AetherEffect.Publish, "catalog");
+
+        var hidden = Assert.Throws<AetherProtocolException>(() => Apply(store, hide));
+        var published = Assert.Throws<AetherProtocolException>(() => Apply(store, publish));
+
+        Assert.Equal("Hide is not issued by the entity owner.", hidden.Message);
+        Assert.Equal("Publication is not issued by the entity owner.", published.Message);
+        Assert.Equal(clock, store.Clock);
+        Assert.Equal(records, store.RecordCount);
+        Assert.True(store.IsSharedVisible("entity-1"));
+        Assert.False(store.IsMember("entity-1", "catalog"));
+    }
+
+    [Fact]
     public void Hide_keeps_the_raw_contribution()
     {
         var store = NewStore();
