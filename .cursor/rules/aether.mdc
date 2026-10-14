@@ -217,8 +217,9 @@ is not registered for replica state sync. One that was already registered
 leaves that registry without a replica delete packet, and the scene object
 stays. A replica create, update, or delete does not write or announce it.
 The scene commit removes it when the reducer stores the tombstone. The
-one-entity link still yields only its label. An entity the reducer does
-not store still follows the replica path.
+one-entity link does the same once the reducer stores that entity. Until
+then it yields the label. An entity the reducer does not store still
+follows the replica path.
 
 ## Treat persistence as protocol state
 

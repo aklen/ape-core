@@ -89,6 +89,7 @@ public sealed class AetherLabelLink : IDisposable
         _fieldId = fieldId ?? throw new ArgumentNullException(nameof(fieldId));
         if (scene.GetEntity(entityId) is Replica replica)
             replica.YieldPropertyToAether(labelPropertyName);
+        NoteStoredEntity();
 
         var storedCreate = host.Reducer.GetEntity(entityId);
         if (storedCreate is not null && string.Equals(storedCreate.CreatorId, writerId, StringComparison.Ordinal))
@@ -197,6 +198,7 @@ public sealed class AetherLabelLink : IDisposable
         // A Create or ownership transfer folded by this tick can unlock the next held link in the chain.
         // Queue it now; the frame budget still applies because it is folded by a later tick.
         AdmitHeld();
+        NoteStoredEntity();
         if (_scratch.SceneCommits is not null)
         {
             foreach (var request in _scratch.SceneCommits)
@@ -510,6 +512,14 @@ public sealed class AetherLabelLink : IDisposable
 
             _heldContributions.Enqueue(held);
         }
+    }
+
+    private void NoteStoredEntity()
+    {
+        if (_host.Reducer.GetEntity(_entityId) is null && _host.Reducer.GetDeletion(_entityId) is null)
+            return;
+        if (_scene is SceneManager manager)
+            manager.NoteAetherEntity(_entityId);
     }
 
     private void Note(AetherOperation operation)

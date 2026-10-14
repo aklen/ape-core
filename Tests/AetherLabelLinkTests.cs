@@ -746,6 +746,54 @@ public sealed class AetherLabelLinkTests
     }
 
     [Fact]
+    public void A_stored_label_entity_leaves_replica_sync()
+    {
+        var store = new AetherReducer();
+        store.DefineField("label", "lww");
+        var actor = AetherActorId.Format("peer-a", "s1");
+        store.Apply(new AetherOperation(
+            "pub-peer-a", "entity-1", "peer-a", actor, 1, 1,
+            new Dictionary<string, FieldValue>(), AetherEffect.Publish, "catalog"), observeClock: true);
+        store.RestoreActorSequence(actor, 1);
+        var transport = new ScriptedTransport("peer-a");
+        using var network = new NetworkManager(transport, "peer-a", allowUnauthenticated: true);
+        var services = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var scene = services.GetRequiredService<ISceneManager>();
+        var replicas = services.GetRequiredService<IReplicaManager>();
+        var log = services.GetRequiredService<ILogger>();
+        SceneCommitApplicator.Apply(
+            scene,
+            new CreateRegisteredEntityCommitRequest(TestStubEntity.RegistryTypeId, "entity-1"),
+            log);
+        var host = new AetherHost(store, 4096, 8);
+        using var link = new AetherLabelLink(
+            network, host, scene, log, "entity-1", "peer-a", "s1", "catalog", allowUnauthenticated: true);
+
+        var entity = Assert.IsType<TestStubEntity>(scene.GetEntity("entity-1"));
+        Assert.Same(entity, replicas.GetReplica("entity-1"));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(
+            ReplicaPacketType.Update, new TestStubEntity { Id = "entity-1", Counter = 3, Label = "stolen" }));
+        Assert.Equal(3, entity.Counter);
+        Assert.Null(entity.Label);
+
+        Assert.Equal(AetherAdmitKind.Queued, link.SubmitCreate(TestStubEntity.RegistryTypeId).Kind);
+        link.Pump();
+
+        Assert.Same(entity, scene.GetEntity("entity-1"));
+        Assert.Null(replicas.GetReplica("entity-1"));
+        Assert.NotNull(store.GetEntity("entity-1"));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(
+            ReplicaPacketType.Update, new TestStubEntity { Id = "entity-1", Counter = 9, Label = "stolen" }));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(
+            ReplicaPacketType.Create, new TestStubEntity { Id = "entity-1", Counter = 9, Label = "stolen" }));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildDeletePacket("entity-1"));
+        Assert.Same(entity, scene.GetEntity("entity-1"));
+        Assert.Null(replicas.GetReplica("entity-1"));
+        Assert.Equal(3, entity.Counter);
+        Assert.NotEqual("stolen", entity.Label);
+    }
+
+    [Fact]
     public void Ownership_transfer_changes_the_peer_allowed_to_delete()
     {
         using var left = Peer("peer-a");
