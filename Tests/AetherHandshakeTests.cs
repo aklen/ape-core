@@ -1356,15 +1356,16 @@ public sealed class AetherHandshakeTests
         var cube = Assert.IsType<TestStubEntity>(scene.GetEntity("cube"));
         Assert.Equal("red", cube.Label);
         Assert.Equal(4, cube.Offset);
-        Assert.Same(cube, replicas.GetReplica("cube"));
+        Assert.Null(replicas.GetReplica("cube"));
 
         var incoming = new TestStubEntity { Id = "cube", Counter = 99, Label = "stolen", Offset = 50 };
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.Create, incoming));
         replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.Update, incoming));
         replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.FullSync, incoming));
         replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildDeletePacket("cube"));
 
         Assert.Same(cube, scene.GetEntity("cube"));
-        Assert.Same(cube, replicas.GetReplica("cube"));
+        Assert.Null(replicas.GetReplica("cube"));
         Assert.Equal("red", cube.Label);
         Assert.Equal(4, cube.Offset);
         Assert.Equal(0, cube.Counter);
@@ -1382,6 +1383,35 @@ public sealed class AetherHandshakeTests
         Assert.Null(scene.GetEntity("plain"));
         Assert.Null(replicas.GetReplica("plain"));
         Assert.Same(cube, scene.GetEntity("cube"));
+    }
+
+    [Fact]
+    public void A_registered_entity_leaves_replica_sync_when_the_reducer_stores_it()
+    {
+        var services = RegisteredEntityCommitTests.BuildWithStubRegistered();
+        var scene = services.GetRequiredService<ISceneManager>();
+        var replicas = services.GetRequiredService<IReplicaManager>();
+        TestStubEntity moved;
+        using (SceneMutationScope.Begin())
+        {
+            moved = Assert.IsType<TestStubEntity>(scene.CreateRegisteredEntity(TestStubEntity.RegistryTypeId, "moved", "owner-a"));
+            moved.Label = "kept";
+        }
+
+        Assert.Same(moved, replicas.GetReplica("moved"));
+        Assert.IsType<SceneManager>(scene).NoteAetherEntity("moved");
+
+        Assert.Same(moved, scene.GetEntity("moved"));
+        Assert.Null(replicas.GetReplica("moved"));
+        Assert.Equal("kept", moved.Label);
+
+        var incoming = new TestStubEntity { Id = "moved", Label = "stolen" };
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildDeletePacket("moved"));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.Create, incoming));
+
+        Assert.Same(moved, scene.GetEntity("moved"));
+        Assert.Null(replicas.GetReplica("moved"));
+        Assert.Equal("kept", moved.Label);
     }
 
     [Fact]

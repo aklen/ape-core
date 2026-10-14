@@ -135,7 +135,10 @@ public class SceneManager : ISceneManager, ICoreService
         ArgumentException.ThrowIfNullOrEmpty(entityId);
         _aetherEntities.Add(entityId);
         if (_entities.TryGetValue(entityId, out var entity) && entity is Replica replica)
+        {
             replica.YieldEntityToAether();
+            _replicaManager.Unregister(entityId);
+        }
     }
 
     internal void DeliverReplica(ReplicaReceivedEvent evt)
@@ -367,14 +370,16 @@ public class SceneManager : ISceneManager, ICoreService
             replica.IsLocal = true;
         }
 
-        if (entity is Replica handled && _aetherEntities.Contains(dictionaryKey))
+        var projected = _aetherEntities.Contains(dictionaryKey);
+        if (projected && entity is Replica handled)
             handled.YieldEntityToAether();
 
         if (entity is Base baseObj)
             baseObj.SceneManager = this;
 
         _entities[dictionaryKey] = entity;
-        _replicaManager.Register((IReplica)entity);
+        if (!projected)
+            _replicaManager.Register((IReplica)entity);
     }
     
     /// <summary>

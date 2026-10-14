@@ -213,8 +213,11 @@ ids for one connection. The scene link then sends that connection only this
 peer's own envelopes for those ids. No list keeps the full catch-up. An empty
 list receives nothing. Disconnect clears the list. The list does not grant
 publication membership or owner authority. A scene entity the reducer stores
-is not written or removed by a replica update or delete. The scene commit
-removes it when the reducer stores the tombstone. An entity the reducer does
+is not registered for replica state sync. One that was already registered
+leaves that registry without a replica delete packet, and the scene object
+stays. A replica create, update, or delete does not write or announce it.
+The scene commit removes it when the reducer stores the tombstone. The
+one-entity link still yields only its label. An entity the reducer does
 not store still follows the replica path.
 
 ## Treat persistence as protocol state
