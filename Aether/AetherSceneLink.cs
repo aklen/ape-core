@@ -681,7 +681,9 @@ public sealed class AetherSceneLink : IDisposable
         AetherEffect.TransferOwnership,
         newOwnerId: row.OwnerId,
         priorOwnerOperationId: row.PriorOperationId,
-        authority: row.Authority);
+        authority: row.Authority,
+        frozenVisibilityOperationId: row.FrozenVisibilityOperationId,
+        frozenMembershipOperationIds: row.FrozenMembershipOperationIds);
 
     private AetherOperation SealAuthority(AetherOperation operation)
     {

@@ -173,7 +173,9 @@ public static class AetherCheckpoint
                 ownership.PreviousOwnerId, ownership.Version.ActorId, ownership.Sequence,
                 ownership.Version.Lamport, new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
                 newOwnerId: ownership.OwnerId, priorOwnerOperationId: ownership.PriorOperationId,
-                authority: ownership.Authority);
+                authority: ownership.Authority,
+                frozenVisibilityOperationId: ownership.FrozenVisibilityOperationId,
+                frozenMembershipOperationIds: ownership.FrozenMembershipOperationIds);
             if (!AetherAuthority.Verify(transfer))
                 throw new AetherProtocolException("Checkpoint authority proof is missing or invalid.");
         }

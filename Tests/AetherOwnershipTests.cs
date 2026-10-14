@@ -2,6 +2,8 @@ using Ape.Core.Aether;
 using Ape.Core.Determinism;
 using Ape.Core.Graph;
 using Ape.Core.Logging;
+using Ape.Core.Network;
+using Ape.Core.Network.Services;
 using Ape.Core.Replication;
 using Ape.Core.Scene;
 using Ape.Core.Scene.Commit;
@@ -190,6 +192,89 @@ public sealed class AetherOwnershipTests
         foreach (var request in scratch.SceneCommits!) SceneCommitApplicator.Apply(scene, request, logger);
 
         Assert.Equal("owner-b", Assert.IsAssignableFrom<Replica>(scene.GetEntity("entity-1")).OwnerId);
+    }
+
+    [Fact]
+    public void Transfer_keeps_the_previous_owners_hide_and_refuses_a_new_one()
+    {
+        using var previousDir = new TempDir();
+        using var nextDir = new TempDir();
+        using var saveDir = new TempDir();
+        using var previous = new NetworkManager("none", previousDir.Path);
+        using var next = new NetworkManager("none", nextDir.Path);
+        var previousActor = AetherActorId.Format(previous.PrincipalId, "s1");
+        var nextActor = AetherActorId.Format(next.PrincipalId, "s1");
+        var source = Store();
+        var create = Signed(previous, new AetherOperation("create", "entity-1", previous.PrincipalId,
+            previousActor, 1, 1, new Dictionary<string, FieldValue>(), AetherEffect.CreateEntity,
+            entityTypeId: TestStubEntity.RegistryTypeId, creatorId: previous.PrincipalId,
+            ownerId: previous.PrincipalId));
+        Apply(source, create);
+        var hide = Signed(previous, new AetherOperation("hide-1", "entity-1", previous.PrincipalId,
+            previousActor, 2, 2, new Dictionary<string, FieldValue>(), AetherEffect.HideShared));
+        Apply(source, hide);
+        var publish = Signed(previous, new AetherOperation("publish-1", "entity-1", previous.PrincipalId,
+            previousActor, 3, 3, new Dictionary<string, FieldValue>(), AetherEffect.Publish, "catalog"));
+        Apply(source, publish);
+        var transfer = source.StampLocalTransfer("entity-1", next.PrincipalId, previous.PrincipalId,
+            previousActor, operation => Signed(previous, operation));
+        Apply(source, transfer);
+
+        Assert.Equal("hide-1", transfer.FrozenVisibilityOperationId);
+        Assert.True(AetherReducer.FrozenMembershipContains(transfer.FrozenMembershipOperationIds, "publish-1"));
+        Assert.True(AetherWire.TryDecodeAny(AetherWire.Encode(transfer), out var decoded, out _));
+        Assert.Equal(transfer.FrozenVisibilityOperationId, decoded!.FrozenVisibilityOperationId);
+        Assert.Equal(transfer.FrozenMembershipOperationIds, decoded.FrozenMembershipOperationIds);
+
+        var receiver = Store();
+        Apply(receiver, create);
+        Apply(receiver, transfer);
+        new AetherArchive(saveDir.Path).Save(receiver);
+        var loaded = new AetherArchive(saveDir.Path).Load();
+        Assert.Equal("hide-1", Assert.Single(loaded.Ownership).FrozenVisibilityOperationId);
+        Apply(loaded, hide);
+        Apply(loaded, publish);
+        Assert.False(loaded.IsSharedVisible("entity-1"));
+        Assert.True(loaded.IsMember("entity-1", "catalog"));
+
+        var laterHide = Signed(previous, new AetherOperation("hide-2", "entity-1", previous.PrincipalId,
+            previousActor, 6, 8, new Dictionary<string, FieldValue>(), AetherEffect.HideShared));
+        var reused = Signed(previous, new AetherOperation("hide-1", "entity-1", previous.PrincipalId,
+            previousActor, 7, 9, new Dictionary<string, FieldValue>(), AetherEffect.Publish, "catalog"));
+        var hideError = Assert.Throws<AetherProtocolException>(() => Apply(loaded, laterHide));
+        var unseen = Store();
+        Apply(unseen, create);
+        Apply(unseen, transfer);
+        var publishError = Assert.Throws<AetherProtocolException>(() => Apply(unseen, reused));
+        Assert.Equal("Hide is not issued by the entity owner.", hideError.Message);
+        Assert.Equal("Publication is not issued by the entity owner.", publishError.Message);
+        Assert.False(loaded.IsSharedVisible("entity-1"));
+        Assert.True(loaded.IsMember("entity-1", "catalog"));
+
+        var restore = Signed(next, new AetherOperation("restore-1", "entity-1", next.PrincipalId,
+            nextActor, 1, 10, new Dictionary<string, FieldValue>(), AetherEffect.RestoreShared));
+        Apply(loaded, restore);
+        Apply(loaded, hide);
+        Assert.True(loaded.IsSharedVisible("entity-1"));
+
+        var queued = Store();
+        Apply(queued, create);
+        Apply(queued, transfer);
+        var host = new AetherHost(queued, 64 * 1024, 16);
+        var admitted = host.TryAcceptRemote(hide, previous.PrincipalId, requireAuthorityProof: true);
+        var refused = host.TryAcceptRemote(laterHide, previous.PrincipalId, requireAuthorityProof: true);
+        Assert.Equal(AetherAdmitKind.Queued, admitted.Kind);
+        Assert.Equal(AetherAdmitKind.Refused, refused.Kind);
+        Assert.Equal("Hide is not issued by the entity owner.", refused.Reason);
+        host.Drain();
+        Assert.False(queued.IsSharedVisible("entity-1"));
+    }
+
+    private static AetherOperation Signed(NetworkManager identity, AetherOperation operation)
+    {
+        var signer = (IPrincipalSigner)identity;
+        Assert.True(signer.TrySignPrincipal(operation.AuthorityPayload(), out var key, out var signature));
+        return AetherAuthority.Seal(operation, key, signature);
     }
 
     private static AetherReducer Store()

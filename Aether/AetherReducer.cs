@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace Ape.Core.Aether;
 
 /// <summary>
@@ -70,6 +72,64 @@ public sealed class AetherReducer
 
     public bool Covers(string operationId) =>
         !string.IsNullOrEmpty(operationId) && _coverage.Contains(operationId);
+
+    internal bool AllowsFrozenLifecycle(string entityId, string writerId, string operationId, bool visibility)
+    {
+        if (GetOwnership(entityId) is not { } row
+            || !string.Equals(row.PreviousOwnerId, writerId, StringComparison.Ordinal))
+            return false;
+        if (visibility)
+            return !string.IsNullOrEmpty(row.FrozenVisibilityOperationId)
+                && string.Equals(row.FrozenVisibilityOperationId, operationId, StringComparison.Ordinal);
+        return FrozenMembershipContains(row.FrozenMembershipOperationIds, operationId);
+    }
+
+    internal string FrozenVisibilityOperationId(string entityId) =>
+        _visibility.TryGetValue(entityId, out var mark) ? mark.OperationId : "";
+
+    internal IEnumerable<string> MembershipOperationIds(string entityId) =>
+        _membership.Where(mark => string.Equals(mark.Key.EntityId, entityId, StringComparison.Ordinal))
+            .Select(mark => mark.Value.OperationId);
+
+    internal static string FreezeMembershipOperationIds(IEnumerable<string> operationIds)
+    {
+        var ordered = operationIds
+            .Where(id => !string.IsNullOrEmpty(id))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .ToArray();
+        if (ordered.Length > 64)
+            throw new AetherProtocolException("Ownership transfer freezes too many publications.");
+        var builder = new StringBuilder();
+        foreach (var id in ordered)
+        {
+            builder.Append(id.Length.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            builder.Append(':');
+            builder.Append(id);
+            builder.Append(';');
+        }
+
+        return builder.ToString();
+    }
+
+    internal static bool FrozenMembershipContains(string canon, string operationId)
+    {
+        if (string.IsNullOrEmpty(canon) || string.IsNullOrEmpty(operationId))
+            return false;
+        var index = 0;
+        while (index < canon.Length)
+        {
+            var colon = canon.IndexOf(':', index);
+            if (colon <= index || !int.TryParse(canon.AsSpan(index, colon - index), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var length)
+                || length < 0 || colon + 1 + length >= canon.Length || canon[colon + 1 + length] != ';')
+                return false;
+            if (canon.AsSpan(colon + 1, length).SequenceEqual(operationId))
+                return true;
+            index = colon + 1 + length + 1;
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// True only when the original operation payload is still stored.
@@ -333,7 +393,9 @@ public sealed class AetherReducer
             $"{actorId}/{sequence.ToString(System.Globalization.CultureInfo.InvariantCulture)}",
             entityId, writerId, actorId, sequence, nextClock,
             new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
-            newOwnerId: newOwnerId, priorOwnerOperationId: prior);
+            newOwnerId: newOwnerId, priorOwnerOperationId: prior,
+            frozenVisibilityOperationId: FrozenVisibilityOperationId(entityId),
+            frozenMembershipOperationIds: FreezeMembershipOperationIds(MembershipOperationIds(entityId)));
         RejectBeforeAdmit(stamped);
         stamped = Seal(stamped, seal);
         AetherWire.Encode(stamped);
@@ -919,10 +981,13 @@ public sealed class AetherReducer
         if (owner is null)
             return;
         var visibility = op.Effect is AetherEffect.HideShared or AetherEffect.RestoreShared;
-        if (!string.Equals(op.WriterId, owner, StringComparison.Ordinal))
-            throw new AetherProtocolException(visibility
-                ? "Hide is not issued by the entity owner."
-                : "Publication is not issued by the entity owner.");
+        if (string.Equals(op.WriterId, owner, StringComparison.Ordinal))
+            return;
+        if (AllowsFrozenLifecycle(op.EntityId, op.WriterId, op.Id, visibility))
+            return;
+        throw new AetherProtocolException(visibility
+            ? "Hide is not issued by the entity owner."
+            : "Publication is not issued by the entity owner.");
     }
 
     private void RejectCreation(AetherOperation op)
@@ -1004,7 +1069,8 @@ public sealed class AetherReducer
             return existing;
         var generation = _ownership.TryGetValue(op.EntityId, out var current) ? checked(current.Generation + 1) : 1;
         return new StoredOwnership(op.EntityId, op.WriterId, op.NewOwnerId!, op.PriorOwnerOperationId!, generation,
-            new FieldVersion(op.Lamport, op.ActorId), op.Id, op.Sequence, op.Authority);
+            new FieldVersion(op.Lamport, op.ActorId), op.Id, op.Sequence, op.Authority,
+            op.FrozenVisibilityOperationId, op.FrozenMembershipOperationIds);
     }
 
     private static void RequireOwnership(StoredOwnership row)
@@ -1019,7 +1085,9 @@ public sealed class AetherReducer
         RequireAuthorityWhenPresent(new AetherOperation(
             row.OperationId, row.EntityId, row.PreviousOwnerId, row.Version.ActorId, row.Sequence,
             row.Version.Lamport, new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
-            newOwnerId: row.OwnerId, priorOwnerOperationId: row.PriorOperationId, authority: row.Authority));
+            newOwnerId: row.OwnerId, priorOwnerOperationId: row.PriorOperationId, authority: row.Authority,
+            frozenVisibilityOperationId: row.FrozenVisibilityOperationId,
+            frozenMembershipOperationIds: row.FrozenMembershipOperationIds));
     }
 
     private List<StoredOwnership> FoldOwnership(IReadOnlyList<StoredOwnership>? rows, IReadOnlyList<StoredEntity> entities)
@@ -1575,7 +1643,9 @@ public sealed record StoredOwnership(
     FieldVersion Version,
     string OperationId,
     long Sequence,
-    AetherAuthorityProof? Authority = null);
+    AetherAuthorityProof? Authority = null,
+    string FrozenVisibilityOperationId = "",
+    string FrozenMembershipOperationIds = "");
 
 public readonly record struct SeenOperation(string Id, string Digest, long Lamport);
 

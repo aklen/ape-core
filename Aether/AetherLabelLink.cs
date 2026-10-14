@@ -667,7 +667,9 @@ public sealed class AetherLabelLink : IDisposable
     private static AetherOperation OwnershipOperation(StoredOwnership row) => new(
         row.OperationId, row.EntityId, row.PreviousOwnerId, row.Version.ActorId, row.Sequence, row.Version.Lamport,
         new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
-        newOwnerId: row.OwnerId, priorOwnerOperationId: row.PriorOperationId, authority: row.Authority);
+        newOwnerId: row.OwnerId, priorOwnerOperationId: row.PriorOperationId, authority: row.Authority,
+        frozenVisibilityOperationId: row.FrozenVisibilityOperationId,
+        frozenMembershipOperationIds: row.FrozenMembershipOperationIds);
 
     private AetherOperation SealAuthority(AetherOperation operation)
     {

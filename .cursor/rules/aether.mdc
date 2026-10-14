@@ -77,7 +77,7 @@ versioned canonical envelope. Verify the fingerprint, signature, operation id, e
 effect, version, and lifecycle metadata before the host queue. Preserve that proof in
 the wire, snapshot, log, and catch-up envelope. A signature proves authorship; reducer
 rules grant authority. Delete requires the authenticated principal to equal the current owner. Ownership transfer is explicit, is issued by
-that current owner, and names the operation that established it. Keep creator,
+that current owner, and names the operation that established it. It also names the visibility operation id and the membership operation ids current when it was signed. After the transfer, only those exact envelopes from the previous owner are still accepted. A new hide or publication from that previous owner is refused. The new owner does not re-sign them. Keep creator,
 initial owner, and current owner separate. Never resolve two transfers from the same
 prior ownership operation by arrival order or actor id; that is owner equivocation,
 outside the valid input set. An exact replay of the current transfer remains idempotent after digest eviction. A missing predecessor may wait only in a bounded queue.

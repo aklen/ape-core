@@ -154,6 +154,8 @@ public static class AetherWire
         Reserve(ref size, 16);
         ReserveText(ref size, op.NewOwnerId!);
         ReserveText(ref size, op.PriorOwnerOperationId!);
+        ReserveText(ref size, op.FrozenVisibilityOperationId);
+        ReserveText(ref size, op.FrozenMembershipOperationIds);
         ReserveProof(ref size, op.Authority);
         using var body = new MemoryStream(size);
         body.WriteByte(TransferType);
@@ -166,6 +168,8 @@ public static class AetherWire
         WriteI64(body, op.Lamport);
         WriteText(body, op.NewOwnerId!);
         WriteText(body, op.PriorOwnerOperationId!);
+        WriteText(body, op.FrozenVisibilityOperationId);
+        WriteText(body, op.FrozenMembershipOperationIds);
         WriteProof(body, op.Authority);
         return WithChecksum(body.ToArray());
     }
@@ -544,13 +548,16 @@ public static class AetherWire
         var lamport = reader.I64();
         var newOwnerId = reader.Text();
         var prior = reader.Text();
+        var frozenVisibility = reader.Text();
+        var frozenMembership = reader.Text();
         var authority = ReadProof(ref reader);
         reader.End();
         if (entityId is not null && !string.Equals(encodedEntity, entityId, StringComparison.Ordinal))
             throw new AetherProtocolException("Entity is not on this link.");
         return new AetherOperation(id, encodedEntity, writerId, actorId, sequence, lamport,
             new Dictionary<string, FieldValue>(), AetherEffect.TransferOwnership,
-            newOwnerId: newOwnerId, priorOwnerOperationId: prior, authority: authority);
+            newOwnerId: newOwnerId, priorOwnerOperationId: prior, authority: authority,
+            frozenVisibilityOperationId: frozenVisibility, frozenMembershipOperationIds: frozenMembership);
     }
 
     private static AetherOperation DecodeVisibility(ref Reader reader, string? entityId, bool hidden)

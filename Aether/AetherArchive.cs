@@ -13,7 +13,7 @@ public sealed class AetherArchive
 {
     public const string SnapshotFileName = "snapshot.bin";
     public const string LogFileName = "recovery.log";
-    internal const ushort StateFormatVersion = 11;
+    internal const ushort StateFormatVersion = 12;
     private const byte ContributionRecord = 0x10;
     private const int HeaderPrefixLength = 18;
     private const int HeaderLength = 50;
@@ -353,7 +353,7 @@ public sealed class AetherArchive
             var operationId = reader.Text();
             var sequence = reader.I64();
             rows.Add(new StoredOwnership(entityId, previousOwnerId, ownerId, priorOperationId, generation,
-                version, operationId, sequence, ReadProof(reader)));
+                version, operationId, sequence, ReadProof(reader), reader.Text(), reader.Text()));
         }
         return rows;
     }
@@ -468,6 +468,8 @@ public sealed class AetherArchive
             WriteI64(buffer, row.Version.Lamport); WriteText(buffer, row.Version.ActorId);
             WriteText(buffer, row.OperationId); WriteI64(buffer, row.Sequence);
             WriteProof(buffer, row.Authority);
+            WriteText(buffer, row.FrozenVisibilityOperationId);
+            WriteText(buffer, row.FrozenMembershipOperationIds);
         }
 
         WriteU32(buffer, (uint)reducer.ActorCursors.Count);
@@ -508,6 +510,8 @@ public sealed class AetherArchive
         WriteText(buffer, op.OwnerId ?? "");
         WriteText(buffer, op.NewOwnerId ?? "");
         WriteText(buffer, op.PriorOwnerOperationId ?? "");
+        WriteText(buffer, op.FrozenVisibilityOperationId);
+        WriteText(buffer, op.FrozenMembershipOperationIds);
         WriteProof(buffer, op.Authority);
         WriteI64(buffer, op.Sequence);
         WriteI64(buffer, op.Lamport);
@@ -600,6 +604,8 @@ public sealed class AetherArchive
         var ownerId = reader.Text();
         var newOwnerId = reader.Text();
         var priorOwnerOperationId = reader.Text();
+        var frozenVisibility = reader.Text();
+        var frozenMembership = reader.Text();
         var authority = ReadProof(reader);
         var sequence = reader.I64();
         var lamport = reader.I64();
@@ -636,7 +642,9 @@ public sealed class AetherArchive
             effect == AetherEffect.CreateEntity ? ownerId : null,
             effect == AetherEffect.TransferOwnership ? newOwnerId : null,
             effect == AetherEffect.TransferOwnership ? priorOwnerOperationId : null,
-            authority), clock);
+            authority,
+            effect == AetherEffect.TransferOwnership ? frozenVisibility : null,
+            effect == AetherEffect.TransferOwnership ? frozenMembership : null), clock);
     }
 
     private static byte[] Finish(ReadOnlySpan<byte> magic, long generation, byte[] body)

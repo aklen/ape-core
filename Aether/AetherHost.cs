@@ -62,7 +62,7 @@ public sealed class AetherHost
         if (requireAuthorityProof
             && op.Effect is AetherEffect.HideShared or AetherEffect.RestoreShared
                 or AetherEffect.Publish or AetherEffect.WithdrawPublication
-            && !OwnsLifecycle(op.EntityId, principalId, op.Effect is AetherEffect.HideShared or AetherEffect.RestoreShared, out var lifecycle))
+            && !OwnsLifecycle(op.EntityId, principalId, op.Id, op.Effect is AetherEffect.HideShared or AetherEffect.RestoreShared, out var lifecycle))
             return lifecycle;
         if (op.Effect == AetherEffect.CreateEntity
             && (!string.Equals(op.CreatorId, principalId, StringComparison.Ordinal)
@@ -155,7 +155,7 @@ public sealed class AetherHost
         bool hidden,
         Func<AetherOperation, AetherOperation>? seal = null)
     {
-        if (!OwnsLifecycle(entityId, writerId, visibility: true, out var refused))
+        if (!OwnsLifecycle(entityId, writerId, operationId: "", visibility: true, out var refused))
             return refused;
         var bytes = BaseBytes + Utf8(entityId) + Utf8(writerId) + Utf8(actorId) + 16 + AuthorityReservation(seal);
         return TryEnqueue(new Pending(null, new LocalWrite(
@@ -171,7 +171,7 @@ public sealed class AetherHost
         bool published,
         Func<AetherOperation, AetherOperation>? seal = null)
     {
-        if (!OwnsLifecycle(entityId, writerId, visibility: false, out var refused))
+        if (!OwnsLifecycle(entityId, writerId, operationId: "", visibility: false, out var refused))
             return refused;
         var bytes = BaseBytes + Utf8(entityId) + Utf8(publicationId) + Utf8(writerId) + Utf8(actorId) + 16
             + AuthorityReservation(seal);
@@ -494,7 +494,7 @@ public sealed class AetherHost
 
     private static int Utf8(string? value) => value is null ? 0 : Encoding.UTF8.GetByteCount(value);
 
-    private bool OwnsLifecycle(string entityId, string writerId, bool visibility, out AetherAdmit refused)
+    private bool OwnsLifecycle(string entityId, string writerId, string operationId, bool visibility, out AetherAdmit refused)
     {
         var owner = Reducer.GetOwner(entityId);
         if (owner is null)
@@ -505,7 +505,8 @@ public sealed class AetherHost
             return false;
         }
 
-        if (!string.Equals(owner, writerId, StringComparison.Ordinal))
+        if (!string.Equals(owner, writerId, StringComparison.Ordinal)
+            && !Reducer.AllowsFrozenLifecycle(entityId, writerId, operationId, visibility))
         {
             refused = AetherAdmit.Refused(visibility
                 ? "Hide is not issued by the entity owner."

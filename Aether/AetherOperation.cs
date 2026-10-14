@@ -39,7 +39,9 @@ public sealed class AetherOperation
         string? ownerId = null,
         string? newOwnerId = null,
         string? priorOwnerOperationId = null,
-        AetherAuthorityProof? authority = null)
+        AetherAuthorityProof? authority = null,
+        string? frozenVisibilityOperationId = null,
+        string? frozenMembershipOperationIds = null)
     {
         Id = id ?? throw new ArgumentNullException(nameof(id));
         EntityId = entityId ?? throw new ArgumentNullException(nameof(entityId));
@@ -82,8 +84,11 @@ public sealed class AetherOperation
         {
             if (string.IsNullOrEmpty(newOwnerId) || string.IsNullOrEmpty(priorOwnerOperationId))
                 throw new AetherProtocolException("Ownership transfer needs a new owner and prior operation.");
+            frozenVisibilityOperationId ??= "";
+            frozenMembershipOperationIds ??= "";
         }
-        else if (newOwnerId is not null || priorOwnerOperationId is not null)
+        else if (newOwnerId is not null || priorOwnerOperationId is not null
+            || frozenVisibilityOperationId is not null || frozenMembershipOperationIds is not null)
         {
             throw new AetherProtocolException("This operation has no ownership metadata.");
         }
@@ -101,9 +106,11 @@ public sealed class AetherOperation
         OwnerId = ownerId;
         NewOwnerId = newOwnerId;
         PriorOwnerOperationId = priorOwnerOperationId;
+        FrozenVisibilityOperationId = frozenVisibilityOperationId ?? "";
+        FrozenMembershipOperationIds = frozenMembershipOperationIds ?? "";
         Authority = authority is null ? null : new AetherAuthorityProof(authority.PublicKey, authority.Signature);
         Changes = new ReadOnlyDictionary<string, FieldValue>(stored);
-        Digest = ComputeDigest(EntityId, WriterId, ActorId, Sequence, Lamport, Changes, effect, publicationId, entityTypeId, creatorId, ownerId, newOwnerId, priorOwnerOperationId);
+        Digest = ComputeDigest(EntityId, WriterId, ActorId, Sequence, Lamport, Changes, effect, publicationId, entityTypeId, creatorId, ownerId, newOwnerId, priorOwnerOperationId, FrozenVisibilityOperationId, FrozenMembershipOperationIds);
     }
 
     public string Id { get; }
@@ -129,6 +136,11 @@ public sealed class AetherOperation
     public string? OwnerId { get; }
     public string? NewOwnerId { get; }
     public string? PriorOwnerOperationId { get; }
+
+    public string FrozenVisibilityOperationId { get; }
+
+    public string FrozenMembershipOperationIds { get; }
+
     public AetherAuthorityProof? Authority { get; }
 
     public IReadOnlyDictionary<string, FieldValue> Changes { get; }
@@ -141,7 +153,8 @@ public sealed class AetherOperation
         WriteString(buffer, "ape-aether-authority-v1");
         WriteString(buffer, Id);
         WriteSemantic(buffer, EntityId, WriterId, ActorId, Sequence, Lamport, Changes, Effect,
-            PublicationId, EntityTypeId, CreatorId, OwnerId, NewOwnerId, PriorOwnerOperationId);
+            PublicationId, EntityTypeId, CreatorId, OwnerId, NewOwnerId, PriorOwnerOperationId,
+            FrozenVisibilityOperationId, FrozenMembershipOperationIds);
         return buffer.ToArray();
     }
 
@@ -158,11 +171,14 @@ public sealed class AetherOperation
         string? creatorId = null,
         string? ownerId = null,
         string? newOwnerId = null,
-        string? priorOwnerOperationId = null)
+        string? priorOwnerOperationId = null,
+        string frozenVisibilityOperationId = "",
+        string frozenMembershipOperationIds = "")
     {
         using var buffer = new MemoryStream();
         WriteSemantic(buffer, entityId, writerId, actorId, sequence, lamport, changes, effect,
-            publicationId, entityTypeId, creatorId, ownerId, newOwnerId, priorOwnerOperationId);
+            publicationId, entityTypeId, creatorId, ownerId, newOwnerId, priorOwnerOperationId,
+            frozenVisibilityOperationId, frozenMembershipOperationIds);
         return Convert.ToHexString(SHA256.HashData(buffer.ToArray()));
     }
 
@@ -180,7 +196,9 @@ public sealed class AetherOperation
         string? creatorId,
         string? ownerId,
         string? newOwnerId,
-        string? priorOwnerOperationId)
+        string? priorOwnerOperationId,
+        string frozenVisibilityOperationId,
+        string frozenMembershipOperationIds)
     {
         buffer.WriteByte((byte)effect);
         WriteString(buffer, publicationId ?? "");
@@ -189,6 +207,11 @@ public sealed class AetherOperation
         WriteString(buffer, ownerId ?? "");
         WriteString(buffer, newOwnerId ?? "");
         WriteString(buffer, priorOwnerOperationId ?? "");
+        if (effect == AetherEffect.TransferOwnership)
+        {
+            WriteString(buffer, frozenVisibilityOperationId);
+            WriteString(buffer, frozenMembershipOperationIds);
+        }
         WriteString(buffer, entityId);
         WriteString(buffer, writerId);
         WriteString(buffer, actorId);
@@ -262,7 +285,9 @@ public static class AetherAuthority
         new(operation.Id, operation.EntityId, operation.WriterId, operation.ActorId, operation.Sequence, operation.Lamport,
             operation.Changes, operation.Effect, operation.PublicationId, operation.EntityTypeId, operation.CreatorId,
             operation.OwnerId, operation.NewOwnerId, operation.PriorOwnerOperationId,
-            new AetherAuthorityProof(publicKey, signature));
+            new AetherAuthorityProof(publicKey, signature),
+            operation.Effect == AetherEffect.TransferOwnership ? operation.FrozenVisibilityOperationId : null,
+            operation.Effect == AetherEffect.TransferOwnership ? operation.FrozenMembershipOperationIds : null);
 
     public static bool Verify(AetherOperation operation)
     {
