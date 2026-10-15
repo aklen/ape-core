@@ -50,6 +50,14 @@ public interface INetworkTransport : IDisposable
     void Connect(string host, int port, string? peerName = null, string? role = null);
 
     /// <summary>
+    /// How often this transport should prove that a connection is still alive.
+    /// Zero leaves the transport's own default. Call this before <see cref="StartServer"/> or <see cref="Connect"/>.
+    /// </summary>
+    void SetKeepAlive(TimeSpan interval)
+    {
+    }
+
+    /// <summary>
     /// Send data reliably (guaranteed delivery, ordered).
     /// </summary>
     /// <param name="peerId">Target peer ID (string)</param>

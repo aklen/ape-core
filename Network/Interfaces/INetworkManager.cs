@@ -40,6 +40,14 @@ public interface INetworkManager
     void Connect(string address, int port, string? peerName = null, string? role = null);
 
     /// <summary>
+    /// How often the selected transport should prove that a connection is still alive.
+    /// Zero leaves that transport's own default. Call this before <see cref="StartServer"/> or <see cref="Connect"/>.
+    /// </summary>
+    void SetKeepAlive(TimeSpan interval)
+    {
+    }
+
+    /// <summary>
     /// Stop the network manager and disconnect all peers.
     /// </summary>
     void Stop();

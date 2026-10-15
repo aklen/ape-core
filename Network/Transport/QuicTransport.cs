@@ -46,6 +46,7 @@ public class QuicTransport : INetworkTransport
     private static readonly TimeSpan ConnectionIdleTimeout = TimeSpan.FromMinutes(2);
 
     private string _transportType = "quic";
+    private TimeSpan _keepAliveInterval;
 
     private readonly ILogger _logger;
     private QuicListener? _listener;
@@ -106,6 +107,22 @@ public class QuicTransport : INetworkTransport
         }
     }
 
+    public void SetKeepAlive(TimeSpan interval)
+    {
+        if (interval < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(interval));
+
+        _keepAliveInterval = interval;
+        if (interval > TimeSpan.Zero)
+            _logger.LogInfo($"[QuicTransport] Keep-alive every {interval.TotalSeconds:0}s");
+    }
+
+    internal (TimeSpan Probe, TimeSpan Idle) QuicTimers() =>
+    (
+        TransportKeepAlive.QuicProbe(_keepAliveInterval),
+        TransportKeepAlive.QuicIdle(_keepAliveInterval, ConnectionIdleTimeout)
+    );
+
     public void StartServer(int port, string? peerName = null, string? role = null)
     {
         if (_isRunning)
@@ -132,9 +149,11 @@ public class QuicTransport : INetworkTransport
             ConnectionOptionsCallback = (connection, sslInfo, cancellationToken) =>
             {
                 _logger.LogInfo($"[QuicTransport] ConnectionOptionsCallback called, SNI: {sslInfo.ServerName}");
+                var timers = QuicTimers();
                 return ValueTask.FromResult(new QuicServerConnectionOptions
                 {
-                    IdleTimeout = ConnectionIdleTimeout,
+                    KeepAliveInterval = timers.Probe,
+                    IdleTimeout = timers.Idle,
                     DefaultStreamErrorCode = 0,
                     DefaultCloseErrorCode = 0,
                     MaxInboundBidirectionalStreams = 100, // Allow client to open streams to server
@@ -218,10 +237,12 @@ public class QuicTransport : INetworkTransport
         _logger.LogInfo($"[QuicTransport] Client ALPN protocol: {System.Text.Encoding.UTF8.GetString(alpnProtocol.Protocol.ToArray())}");
         _logger.LogInfo($"[QuicTransport] Connecting to {host}:{port} with TargetHost: {host}");
         _logger.LogInfo($"[QuicTransport] 🆔 LocalPeerId = {_localPeerId}");
+        var timers = QuicTimers();
         var clientOptions = new QuicClientConnectionOptions
         {
             RemoteEndPoint = new DnsEndPoint(host, port),
-            IdleTimeout = ConnectionIdleTimeout,
+            KeepAliveInterval = timers.Probe,
+            IdleTimeout = timers.Idle,
             DefaultStreamErrorCode = 0,
             DefaultCloseErrorCode = 0,
             MaxInboundBidirectionalStreams = 100, // Allow server to open streams to client

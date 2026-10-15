@@ -29,6 +29,8 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
     private bool _isRunning;
     private bool _isServer;
     private string _localPeerId = string.Empty;  // Empty = not connected/started
+    private readonly int _defaultPingInterval;
+    private readonly int _defaultDisconnectTimeout;
 
     private sealed class BulkQueue
     {
@@ -59,7 +61,30 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
     {
         _logger = logger;
         _netManager = new NetManager(this) { ChannelsCount = BulkChannel + 1 };
+        _defaultPingInterval = _netManager.PingInterval;
+        _defaultDisconnectTimeout = _netManager.DisconnectTimeout;
     }
+
+    public void SetKeepAlive(TimeSpan interval)
+    {
+        if (interval < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(interval));
+
+        if (interval == TimeSpan.Zero)
+        {
+            _netManager.PingInterval = _defaultPingInterval;
+            _netManager.DisconnectTimeout = _defaultDisconnectTimeout;
+            return;
+        }
+
+        _netManager.PingInterval = TransportKeepAlive.LiteNetPingMilliseconds(interval);
+        _netManager.DisconnectTimeout = TransportKeepAlive.LiteNetDisconnectMilliseconds(interval, _defaultDisconnectTimeout);
+        _logger.LogInfo($"[LiteNetLibTransport] Keep-alive every {interval.TotalSeconds:0}s");
+    }
+
+    internal int PingIntervalMilliseconds => _netManager.PingInterval;
+
+    internal int DisconnectTimeoutMilliseconds => _netManager.DisconnectTimeout;
 
     public void StartServer(int port, string? peerName = null, string? role = null)
     {

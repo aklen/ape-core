@@ -475,6 +475,8 @@ public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, I
         _transport.Connect(address, port, peerName, role);
     }
 
+    public void SetKeepAlive(TimeSpan interval) => _transport.SetKeepAlive(interval);
+
     public void Stop()
     {
         _transport.Stop();

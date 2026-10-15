@@ -231,6 +231,12 @@ public static class ApeSystem
         {
             var port = networkSection?.GetInt("port") ?? 9050;
             var peerName = networkSection?.GetString("peerName");
+            var keepAliveSeconds = networkSection?.GetInt("keepAliveSeconds") ?? 0;
+            if (keepAliveSeconds > 0)
+            {
+                networkManager.SetKeepAlive(TimeSpan.FromSeconds(keepAliveSeconds));
+                logger.LogInfo($"Network keep-alive every {keepAliveSeconds}s");
+            }
 
             if (role == "client")
             {
