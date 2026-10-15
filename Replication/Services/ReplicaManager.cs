@@ -85,6 +85,8 @@ public class ReplicaManager : IReplicaManager, ICoreService
     private readonly HashSet<string> _setClosed = new(StringComparer.Ordinal);
     private readonly HashSet<string> _setCloseInFlight = new(StringComparer.Ordinal);
     private readonly object _setGate = new();
+    private readonly object _deleteGate = new();
+    private readonly Dictionary<string, Dictionary<string, PendingDelete>> _pendingDeletes = new(StringComparer.Ordinal);
     private readonly ReplicaFieldOutbound _outbound = new();
 
     private void OnPeerConnected(string peerId)
@@ -115,6 +117,8 @@ public class ReplicaManager : IReplicaManager, ICoreService
         _logger.LogInfo($"[ReplicaManager] Peer {peerId} disconnected");
         _accessControl?.UnregisterPeer(peerId);
         _outbound.ForgetPeer(peerId);
+        lock (_deleteGate)
+            _pendingDeletes.Remove(peerId);
         lock (_setGate)
         {
             _setClosed.Remove(peerId);
@@ -187,17 +191,9 @@ public class ReplicaManager : IReplicaManager, ICoreService
             if (HandledByAether(replica))
                 return;
 
-            // Send Delete packet to subscribed peers (or broadcast if no access control)
-            try
-            {
-                var packet = ReplicaPacketBuilder.BuildDeletePacket(replicaId);
-                SendToRecipients(replica.UniquePath, packet);
-                _logger.LogDebug($"Sent Delete packet for replica {replicaId}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error sending Delete packet for replica {replicaId}", ex);
-            }
+            var packet = ReplicaPacketBuilder.BuildDeletePacket(replicaId);
+            foreach (var peerId in RecipientList(replica.UniquePath))
+                QueueDelete(peerId, replicaId, packet);
         }
     }
 
@@ -231,6 +227,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
         foreach (var peerId in _networkManager.GetConnectedPeers())
             TryCloseSet(peerId);
+        FlushDeletes();
     }
 
     /// <summary>
@@ -285,6 +282,71 @@ public class ReplicaManager : IReplicaManager, ICoreService
         if (subscribed != null)
             return subscribed;
         return _networkManager.GetConnectedPeers();
+    }
+
+    private void QueueDelete(string peerId, string replicaId, byte[] packet)
+    {
+        lock (_deleteGate)
+        {
+            if (!_pendingDeletes.TryGetValue(peerId, out var byReplica))
+            {
+                byReplica = new Dictionary<string, PendingDelete>(StringComparer.Ordinal);
+                _pendingDeletes[peerId] = byReplica;
+            }
+
+            byReplica[replicaId] = new PendingDelete(packet);
+        }
+
+        FlushDeletes();
+    }
+
+    private void FlushDeletes()
+    {
+        var outgoing = new List<(string PeerId, string ReplicaId, byte[] Packet)>();
+        lock (_deleteGate)
+        {
+            foreach (var (peerId, byReplica) in _pendingDeletes)
+            {
+                foreach (var (replicaId, pending) in byReplica)
+                {
+                    if (pending.InFlight)
+                        continue;
+                    pending.InFlight = true;
+                    outgoing.Add((peerId, replicaId, pending.Packet));
+                }
+            }
+        }
+
+        foreach (var item in outgoing)
+        {
+            Deliver(item.PeerId, item.Packet, flushed =>
+            {
+                lock (_deleteGate)
+                {
+                    if (!_pendingDeletes.TryGetValue(item.PeerId, out var byReplica))
+                        return;
+                    if (!byReplica.TryGetValue(item.ReplicaId, out var pending))
+                        return;
+                    if (!flushed)
+                    {
+                        pending.InFlight = false;
+                        return;
+                    }
+
+                    byReplica.Remove(item.ReplicaId);
+                    if (byReplica.Count == 0)
+                        _pendingDeletes.Remove(item.PeerId);
+                }
+            });
+        }
+    }
+
+    private sealed class PendingDelete
+    {
+        public PendingDelete(byte[] packet) => Packet = packet;
+
+        public byte[] Packet { get; }
+        public bool InFlight { get; set; }
     }
 
     private void Deliver(string peerId, byte[] packet, Action<bool> onFlushed)

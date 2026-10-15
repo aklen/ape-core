@@ -153,6 +153,30 @@ public class ReplicaFieldSyncTests
         Assert.NotNull(manager.GetReplica("mine"));
     }
 
+    [Fact]
+    public void A_failed_delete_is_sent_again()
+    {
+        var network = new RecordingNetwork { FailDeleteFlushes = 1 };
+        var manager = new ReplicaManager();
+        manager.Initialize(new ServiceCollection()
+            .AddSingleton<INetworkManager>(network)
+            .AddSingleton<IEventManager>(new QuietEvents())
+            .AddSingleton<ILogger>(new QuietLog())
+            .BuildServiceProvider());
+
+        network.AddPeer("client");
+        manager.Register(new FieldProbe { Id = "device-1" });
+        manager.Unregister("device-1");
+
+        Assert.Equal(1, network.Sent.Count(packet => packet[0] == (byte)ReplicaPacketType.Delete));
+
+        manager.Tick();
+        Assert.Equal(2, network.Sent.Count(packet => packet[0] == (byte)ReplicaPacketType.Delete));
+
+        manager.Tick();
+        Assert.Equal(2, network.Sent.Count(packet => packet[0] == (byte)ReplicaPacketType.Delete));
+    }
+
     [MessagePackObject]
     internal sealed class FieldProbe : Replica
     {
@@ -177,6 +201,7 @@ public class ReplicaFieldSyncTests
     private sealed class RecordingNetwork : QuietNetwork
     {
         public List<byte[]> Sent { get; } = new();
+        public int FailDeleteFlushes { get; set; }
         private readonly List<string> _peers = new();
 
         public void AddPeer(string peerId)
@@ -189,7 +214,14 @@ public class ReplicaFieldSyncTests
         public override void Send(string peerId, byte[] data, bool reliable, Action<bool>? onFlushed)
         {
             Sent.Add(data);
-            onFlushed?.Invoke(true);
+            var ok = true;
+            if (data.Length > 0 && data[0] == (byte)ReplicaPacketType.Delete && FailDeleteFlushes > 0)
+            {
+                FailDeleteFlushes--;
+                ok = false;
+            }
+
+            onFlushed?.Invoke(ok);
         }
     }
 
