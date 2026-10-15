@@ -108,6 +108,51 @@ public class ReplicaFieldSyncTests
         Assert.Null(manager.GetReplica("missing"));
     }
 
+    [Fact]
+    public void A_full_sync_ends_with_the_owned_replica_ids()
+    {
+        var network = new RecordingNetwork();
+        var manager = new ReplicaManager();
+        manager.Initialize(new ServiceCollection()
+            .AddSingleton<INetworkManager>(network)
+            .AddSingleton<IEventManager>(new QuietEvents())
+            .AddSingleton<ILogger>(new QuietLog())
+            .BuildServiceProvider());
+
+        manager.Register(new FieldProbe { Id = "device-1" });
+        network.AddPeer("client");
+
+        Assert.Contains(network.Sent, packet => packet[0] == (byte)ReplicaPacketType.FullSync);
+        var closing = Assert.Single(network.Sent, packet => packet[0] == (byte)ReplicaPacketType.SyncComplete);
+        Assert.True(ReplicaPacketBuilder.TryParseSyncComplete(closing, out var owner, out var ids));
+        Assert.Equal("owner", owner);
+        Assert.Equal("device-1", Assert.Single(ids));
+    }
+
+    [Fact]
+    public void A_sync_completion_drops_replicas_the_owner_no_longer_has()
+    {
+        var manager = new ReplicaManager();
+        manager.Initialize(new ServiceCollection()
+            .AddSingleton<INetworkManager>(new QuietNetwork())
+            .AddSingleton<IEventManager>(new QuietEvents())
+            .AddSingleton<ILogger>(new QuietLog())
+            .BuildServiceProvider());
+
+        manager.Register(new FieldProbe { Id = "keep", OwnerId = "server" });
+        manager.Register(new FieldProbe { Id = "stale", OwnerId = "server" });
+        manager.Register(new FieldProbe { Id = "other", OwnerId = "someone-else" });
+        manager.Register(new FieldProbe { Id = "mine" });
+
+        manager.OnNetworkData("peer", ReplicaPacketBuilder.BuildSyncComplete("server", new[] { "keep" }));
+        manager.OnNetworkData("peer", ReplicaPacketBuilder.BuildSyncComplete("owner", Array.Empty<string>()));
+
+        Assert.NotNull(manager.GetReplica("keep"));
+        Assert.Null(manager.GetReplica("stale"));
+        Assert.NotNull(manager.GetReplica("other"));
+        Assert.NotNull(manager.GetReplica("mine"));
+    }
+
     [MessagePackObject]
     internal sealed class FieldProbe : Replica
     {
@@ -129,13 +174,33 @@ public class ReplicaFieldSyncTests
         }
     }
 
-    private sealed class QuietNetwork : INetworkManager
+    private sealed class RecordingNetwork : QuietNetwork
+    {
+        public List<byte[]> Sent { get; } = new();
+        private readonly List<string> _peers = new();
+
+        public void AddPeer(string peerId)
+        {
+            _peers.Add(peerId);
+            RaisePeerConnected(peerId);
+        }
+
+        public override IReadOnlyList<string> GetConnectedPeers() => _peers;
+        public override void Send(string peerId, byte[] data, bool reliable, Action<bool>? onFlushed)
+        {
+            Sent.Add(data);
+            onFlushed?.Invoke(true);
+        }
+    }
+
+    private class QuietNetwork : INetworkManager
     {
         public string LocalPeerId => "owner";
         public string PrincipalId => "owner";
         public string Role => "server";
         public event Action<string, byte[]>? OnDataReceived;
         public event Action<string>? OnPeerConnected;
+        protected void RaisePeerConnected(string peerId) => OnPeerConnected?.Invoke(peerId);
         public event Action<string>? OnPeerDisconnected;
         public event Action<PeerConnectionContext>? OnPeerIdentified;
         public void StartServer(int port, string? peerName = null, string? role = null) { }
@@ -143,6 +208,10 @@ public class ReplicaFieldSyncTests
         public void Stop() { }
         public void Broadcast(byte[] data, bool reliable = true) { }
         public void Send(string peerId, byte[] data, bool reliable = true) { }
+        public virtual void Send(string peerId, byte[] data, bool reliable, Action<bool>? onFlushed)
+        {
+            onFlushed?.Invoke(true);
+        }
         public bool TrySendBulk(string connectionId, byte[] data) => false;
         public void PollEvents() { }
         public bool TryGetPeer(string connectionId, out PeerConnectionContext peer)
@@ -150,7 +219,7 @@ public class ReplicaFieldSyncTests
             peer = default;
             return false;
         }
-        public IReadOnlyList<string> GetConnectedPeers() => Array.Empty<string>();
+        public virtual IReadOnlyList<string> GetConnectedPeers() => Array.Empty<string>();
         public IEnumerable<string> GetLocalIPAddresses() => Array.Empty<string>();
         public string GetPreferredLocalIPAddress() => "127.0.0.1";
     }

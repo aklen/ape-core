@@ -42,6 +42,12 @@ public enum ReplicaPacketType : byte
     Unsubscribe = 0x05,
 
     /// <summary>
+    /// Closes a full-sync batch. Lists every replica the sender currently owns.
+    /// The receiver drops that owner's replicas that are not in the list.
+    /// </summary>
+    SyncComplete = 0x06,
+
+    /// <summary>
     /// Video frame packet (adaptive streaming). Not processed by ReplicaManager.
     /// Payload: [4 streamId][4 frameIndex][4 quality][N jpeg bytes]
     /// </summary>
@@ -166,6 +172,42 @@ public static class ReplicaPacketBuilder
             Array.Copy(data, offset, encoded, 0, valueLength);
             offset += valueLength;
             fields.Add((name, encoded));
+        }
+
+        return offset == data.Length;
+    }
+
+    internal static byte[] BuildSyncComplete(string ownerId, IReadOnlyList<string> replicaIds)
+    {
+        ArgumentNullException.ThrowIfNull(ownerId);
+        ArgumentNullException.ThrowIfNull(replicaIds);
+        var buffer = new List<byte>(64);
+        buffer.Add((byte)ReplicaPacketType.SyncComplete);
+        WriteText(buffer, ownerId);
+        WriteInt(buffer, replicaIds.Count);
+        foreach (var replicaId in replicaIds)
+            WriteText(buffer, replicaId);
+        return buffer.ToArray();
+    }
+
+    internal static bool TryParseSyncComplete(byte[] data, out string ownerId, out List<string> replicaIds)
+    {
+        ownerId = string.Empty;
+        replicaIds = new List<string>();
+        if (data.Length < 1 || data[0] != (byte)ReplicaPacketType.SyncComplete)
+            return false;
+
+        var offset = 1;
+        if (!TryReadText(data, ref offset, out ownerId))
+            return false;
+        if (!TryReadInt(data, ref offset, out var count) || count < 0 || count > 100_000)
+            return false;
+
+        for (var i = 0; i < count; i++)
+        {
+            if (!TryReadText(data, ref offset, out var replicaId))
+                return false;
+            replicaIds.Add(replicaId);
         }
 
         return offset == data.Length;

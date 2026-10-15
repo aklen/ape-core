@@ -11,6 +11,19 @@ internal sealed class ReplicaFieldOutbound
     private readonly object _gate = new();
     private readonly Dictionary<string, Dictionary<string, PeerReplica>> _byReplica = new(StringComparer.Ordinal);
 
+    public Action<string>? PeerImageFlushed { get; set; }
+
+    public bool HasFlushedImage(string replicaId, string peerId)
+    {
+        lock (_gate)
+        {
+            return _byReplica.TryGetValue(replicaId, out var peers)
+                && peers.TryGetValue(peerId, out var slot)
+                && slot.ImageFlushed
+                && !slot.Retired;
+        }
+    }
+
     public void ForgetPeer(string peerId)
     {
         lock (_gate)
@@ -99,6 +112,7 @@ internal sealed class ReplicaFieldOutbound
 
     private void Complete(Pending item, bool flushed)
     {
+        var imageReady = false;
         lock (_gate)
         {
             item.Slot.InFlight = false;
@@ -108,8 +122,14 @@ internal sealed class ReplicaFieldOutbound
             foreach (var field in item.Sent)
                 item.Slot.Flushed[field.Name] = field.Value;
             if (item.Image)
+            {
                 item.Slot.ImageFlushed = true;
+                imageReady = true;
+            }
         }
+
+        if (imageReady)
+            PeerImageFlushed?.Invoke(item.PeerId);
     }
 
     private sealed class PeerReplica

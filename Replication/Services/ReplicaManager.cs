@@ -47,6 +47,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
         _logger = services.GetRequiredService<ILogger>();
         _accessControl = services.GetService<IReplicaAccessControlService>();
 
+        _outbound.PeerImageFlushed = TryCloseSet;
         _logger.LogDebug($"[ReplicaManager] Initialize called (NetworkManager HashCode: {_networkManager.GetHashCode()})");
         _logger.LogDebug("[ReplicaManager] Subscribing to NetworkManager events");
 
@@ -81,6 +82,9 @@ public class ReplicaManager : IReplicaManager, ICoreService
     }
 
     private readonly HashSet<string> _syncedPeers = new();
+    private readonly HashSet<string> _setClosed = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _setCloseInFlight = new(StringComparer.Ordinal);
+    private readonly object _setGate = new();
     private readonly ReplicaFieldOutbound _outbound = new();
 
     private void OnPeerConnected(string peerId)
@@ -102,6 +106,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
             _logger.LogInfo($"[ReplicaManager] Peer {peerId} connected - sending initial sync (call #{(_syncedPeers.Count)})");
             PushOwned(ReplicaPacketType.FullSync, peerId);
+            TryCloseSet(peerId);
         }
     }
 
@@ -110,6 +115,11 @@ public class ReplicaManager : IReplicaManager, ICoreService
         _logger.LogInfo($"[ReplicaManager] Peer {peerId} disconnected");
         _accessControl?.UnregisterPeer(peerId);
         _outbound.ForgetPeer(peerId);
+        lock (_setGate)
+        {
+            _setClosed.Remove(peerId);
+            _setCloseInFlight.Remove(peerId);
+        }
 
         // Remove from synced peers list
         lock (_syncedPeers)
@@ -218,6 +228,9 @@ public class ReplicaManager : IReplicaManager, ICoreService
                 }
             }
         }
+
+        foreach (var peerId in _networkManager.GetConnectedPeers())
+            TryCloseSet(peerId);
     }
 
     /// <summary>
@@ -329,6 +342,12 @@ public class ReplicaManager : IReplicaManager, ICoreService
                 return;
             }
 
+            if (packetType == ReplicaPacketType.SyncComplete)
+            {
+                ApplySyncComplete(peerId, data);
+                return;
+            }
+
             // Handle Create/FullSync packets (full replica payload)
             if (!ReplicaPacketBuilder.TryParsePacket(data, out var parsedReplicaId, out var ownerId, out var typeName, out var payload))
             {
@@ -394,6 +413,78 @@ public class ReplicaManager : IReplicaManager, ICoreService
         }
 
         _logger.LogDebug($"Updated {fields.Count} field(s) on replica {replicaId}");
+    }
+
+    private void TryCloseSet(string peerId)
+    {
+        string[] ids;
+        lock (_setGate)
+        {
+            if (_setClosed.Contains(peerId) || _setCloseInFlight.Contains(peerId))
+                return;
+
+            var owned = OwnedFor(peerId);
+            foreach (var replica in owned)
+            {
+                if (!_outbound.HasFlushedImage(replica.Id, peerId))
+                    return;
+            }
+
+            _setCloseInFlight.Add(peerId);
+            ids = owned.Select(replica => replica.Id).ToArray();
+        }
+
+        var packet = ReplicaPacketBuilder.BuildSyncComplete(_networkManager.LocalPeerId, ids);
+        Deliver(peerId, packet, flushed =>
+        {
+            lock (_setGate)
+            {
+                _setCloseInFlight.Remove(peerId);
+                if (flushed)
+                    _setClosed.Add(peerId);
+            }
+        });
+    }
+
+    private List<Replica> OwnedFor(string peerId)
+    {
+        var owned = new List<Replica>();
+        var localPeerId = _networkManager.LocalPeerId;
+        foreach (var replica in _replicas.Values)
+        {
+            if (replica.OwnerId != localPeerId || HandledByAether(replica) || replica is not Replica tracked)
+                continue;
+            if (!RecipientList(tracked.UniquePath).Contains(peerId, StringComparer.Ordinal))
+                continue;
+            owned.Add(tracked);
+        }
+
+        return owned;
+    }
+
+    private void ApplySyncComplete(string peerId, byte[] data)
+    {
+        if (!ReplicaPacketBuilder.TryParseSyncComplete(data, out var ownerId, out var replicaIds))
+        {
+            _logger.LogWarning($"Received invalid sync completion from peer {peerId}");
+            return;
+        }
+
+        if (ownerId == _networkManager.LocalPeerId)
+            return;
+
+        var keep = new HashSet<string>(replicaIds, StringComparer.Ordinal);
+        var stale = new List<string>();
+        foreach (var replica in _replicas.Values)
+        {
+            if (replica.OwnerId == ownerId && !keep.Contains(replica.Id))
+                stale.Add(replica.Id);
+        }
+
+        foreach (var replicaId in stale)
+            HandleDeletePacket(replicaId);
+
+        _logger.LogInfo($"[ReplicaManager] Sync completion from {ownerId}: kept {keep.Count}, removed {stale.Count}");
     }
 
     private void HandleControlPacket(string peerId, ReplicaPacketType packetType, byte[] data)

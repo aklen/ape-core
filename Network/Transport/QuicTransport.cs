@@ -40,6 +40,11 @@ public class QuicTransport : INetworkTransport
     private const int MaxBulkQueuedBytes = 4 * 1024 * 1024;
     private const int MaxBulkQueuedPackets = 64;
 
+    /// <summary>
+    /// Silence longer than this closes the connection. Zero would leave MsQuic's 30 second default.
+    /// </summary>
+    private static readonly TimeSpan ConnectionIdleTimeout = TimeSpan.FromMinutes(2);
+
     private string _transportType = "quic";
 
     private readonly ILogger _logger;
@@ -129,6 +134,7 @@ public class QuicTransport : INetworkTransport
                 _logger.LogInfo($"[QuicTransport] ConnectionOptionsCallback called, SNI: {sslInfo.ServerName}");
                 return ValueTask.FromResult(new QuicServerConnectionOptions
                 {
+                    IdleTimeout = ConnectionIdleTimeout,
                     DefaultStreamErrorCode = 0,
                     DefaultCloseErrorCode = 0,
                     MaxInboundBidirectionalStreams = 100, // Allow client to open streams to server
@@ -166,44 +172,78 @@ public class QuicTransport : INetworkTransport
         // Generate unique PeerId using PeerIdGenerator
         _localPeerId = PeerIdGenerator.Generate(peerName, role ?? "client", transportId: 0);
 
-        _ = Task.Run(async () =>
+        _ = Task.Run(() => MaintainClientConnectionAsync(host, port));
+    }
+
+    private async Task MaintainClientConnectionAsync(string host, int port)
+    {
+        var delay = TimeSpan.FromSeconds(1);
+        while (!_cts.IsCancellationRequested)
         {
             try
             {
-                var alpnProtocol = new SslApplicationProtocol("apecore");
-                _logger.LogInfo($"[QuicTransport] Client ALPN protocol: {System.Text.Encoding.UTF8.GetString(alpnProtocol.Protocol.ToArray())}");
-                _logger.LogInfo($"[QuicTransport] Connecting to {host}:{port} with TargetHost: {host}");
-                _logger.LogInfo($"[QuicTransport] 🆔 LocalPeerId = {_localPeerId}");
-                var clientOptions = new QuicClientConnectionOptions
-                {
-                    RemoteEndPoint = new DnsEndPoint(host, port),
-                    DefaultStreamErrorCode = 0,
-                    DefaultCloseErrorCode = 0,
-                    MaxInboundBidirectionalStreams = 100, // Allow server to open streams to client
-                    MaxInboundUnidirectionalStreams = 100,
-                    ClientAuthenticationOptions = new SslClientAuthenticationOptions
-                    {
-                        ApplicationProtocols = new List<SslApplicationProtocol> { alpnProtocol },
-                        RemoteCertificateValidationCallback = (sender, certificate, chain, errors) => true, // Accept all certs in dev mode
-                        TargetHost = host // Explicitly set TargetHost for SNI
-                    }
-                };
-
-                _clientConnection = await QuicConnection.ConnectAsync(clientOptions, _cts.Token);
-                var peerId = "0"; // Server is always peer "0" for client
-                _connections[peerId] = _clientConnection;
-
-                _logger.LogInfo($"[QuicTransport] Connected to {host}:{port}");
-                OnPeerConnected?.Invoke(peerId);
-
-                // Start receiving on reliable stream
-                _ = Task.Run(() => ReceiveFromConnectionAsync(peerId, _clientConnection));
+                await ConnectClientOnceAsync(host, port);
+                delay = TimeSpan.FromSeconds(1);
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+                break;
             }
             catch (Exception ex)
             {
-                _logger.LogError($"[QuicTransport] Connection failed: {ex.Message}", ex);
+                _logger.LogWarning($"[QuicTransport] Connection failed: {ex.Message}. Retrying.");
             }
-        });
+
+            if (_cts.IsCancellationRequested)
+                break;
+
+            _logger.LogInfo($"[QuicTransport] Reconnecting to {host}:{port} in {delay.TotalSeconds:0}s");
+            try
+            {
+                await Task.Delay(delay, _cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            var nextSeconds = Math.Min(delay.TotalSeconds * 2, 8);
+            delay = TimeSpan.FromSeconds(nextSeconds);
+        }
+    }
+
+    private async Task ConnectClientOnceAsync(string host, int port)
+    {
+        var alpnProtocol = new SslApplicationProtocol("apecore");
+        _logger.LogInfo($"[QuicTransport] Client ALPN protocol: {System.Text.Encoding.UTF8.GetString(alpnProtocol.Protocol.ToArray())}");
+        _logger.LogInfo($"[QuicTransport] Connecting to {host}:{port} with TargetHost: {host}");
+        _logger.LogInfo($"[QuicTransport] 🆔 LocalPeerId = {_localPeerId}");
+        var clientOptions = new QuicClientConnectionOptions
+        {
+            RemoteEndPoint = new DnsEndPoint(host, port),
+            IdleTimeout = ConnectionIdleTimeout,
+            DefaultStreamErrorCode = 0,
+            DefaultCloseErrorCode = 0,
+            MaxInboundBidirectionalStreams = 100, // Allow server to open streams to client
+            MaxInboundUnidirectionalStreams = 100,
+            ClientAuthenticationOptions = new SslClientAuthenticationOptions
+            {
+                ApplicationProtocols = new List<SslApplicationProtocol> { alpnProtocol },
+                RemoteCertificateValidationCallback = (sender, certificate, chain, errors) => true, // Accept all certs in dev mode
+                TargetHost = host // Explicitly set TargetHost for SNI
+            }
+        };
+
+        var connection = await QuicConnection.ConnectAsync(clientOptions, _cts.Token);
+        _clientConnection = connection;
+        var peerId = "0"; // Server is always peer "0" for client
+        _connections[peerId] = connection;
+
+        _logger.LogInfo($"[QuicTransport] Connected to {host}:{port}");
+        OnPeerConnected?.Invoke(peerId);
+        await ReceiveFromConnectionAsync(peerId, connection);
+        if (ReferenceEquals(_clientConnection, connection))
+            _clientConnection = null;
     }
 
     private async Task AcceptConnectionsAsync()
