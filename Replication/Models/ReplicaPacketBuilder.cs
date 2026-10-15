@@ -19,7 +19,7 @@ public enum ReplicaPacketType : byte
     
     /// <summary>
     /// Update packet sent when replica properties change.
-    /// Contains only changed property data (delta update).
+    /// Carries the replica id and only the properties that changed for that peer.
     /// </summary>
     Update = 0x02,
     
@@ -117,6 +117,95 @@ public static class ReplicaPacketBuilder
         Array.Copy(data, 0, packet, offset, data.Length);
         
         return packet;
+    }
+
+    /// <summary>
+    /// Update packet: [type][id][owner][count] then [name][MessagePack value] for each changed property.
+    /// </summary>
+    internal static byte[] BuildPropertyUpdate(Replica replica, IReadOnlyList<ReplicaFieldSample> fields)
+    {
+        ArgumentNullException.ThrowIfNull(replica);
+        ArgumentNullException.ThrowIfNull(fields);
+        var buffer = new List<byte>(128);
+        buffer.Add((byte)ReplicaPacketType.Update);
+        WriteText(buffer, replica.Id);
+        WriteText(buffer, replica.OwnerId);
+        WriteInt(buffer, fields.Count);
+        foreach (var field in fields)
+        {
+            WriteText(buffer, field.Name);
+            var encoded = replica.EncodeSyncField(field.Name);
+            WriteInt(buffer, encoded.Length);
+            buffer.AddRange(encoded);
+        }
+
+        return buffer.ToArray();
+    }
+
+    internal static bool TryParsePropertyUpdate(byte[] data, out string replicaId, out string ownerId, out List<(string Name, byte[] Encoded)> fields)
+    {
+        replicaId = string.Empty;
+        ownerId = string.Empty;
+        fields = new List<(string Name, byte[] Encoded)>();
+        if (data.Length < 1 || data[0] != (byte)ReplicaPacketType.Update)
+            return false;
+
+        var offset = 1;
+        if (!TryReadText(data, ref offset, out replicaId) || !TryReadText(data, ref offset, out ownerId))
+            return false;
+        if (!TryReadInt(data, ref offset, out var count) || count < 0 || count > 4096)
+            return false;
+
+        for (var i = 0; i < count; i++)
+        {
+            if (!TryReadText(data, ref offset, out var name))
+                return false;
+            if (!TryReadInt(data, ref offset, out var valueLength) || valueLength < 0 || data.Length < offset + valueLength)
+                return false;
+            var encoded = new byte[valueLength];
+            Array.Copy(data, offset, encoded, 0, valueLength);
+            offset += valueLength;
+            fields.Add((name, encoded));
+        }
+
+        return offset == data.Length;
+    }
+
+    private static void WriteText(List<byte> buffer, string value)
+    {
+        var bytes = System.Text.Encoding.UTF8.GetBytes(value ?? string.Empty);
+        WriteInt(buffer, bytes.Length);
+        buffer.AddRange(bytes);
+    }
+
+    private static void WriteInt(List<byte> buffer, int value)
+    {
+        Span<byte> scratch = stackalloc byte[4];
+        BitConverter.TryWriteBytes(scratch, value);
+        buffer.Add(scratch[0]);
+        buffer.Add(scratch[1]);
+        buffer.Add(scratch[2]);
+        buffer.Add(scratch[3]);
+    }
+
+    private static bool TryReadInt(byte[] data, ref int offset, out int value)
+    {
+        value = 0;
+        if (data.Length < offset + 4)
+            return false;
+        value = BitConverter.ToInt32(data, offset);
+        offset += 4;
+        return true;
+    }
+
+    private static bool TryReadText(byte[] data, ref int offset, out string value)
+    {
+        value = string.Empty;
+        if (!TryReadInt(data, ref offset, out var length) || length < 0 || length > 4096 || data.Length < offset + length)
+            return false;
+        value = System.Text.Encoding.UTF8.GetString(data, offset, length);
+        offset += length;
+        return true;
     }
     
     /// <summary>

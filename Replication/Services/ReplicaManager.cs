@@ -81,6 +81,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
     }
 
     private readonly HashSet<string> _syncedPeers = new();
+    private readonly ReplicaFieldOutbound _outbound = new();
 
     private void OnPeerConnected(string peerId)
     {
@@ -100,7 +101,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
             _syncedPeers.Add(peerId);
 
             _logger.LogInfo($"[ReplicaManager] Peer {peerId} connected - sending initial sync (call #{(_syncedPeers.Count)})");
-            SendInitialSync(peerId);
+            PushOwned(ReplicaPacketType.FullSync, peerId);
         }
     }
 
@@ -108,6 +109,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
     {
         _logger.LogInfo($"[ReplicaManager] Peer {peerId} disconnected");
         _accessControl?.UnregisterPeer(peerId);
+        _outbound.ForgetPeer(peerId);
 
         // Remove from synced peers list
         lock (_syncedPeers)
@@ -150,19 +152,8 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
             // Only broadcast if we own this replica. An Aether entity leaves on its own wire.
             bool weOwnThis = replica.OwnerId == _networkManager.LocalPeerId;
-            if (weOwnThis && !HandledByAether(replica))
-            {
-                try
-                {
-                    var packet = ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.Create, replica);
-                    SendToRecipients(replica.UniquePath, packet);
-                    _logger.LogDebug($"Sent Create packet for replica {replica.Id} (we own it)");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError($"Error sending Create packet for replica {replica.Id}", ex);
-                }
-            }
+            if (weOwnThis && !HandledByAether(replica) && replica is Replica tracked)
+                PushReplica(tracked, ReplicaPacketType.Create, onlyPeer: null);
         }
         else
         {
@@ -180,6 +171,8 @@ public class ReplicaManager : IReplicaManager, ICoreService
             {
                 ReplicaId = replicaId
             });
+
+            _outbound.ForgetReplica(replicaId);
 
             if (HandledByAether(replica))
                 return;
@@ -212,16 +205,12 @@ public class ReplicaManager : IReplicaManager, ICoreService
             var localPeerId = _networkManager.LocalPeerId;
             foreach (var replica in _replicas.Values.Where(r => r.OwnerId == localPeerId))
             {
-                if (HandledByAether(replica) || !replica.HasChanges())
+                if (HandledByAether(replica) || replica is not Replica tracked)
                     continue;
 
                 try
                 {
-                    var packet = ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.Update, replica);
-                    SendToRecipients(replica.UniquePath, packet);
-
-                    // Update snapshot after successful broadcast
-                    replica.SnapshotProperties();
+                    PushReplica(tracked, ReplicaPacketType.FullSync, onlyPeer: null);
                 }
                 catch (Exception ex)
                 {
@@ -248,37 +237,54 @@ public class ReplicaManager : IReplicaManager, ICoreService
         }
     }
 
-    /// <summary>
-    /// Send initial sync to a newly connected peer.
-    /// Sends local replicas the peer is subscribed to. With no access control, sends all owned replicas.
-    /// </summary>
-    private void SendInitialSync(string peerId)
+    private void PushOwned(ReplicaPacketType imageType, string? onlyPeer)
     {
-        var syncCount = 0;
         var localPeerId = _networkManager.LocalPeerId;
-
-        foreach (var replica in _replicas.Values.Where(r => r.OwnerId == localPeerId))
+        var count = 0;
+        foreach (var replica in _replicas.Values)
         {
-            if (HandledByAether(replica))
+            if (replica.OwnerId != localPeerId || HandledByAether(replica) || replica is not Replica tracked)
                 continue;
-
-            var recipients = _accessControl?.GetSubscribedPeers(replica.UniquePath);
-            if (recipients != null && !recipients.Contains(peerId))
-                continue;
-
-            try
-            {
-                var packet = ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.FullSync, replica);
-                _networkManager.Send(peerId, packet, reliable: true);
-                syncCount++;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"Error sending initial sync for replica {replica.Id} to peer {peerId}", ex);
-            }
+            PushReplica(tracked, imageType, onlyPeer);
+            count++;
         }
 
-        _logger.LogInfo($"[ReplicaManager] Sent initial sync to peer {peerId}: {syncCount} replicas (owned by {localPeerId})");
+        if (onlyPeer != null)
+            _logger.LogInfo($"[ReplicaManager] Sent initial sync to peer {onlyPeer}: {count} replicas (owned by {localPeerId})");
+    }
+
+    private void PushReplica(Replica replica, ReplicaPacketType imageType, string? onlyPeer)
+    {
+        var recipients = RecipientList(replica.UniquePath);
+        if (onlyPeer != null)
+        {
+            if (!recipients.Contains(onlyPeer, StringComparer.Ordinal))
+                return;
+            recipients = new[] { onlyPeer };
+        }
+
+        _outbound.Pump(replica, recipients, imageType, Deliver);
+    }
+
+    private IReadOnlyList<string> RecipientList(string replicaPath)
+    {
+        var subscribed = _accessControl?.GetSubscribedPeers(replicaPath);
+        if (subscribed != null)
+            return subscribed;
+        return _networkManager.GetConnectedPeers();
+    }
+
+    private void Deliver(string peerId, byte[] packet, Action<bool> onFlushed)
+    {
+        try
+        {
+            _networkManager.Send(peerId, packet, true, onFlushed);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error sending replica state to peer {peerId}", ex);
+            onFlushed(false);
+        }
     }
 
     public void OnNetworkData(string peerId, byte[] data)
@@ -317,7 +323,13 @@ public class ReplicaManager : IReplicaManager, ICoreService
                 return;
             }
 
-            // Handle Create/Update/FullSync packets (all have payload)
+            if (packetType == ReplicaPacketType.Update)
+            {
+                ApplyPropertyUpdate(peerId, data);
+                return;
+            }
+
+            // Handle Create/FullSync packets (full replica payload)
             if (!ReplicaPacketBuilder.TryParsePacket(data, out var parsedReplicaId, out var ownerId, out var typeName, out var payload))
             {
                 _logger.LogWarning($"Received invalid packet from peer {peerId}: parsing failed");
@@ -352,6 +364,36 @@ public class ReplicaManager : IReplicaManager, ICoreService
         {
             _logger.LogError($"Error processing network data from peer {peerId}", ex);
         }
+    }
+
+    private void ApplyPropertyUpdate(string peerId, byte[] data)
+    {
+        if (!ReplicaPacketBuilder.TryParsePropertyUpdate(data, out var replicaId, out _, out var fields))
+        {
+            _logger.LogWarning($"Received invalid Update packet from peer {peerId}");
+            return;
+        }
+
+        if (!_replicas.TryGetValue(replicaId, out var replica))
+        {
+            _logger.LogDebug($"Received Update for unknown replica {replicaId}");
+            return;
+        }
+
+        if (replica is not Replica tracked || HandledByAether(replica))
+        {
+            if (HandledByAether(replica))
+                _logger.LogWarning($"[ReplicaManager] Replica '{replicaId}' is projected by Aether — skip");
+            return;
+        }
+
+        using (SceneMutationScope.Begin())
+        {
+            foreach (var field in fields)
+                tracked.ApplySyncField(field.Name, field.Encoded);
+        }
+
+        _logger.LogDebug($"Updated {fields.Count} field(s) on replica {replicaId}");
     }
 
     private void HandleControlPacket(string peerId, ReplicaPacketType packetType, byte[] data)

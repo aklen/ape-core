@@ -771,8 +771,13 @@ public sealed class AetherLabelLinkTests
 
         var entity = Assert.IsType<TestStubEntity>(scene.GetEntity("entity-1"));
         Assert.Same(entity, replicas.GetReplica("entity-1"));
-        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(
-            ReplicaPacketType.Update, new TestStubEntity { Id = "entity-1", Counter = 3, Label = "stolen" }));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPropertyUpdate(
+            new TestStubEntity { Id = "entity-1", Counter = 3, Label = "stolen" },
+            new[]
+            {
+                new ReplicaFieldSample(nameof(TestStubEntity.Counter), 3),
+                new ReplicaFieldSample(nameof(TestStubEntity.Label), "stolen")
+            }));
         Assert.Equal(3, entity.Counter);
         Assert.Null(entity.Label);
 
@@ -782,8 +787,13 @@ public sealed class AetherLabelLinkTests
         Assert.Same(entity, scene.GetEntity("entity-1"));
         Assert.Null(replicas.GetReplica("entity-1"));
         Assert.NotNull(store.GetEntity("entity-1"));
-        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(
-            ReplicaPacketType.Update, new TestStubEntity { Id = "entity-1", Counter = 9, Label = "stolen" }));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPropertyUpdate(
+            new TestStubEntity { Id = "entity-1", Counter = 9, Label = "stolen" },
+            new[]
+            {
+                new ReplicaFieldSample(nameof(TestStubEntity.Counter), 9),
+                new ReplicaFieldSample(nameof(TestStubEntity.Label), "stolen")
+            }));
         replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(
             ReplicaPacketType.Create, new TestStubEntity { Id = "entity-1", Counter = 9, Label = "stolen" }));
         replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildDeletePacket("entity-1"));

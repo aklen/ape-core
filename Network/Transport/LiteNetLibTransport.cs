@@ -98,19 +98,32 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
 
     public void SendReliable(string peerId, byte[] data)
     {
+        SendReliable(peerId, data, null);
+    }
+
+    public void SendReliable(string peerId, byte[] data, Action<bool>? onFlushed)
+    {
         if (!_isRunning)
+        {
+            onFlushed?.Invoke(false);
             return;
+        }
 
         lock (_peers)
         {
-            if (_peers.TryGetValue(peerId, out var peer))
+            if (!_peers.TryGetValue(peerId, out var peer))
             {
-                var writer = new NetDataWriter();
-                writer.Put((byte)0); // Normal data message type
-                writer.Put(data);
-                peer.Send(writer, DeliveryMethod.ReliableOrdered);
+                onFlushed?.Invoke(false);
+                return;
             }
+
+            var writer = new NetDataWriter();
+            writer.Put((byte)0); // Normal data message type
+            writer.Put(data);
+            peer.Send(writer, DeliveryMethod.ReliableOrdered);
         }
+
+        onFlushed?.Invoke(true);
     }
 
     public void SendUnreliable(string peerId, byte[] data)

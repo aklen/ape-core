@@ -1360,7 +1360,9 @@ public sealed class AetherHandshakeTests
 
         var incoming = new TestStubEntity { Id = "cube", Counter = 99, Label = "stolen", Offset = 50 };
         replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.Create, incoming));
-        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.Update, incoming));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPropertyUpdate(
+            incoming,
+            new[] { new ReplicaFieldSample(nameof(TestStubEntity.Label), "stolen") }));
         replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.FullSync, incoming));
         replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildDeletePacket("cube"));
 
@@ -1377,7 +1379,9 @@ public sealed class AetherHandshakeTests
             plain = Assert.IsType<TestStubEntity>(scene.CreateRegisteredEntity(TestStubEntity.RegistryTypeId, "plain", side.Principal.Id));
         plain.Counter = 1;
         var changed = new TestStubEntity { Id = "plain", Counter = 5 };
-        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPacket(ReplicaPacketType.Update, changed));
+        replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildPropertyUpdate(
+            changed,
+            new[] { new ReplicaFieldSample(nameof(TestStubEntity.Counter), 5) }));
         Assert.Equal(5, plain.Counter);
         replicas.OnNetworkData("intruder", ReplicaPacketBuilder.BuildDeletePacket("plain"));
         Assert.Null(scene.GetEntity("plain"));

@@ -30,6 +30,11 @@ public sealed class NullNetworkTransport : INetworkTransport
 
     public void SendReliable(string peerId, byte[] data) { }
 
+    public void SendReliable(string peerId, byte[] data, Action<bool>? onFlushed)
+    {
+        onFlushed?.Invoke(false);
+    }
+
     public void SendUnreliable(string peerId, byte[] data) { }
 
     public bool TrySendBulk(string peerId, byte[] data)

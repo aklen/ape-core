@@ -60,6 +60,16 @@ public interface INetworkManager
     void Send(string peerId, byte[] data, bool reliable = true);
 
     /// <summary>
+    /// Send to one peer and report whether a reliable payload reached the transport retransmission queue.
+    /// A true result is not a remote acknowledgement.
+    /// </summary>
+    void Send(string peerId, byte[] data, bool reliable, Action<bool>? onFlushed)
+    {
+        Send(peerId, data, reliable);
+        onFlushed?.Invoke(true);
+    }
+
+    /// <summary>
     /// Try to admit one bulk packet to the selected transport's bounded queue.
     /// A successful return transfers an owned copy to the transport; it does not
     /// acknowledge remote receipt, application, or durable storage.

@@ -57,6 +57,16 @@ public interface INetworkTransport : IDisposable
     void SendReliable(string peerId, byte[] data);
 
     /// <summary>
+    /// Send reliably, then report whether the bytes reached this transport's retransmission queue.
+    /// A true result is not a remote acknowledgement.
+    /// </summary>
+    void SendReliable(string peerId, byte[] data, Action<bool>? onFlushed)
+    {
+        SendReliable(peerId, data);
+        onFlushed?.Invoke(true);
+    }
+
+    /// <summary>
     /// Send data unreliably (best-effort, may be lost or out-of-order).
     /// </summary>
     /// <param name="peerId">Target peer ID (string)</param>

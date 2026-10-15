@@ -8,6 +8,8 @@ using Ape.Core.Scene;
 
 namespace Ape.Core.Replication;
 
+internal readonly record struct ReplicaFieldSample(string Name, object? Value);
+
 /// <summary>
 /// Base class for all replicable objects in ApeCore.
 /// Provides automatic serialization, property change detection, and network synchronization.
@@ -318,15 +320,64 @@ public abstract class Replica : IReplica
     /// Check if any properties have changed since the last snapshot.
     /// Returns true if any serializable property differs from its snapshotted value.
     /// </summary>
+    internal List<ReplicaFieldSample> ReadSyncFields()
+    {
+        var fields = new List<ReplicaFieldSample>();
+        if (_handledByAether)
+            return fields;
+
+        foreach (var prop in KeyedProperties())
+        {
+            if (_yieldedToAether.Contains(prop.Name))
+                continue;
+            fields.Add(new ReplicaFieldSample(prop.Name, prop.GetValue(this)));
+        }
+
+        return fields;
+    }
+
+    internal byte[] EncodeSyncField(string name)
+    {
+        var prop = FindKeyedProperty(name) ?? throw new InvalidOperationException($"Replica has no sync field '{name}'.");
+        return MessagePackSerializer.Serialize(prop.PropertyType, prop.GetValue(this), GetMessagePackOptions());
+    }
+
+    internal void ApplySyncField(string name, ReadOnlyMemory<byte> encoded)
+    {
+        if (_handledByAether || _yieldedToAether.Contains(name))
+            return;
+
+        var prop = FindKeyedProperty(name);
+        if (prop is null || !prop.CanWrite)
+            return;
+
+        var value = MessagePackSerializer.Deserialize(prop.PropertyType, encoded, GetMessagePackOptions());
+        prop.SetValue(this, value);
+    }
+
+    private PropertyInfo? FindKeyedProperty(string name)
+    {
+        foreach (var prop in KeyedProperties())
+        {
+            if (prop.Name == name)
+                return prop;
+        }
+
+        return null;
+    }
+
+    private IEnumerable<PropertyInfo> KeyedProperties()
+    {
+        return GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(p => p.CanRead && p.GetCustomAttribute<KeyAttribute>() != null);
+    }
+
     public bool HasChanges()
     {
         if (_handledByAether)
             return false;
 
-        var properties = GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)
-            .Where(p => p.CanRead && p.GetCustomAttribute<KeyAttribute>() != null);
-        
-        foreach (var prop in properties)
+        foreach (var prop in KeyedProperties())
         {
             if (_yieldedToAether.Contains(prop.Name))
                 continue;

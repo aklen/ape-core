@@ -557,10 +557,18 @@ public class QuicTransport : INetworkTransport
 
     public void SendReliable(string peerId, byte[] data)
     {
-        if (!_isRunning || data == null)
-            return;
+        SendReliable(peerId, data, null);
+    }
 
-        _ = SendFramedAsync(peerId, data, unreliable: false, bulk: false);
+    public void SendReliable(string peerId, byte[] data, Action<bool>? onFlushed)
+    {
+        if (!_isRunning || data == null)
+        {
+            onFlushed?.Invoke(false);
+            return;
+        }
+
+        _ = SendFramedAsync(peerId, data, unreliable: false, bulk: false, onFlushed);
     }
 
     public void SendUnreliable(string peerId, byte[] data)
@@ -609,19 +617,32 @@ public class QuicTransport : INetworkTransport
                 packet = channels.BulkQueue.Dequeue();
                 channels.BulkBytes -= packet.Length;
             }
-            await SendFramedAsync(peerId, packet, unreliable: false, bulk: true);
+            await SendFramedAsync(peerId, packet, unreliable: false, bulk: true, onFlushed: null);
         }
     }
 
-    private async Task SendFramedAsync(string peerId, byte[] data, bool unreliable, bool bulk)
+    private async Task SendFramedAsync(string peerId, byte[] data, bool unreliable, bool bulk, Action<bool>? onFlushed = null)
     {
+        var reported = false;
+        void Report(bool flushed)
+        {
+            if (reported)
+                return;
+            reported = true;
+            onFlushed?.Invoke(flushed);
+        }
+
         if (!_connections.TryGetValue(peerId, out var connection))
+        {
+            Report(false);
             return;
+        }
 
         if (data.Length > MaxFramedMessageBytes)
         {
             _logger.LogWarning(
                 $"[QuicTransport] Dropping oversized {(unreliable ? "unreliable" : "reliable")} payload ({data.Length} B) to peer {peerId}");
+            Report(false);
             return;
         }
 
@@ -634,10 +655,12 @@ public class QuicTransport : INetworkTransport
         }
         catch (OperationCanceledException)
         {
+            Report(false);
             return;
         }
         catch (ObjectDisposedException)
         {
+            Report(false);
             return;
         }
 
@@ -657,21 +680,24 @@ public class QuicTransport : INetworkTransport
             await channel.Stream.WriteAsync(lenBytes, _cts.Token);
             await channel.Stream.WriteAsync(data, _cts.Token);
             await channel.Stream.FlushAsync(_cts.Token);
+            Report(true);
         }
         catch (OperationCanceledException)
         {
-            // Shutdown
+            Report(false);
         }
         catch (Exception ex) when (IsExpectedDisconnect(ex))
         {
             await ResetOutboundStreamAsync(channel);
             HandlePeerDisconnect(peerId);
+            Report(false);
         }
         catch (Exception ex)
         {
             _logger.LogError(
                 $"[QuicTransport] Send {channel.Name} error to peer {peerId}: {ex.Message}", ex);
             await ResetOutboundStreamAsync(channel);
+            Report(false);
             // Do not tear down the whole peer on a single stream write failure — next send reopens.
         }
         finally

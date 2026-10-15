@@ -497,14 +497,19 @@ public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, I
 
     public void Send(string peerId, byte[] data, bool reliable = true)
     {
+        Send(peerId, data, reliable, null);
+    }
+
+    public void Send(string peerId, byte[] data, bool reliable, Action<bool>? onFlushed)
+    {
         if (reliable)
         {
-            _transport.SendReliable(peerId, data);
+            _transport.SendReliable(peerId, data, onFlushed);
+            return;
         }
-        else
-        {
-            _transport.SendUnreliable(peerId, data);
-        }
+
+        _transport.SendUnreliable(peerId, data);
+        onFlushed?.Invoke(true);
     }
 
     public void PollEvents()
