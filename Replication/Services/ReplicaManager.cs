@@ -1,4 +1,6 @@
 using Ape.Core.Aether;
+using Ape.Core.Config;
+using Ape.Core.Config.Models;
 using Ape.Core.Runtime.Service;
 using Ape.Core.Event;
 using Ape.Core.Event.Models;
@@ -22,6 +24,9 @@ public class ReplicaManager : IReplicaManager, ICoreService
     public string Name => "Replica Manager";
 
     private readonly ConcurrentDictionary<string, IReplica> _replicas = new();
+    private readonly object _orderGate = new();
+    private readonly List<string> _registrationOrder = new();
+    private ReplicaApplyJournal? _applyJournal;
     private INetworkManager _networkManager = null!;  // Set in Initialize()
     private IEventManager _eventManager = null!;      // Set in Initialize()
     private ILogger _logger = null!;                   // Set in Initialize()
@@ -48,6 +53,11 @@ public class ReplicaManager : IReplicaManager, ICoreService
         _accessControl = services.GetService<IReplicaAccessControlService>();
 
         _outbound.PeerImageFlushed = TryCloseSet;
+        var root = services.GetService<IStartupConfig>()?.Root;
+        var modules = services.GetService<IModuleTable>();
+        var journalPath = modules?.GetModuleSection(root, SceneModuleIds.ModuleId)?.GetString("replicaJournalPath");
+        if (!string.IsNullOrWhiteSpace(journalPath))
+            _applyJournal = ReplicaApplyJournal.CreateNew(journalPath);
         _logger.LogDebug($"[ReplicaManager] Initialize called (NetworkManager HashCode: {_networkManager.GetHashCode()})");
         _logger.LogDebug("[ReplicaManager] Subscribing to NetworkManager events");
 
@@ -72,6 +82,8 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
     public void Stop()
     {
+        _applyJournal?.Dispose();
+        _applyJournal = null;
         // Unsubscribe from events on shutdown
         if (_networkManager != null)
         {
@@ -166,6 +178,8 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
             // Only broadcast if we own this replica. An Aether entity leaves on its own wire.
             bool weOwnThis = replica.OwnerId == _networkManager.LocalPeerId;
+            Remember(replica.Id);
+            _applyJournal?.Register(replica.Id);
             if (weOwnThis && !HandledByAether(replica) && replica is Replica tracked)
                 PushReplica(tracked, ReplicaPacketType.Create, onlyPeer: null);
         }
@@ -179,6 +193,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
     {
         if (_replicas.TryRemove(replicaId, out var replica))
         {
+            Forget(replicaId);
             _logger.LogInfo($"Unregistered replica: {replicaId}");
 
             _eventManager.Publish(new ReplicaUnregisteredEvent
@@ -209,7 +224,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
         {
             // Serialize and send only changed replicas that we own
             var localPeerId = _networkManager.LocalPeerId;
-            foreach (var replica in _replicas.Values.Where(r => r.OwnerId == localPeerId))
+            foreach (var replica in InRegistrationOrder().Where(r => r.OwnerId == localPeerId))
             {
                 if (HandledByAether(replica) || replica is not Replica tracked)
                     continue;
@@ -249,9 +264,15 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
     private void PushOwned(ReplicaPacketType imageType, string? onlyPeer)
     {
+        lock (_tickLock)
+            PushOwnedCore(imageType, onlyPeer);
+    }
+
+    private void PushOwnedCore(ReplicaPacketType imageType, string? onlyPeer)
+    {
         var localPeerId = _networkManager.LocalPeerId;
         var count = 0;
-        foreach (var replica in _replicas.Values)
+        foreach (var replica in InRegistrationOrder())
         {
             if (replica.OwnerId != localPeerId || HandledByAether(replica) || replica is not Replica tracked)
                 continue;
@@ -273,6 +294,10 @@ public class ReplicaManager : IReplicaManager, ICoreService
             recipients = new[] { onlyPeer };
         }
 
+        if (recipients.Count == 0)
+            return;
+
+        _applyJournal?.Send(replica.Id);
         _outbound.Pump(replica, recipients, imageType, Deliver);
     }
 
@@ -471,7 +496,10 @@ public class ReplicaManager : IReplicaManager, ICoreService
         using (SceneMutationScope.Begin())
         {
             foreach (var field in fields)
+            {
                 tracked.ApplySyncField(field.Name, field.Encoded);
+                _applyJournal?.Update(replicaId, field.Name);
+            }
         }
 
         _logger.LogDebug($"Updated {fields.Count} field(s) on replica {replicaId}");
@@ -512,7 +540,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
     {
         var owned = new List<Replica>();
         var localPeerId = _networkManager.LocalPeerId;
-        foreach (var replica in _replicas.Values)
+        foreach (var replica in InRegistrationOrder())
         {
             if (replica.OwnerId != localPeerId || HandledByAether(replica) || replica is not Replica tracked)
                 continue;
@@ -537,7 +565,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
         var keep = new HashSet<string>(replicaIds, StringComparer.Ordinal);
         var stale = new List<string>();
-        foreach (var replica in _replicas.Values)
+        foreach (var replica in InRegistrationOrder())
         {
             if (replica.OwnerId == ownerId && !keep.Contains(replica.Id))
                 stale.Add(replica.Id);
@@ -587,6 +615,7 @@ public class ReplicaManager : IReplicaManager, ICoreService
 
         if (_replicas.TryRemove(replicaId, out var replica))
         {
+            Forget(replicaId);
             var replicaType = replica.GetType().Name;
             var ownerId = replica.OwnerId;
 
@@ -615,6 +644,37 @@ public class ReplicaManager : IReplicaManager, ICoreService
         {
             _logger.LogDebug($"Received Delete packet for unknown replica {replicaId}");
         }
+    }
+
+    private void Remember(string id)
+    {
+        lock (_orderGate)
+        {
+            if (!_registrationOrder.Contains(id))
+                _registrationOrder.Add(id);
+        }
+    }
+
+    private void Forget(string id)
+    {
+        lock (_orderGate)
+            _registrationOrder.Remove(id);
+    }
+
+    private IReplica[] InRegistrationOrder()
+    {
+        string[] ids;
+        lock (_orderGate)
+            ids = _registrationOrder.ToArray();
+
+        var ordered = new List<IReplica>(ids.Length);
+        foreach (var id in ids)
+        {
+            if (_replicas.TryGetValue(id, out var replica))
+                ordered.Add(replica);
+        }
+
+        return ordered.ToArray();
     }
 
     private void HandleCreatePacket(string replicaId, string ownerId, string typeName, byte[] payload, string peerId, ReplicaPacketType packetType)
