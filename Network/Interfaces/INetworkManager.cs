@@ -40,6 +40,29 @@ public interface INetworkManager
     void Connect(string address, int port, string? peerName = null, string? role = null);
 
     /// <summary>
+    /// Keep dialing this endpoint until it is connected or <see cref="Untrack"/> removes it.
+    /// A listener may already be running. The same host and port are one target.
+    /// </summary>
+    void Track(string host, int port, string? principal = null)
+    {
+    }
+
+    /// <summary>
+    /// Drop a desired endpoint. An in-flight dial is ignored when it finishes. A live connection stays until it drops.
+    /// </summary>
+    void Untrack(string host, int port)
+    {
+    }
+
+    /// <summary>
+    /// Backoff after a failed dial or a dropped desired connection.
+    /// The first attempt is immediate. Each later wait starts at <paramref name="initial"/> and doubles up to <paramref name="maximum"/>.
+    /// </summary>
+    void SetReconnect(TimeSpan initial, TimeSpan maximum)
+    {
+    }
+
+    /// <summary>
     /// How often the selected transport should prove that a connection is still alive.
     /// Zero leaves that transport's own default. Call this before <see cref="StartServer"/> or <see cref="Connect"/>.
     /// </summary>

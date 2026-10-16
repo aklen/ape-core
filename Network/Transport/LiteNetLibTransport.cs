@@ -11,7 +11,7 @@ namespace Ape.Core.Network.Transport;
 /// LiteNetLib-based network transport implementation.
 /// Provides UDP communication with reliable and unreliable channels.
 /// </summary>
-public class LiteNetLibTransport : INetworkTransport, INetEventListener
+public class LiteNetLibTransport : INetworkTransport, IOutboundDial, INetEventListener
 {
     private const byte BulkChannel = 1;
     private const int MaxBulkPacketBytes = 272 * 1024;
@@ -26,6 +26,7 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
     private readonly NetManager _netManager;
     private readonly Dictionary<string, NetPeer> _peers = new();
     private readonly Dictionary<string, BulkQueue> _bulkQueues = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (string Host, int Port)> _outbound = new(StringComparer.Ordinal);
     private bool _isRunning;
     private bool _isServer;
     private string _localPeerId = string.Empty;  // Empty = not connected/started
@@ -41,6 +42,8 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
     public event Action<string>? OnPeerConnected;
     public event Action<string>? OnPeerDisconnected;
     public event Action<string, byte[], int>? OnDataReceived;
+    public event Action<string, string, int>? OutboundConnected;
+    public event Action<string, int>? DialFailed;
     
     // Large File Transfer events
     public event Action<string, Guid, int, byte[]>? OnFileChunkReceived;
@@ -60,7 +63,7 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
     public LiteNetLibTransport(ILogger logger)
     {
         _logger = logger;
-        _netManager = new NetManager(this) { ChannelsCount = BulkChannel + 1 };
+        _netManager = new NetManager(this) { ChannelsCount = BulkChannel + 1, MaxConnectAttempts = 1 };
         _defaultPingInterval = _netManager.PingInterval;
         _defaultDisconnectTimeout = _netManager.DisconnectTimeout;
     }
@@ -105,7 +108,7 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
         _logger.LogInfo($"[LiteNetLibTransport] 🆔 LocalPeerId = {_localPeerId}");
     }
 
-    public void Connect(string host, int port, string? peerName = null, string? role = null)
+    public void StartOutbound(string? peerName = null, string? role = null)
     {
         if (!_isRunning)
         {
@@ -113,10 +116,25 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
             _isRunning = true;
         }
 
-        // Generate unique PeerId using PeerIdGenerator
-        _localPeerId = PeerIdGenerator.Generate(peerName, role ?? "client", transportId: 0);
-        
-        _netManager.Connect(host, port, "ApeCore");
+        if (string.IsNullOrEmpty(_localPeerId))
+            _localPeerId = PeerIdGenerator.Generate(peerName, role ?? "client", transportId: 0);
+    }
+
+    public void Connect(string host, int port, string? peerName = null, string? role = null)
+    {
+        StartOutbound(peerName, role);
+        Dial(host, port);
+    }
+
+    public void Dial(string host, int port)
+    {
+        if (string.IsNullOrWhiteSpace(host) || port is <= 0 or > 65535)
+            throw new ArgumentOutOfRangeException(nameof(port), "Dial needs a host and a port from 1 to 65535.");
+
+        StartOutbound(null, "client");
+        var peer = _netManager.Connect(host, port, "ApeCore");
+        lock (_outbound)
+            _outbound[peer.Id.ToString()] = (host, port);
         _logger.LogInfo($"[LiteNetLibTransport] Connecting to {host}:{port}");
         _logger.LogInfo($"[LiteNetLibTransport] 🆔 LocalPeerId = {_localPeerId}");
     }
@@ -319,20 +337,36 @@ public class LiteNetLibTransport : INetworkTransport, INetEventListener
             _logger.LogInfo($"[LiteNetLibTransport] Peer connected: {peerId} ({peer.Address})");
         }
         
+        (string Host, int Port) outbound = default;
+        var dial = false;
+        lock (_outbound)
+            dial = _outbound.TryGetValue(peerId, out outbound);
+
         OnPeerConnected?.Invoke(peerId);
+        if (dial)
+            OutboundConnected?.Invoke(peerId, outbound.Host, outbound.Port);
     }
 
     void INetEventListener.OnPeerDisconnected(NetPeer peer, DisconnectInfo disconnectInfo)
     {
         var peerId = peer.Id.ToString();
+        bool live;
         lock (_peers)
         {
-            _peers.Remove(peerId);
+            live = _peers.Remove(peerId);
             _bulkQueues.Remove(peerId);
         }
-        
+
+        (string Host, int Port) outbound = default;
+        bool pending;
+        lock (_outbound)
+            pending = _outbound.Remove(peerId, out outbound);
+
         _logger.LogInfo($"[LiteNetLibTransport] Peer disconnected: {peerId} (reason: {disconnectInfo.Reason})");
-        OnPeerDisconnected?.Invoke(peerId);
+        if (live)
+            OnPeerDisconnected?.Invoke(peerId);
+        else if (pending)
+            DialFailed?.Invoke(outbound.Host, outbound.Port);
     }
 
     public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channel, DeliveryMethod deliveryMethod)

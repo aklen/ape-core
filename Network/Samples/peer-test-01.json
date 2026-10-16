@@ -1,0 +1,22 @@
+{
+    "modules": {
+      "Ape.Core.Logging": {
+        "enabled": true,
+        "level": "info",
+        "transport": "console"
+      },
+      "Ape.Core.Network": {
+        "enabled": true,
+        "role": "peer",
+        "transport": "quic",
+        "reconnect": { "initialSeconds": 1, "maxSeconds": 30 },
+        "port": 9050,
+        "peerName": "discovery-test",
+        "peers": [
+          { "host": "10.0.0.2", "port": 9050 },
+          { "host": "10.0.0.3", "port": 9050 }
+        ]
+      }
+    }
+  }
+  

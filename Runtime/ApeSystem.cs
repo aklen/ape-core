@@ -238,16 +238,34 @@ public static class ApeSystem
                 logger.LogInfo($"Network keep-alive every {keepAliveSeconds}s");
             }
 
+            var reconnect = NetworkEndpointConfig.Reconnect(networkSection);
+            networkManager.SetReconnect(reconnect.Initial, reconnect.Max);
+            var peers = NetworkEndpointConfig.Peers(networkSection, port);
+
             if (role == "client")
             {
-                var host = networkSection?.GetString("host", "localhost") ?? "localhost";
-                networkManager.Connect(host, port, peerName, role);
-                logger.LogInfo($"Network client connecting to {host}:{port}");
+                if (peers.Count == 0)
+                {
+                    var host = networkSection?.GetString("host", "localhost") ?? "localhost";
+                    peers = [(host, port)];
+                }
+
+                networkManager.Connect(peers[0].Host, peers[0].Port, peerName, role);
+                for (var i = 1; i < peers.Count; i++)
+                    networkManager.Track(peers[i].Host, peers[i].Port);
+                logger.LogInfo($"Network client connecting to {string.Join(", ", peers.Select(peer => $"{peer.Host}:{peer.Port}"))}");
             }
             else
             {
                 networkManager.StartServer(port, peerName, role);
                 logger.LogInfo($"Network server started on port {port}");
+                if (role == "peer")
+                {
+                    foreach (var peer in peers)
+                        networkManager.Track(peer.Host, peer.Port);
+                    if (peers.Count > 0)
+                        logger.LogInfo($"Network peer dialing {string.Join(", ", peers.Select(peer => $"{peer.Host}:{peer.Port}"))}");
+                }
             }
 
             _networkStarted = true;

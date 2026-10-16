@@ -26,7 +26,7 @@ namespace Ape.Core.Network.Transport;
 [SupportedOSPlatform("linux")]
 [SupportedOSPlatform("macos")]
 [SupportedOSPlatform("windows")]
-public class QuicTransport : INetworkTransport
+public class QuicTransport : INetworkTransport, IOutboundDial
 {
     private const byte MessageTypeNormal = 0;
     private const byte MessageTypeFileChunk = 1;
@@ -62,6 +62,8 @@ public class QuicTransport : INetworkTransport
     public event Action<string>? OnPeerConnected;
     public event Action<string>? OnPeerDisconnected;
     public event Action<string, byte[], int>? OnDataReceived;
+    public event Action<string, string, int>? OutboundConnected;
+    public event Action<string, int>? DialFailed;
     
     // Large File Transfer events
     public event Action<string, Guid, int, byte[]>? OnFileChunkReceived;
@@ -178,93 +180,81 @@ public class QuicTransport : INetworkTransport
         _ = Task.Run(AcceptConnectionsAsync);
     }
 
+    public void StartOutbound(string? peerName = null, string? role = null)
+    {
+        if (!_isRunning)
+            _isRunning = true;
+        if (string.IsNullOrEmpty(_localPeerId))
+            _localPeerId = PeerIdGenerator.Generate(peerName, role ?? "client", transportId: 0);
+    }
+
     public void Connect(string host, int port, string? peerName = null, string? role = null)
     {
-        if (_isRunning)
-        {
-            _logger.LogWarning("[QuicTransport] Already running");
-            return;
-        }
-
-        _isRunning = true;
-        
-        // Generate unique PeerId using PeerIdGenerator
-        _localPeerId = PeerIdGenerator.Generate(peerName, role ?? "client", transportId: 0);
-
-        _ = Task.Run(() => MaintainClientConnectionAsync(host, port));
+        StartOutbound(peerName, role);
+        Dial(host, port);
     }
 
-    private async Task MaintainClientConnectionAsync(string host, int port)
+    public void Dial(string host, int port)
     {
-        var delay = TimeSpan.FromSeconds(1);
-        while (!_cts.IsCancellationRequested)
-        {
-            try
-            {
-                await ConnectClientOnceAsync(host, port);
-                delay = TimeSpan.FromSeconds(1);
-            }
-            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning($"[QuicTransport] Connection failed: {ex.Message}. Retrying.");
-            }
+        if (string.IsNullOrWhiteSpace(host) || port is <= 0 or > 65535)
+            throw new ArgumentOutOfRangeException(nameof(port), "Dial needs a host and a port from 1 to 65535.");
 
-            if (_cts.IsCancellationRequested)
-                break;
-
-            _logger.LogInfo($"[QuicTransport] Reconnecting to {host}:{port} in {delay.TotalSeconds:0}s");
-            try
-            {
-                await Task.Delay(delay, _cts.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-
-            var nextSeconds = Math.Min(delay.TotalSeconds * 2, 8);
-            delay = TimeSpan.FromSeconds(nextSeconds);
-        }
+        StartOutbound(null, "client");
+        _ = Task.Run(() => DialOnceAsync(host, port));
     }
 
-    private async Task ConnectClientOnceAsync(string host, int port)
+    /// <summary>
+    /// MsQuic rejects an IP address in the TLS server name before the certificate callback runs.
+    /// The socket still uses <paramref name="host"/>. The development certificate names <c>ApeCore</c>.
+    /// </summary>
+    private static string SniHost(string host) =>
+        Uri.CheckHostName(host) == UriHostNameType.Dns ? host : "ApeCore";
+
+    private async Task DialOnceAsync(string host, int port)
     {
-        var alpnProtocol = new SslApplicationProtocol("apecore");
-        _logger.LogInfo($"[QuicTransport] Client ALPN protocol: {System.Text.Encoding.UTF8.GetString(alpnProtocol.Protocol.ToArray())}");
-        _logger.LogInfo($"[QuicTransport] Connecting to {host}:{port} with TargetHost: {host}");
-        _logger.LogInfo($"[QuicTransport] 🆔 LocalPeerId = {_localPeerId}");
-        var timers = QuicTimers();
-        var clientOptions = new QuicClientConnectionOptions
+        try
         {
-            RemoteEndPoint = new DnsEndPoint(host, port),
-            KeepAliveInterval = timers.Probe,
-            IdleTimeout = timers.Idle,
-            DefaultStreamErrorCode = 0,
-            DefaultCloseErrorCode = 0,
-            MaxInboundBidirectionalStreams = 100, // Allow server to open streams to client
-            MaxInboundUnidirectionalStreams = 100,
-            ClientAuthenticationOptions = new SslClientAuthenticationOptions
+            var alpnProtocol = new SslApplicationProtocol("apecore");
+            _logger.LogInfo($"[QuicTransport] Connecting to {host}:{port}");
+            _logger.LogInfo($"[QuicTransport] 🆔 LocalPeerId = {_localPeerId}");
+            var timers = QuicTimers();
+            var clientOptions = new QuicClientConnectionOptions
             {
-                ApplicationProtocols = new List<SslApplicationProtocol> { alpnProtocol },
-                RemoteCertificateValidationCallback = (sender, certificate, chain, errors) => true, // Accept all certs in dev mode
-                TargetHost = host // Explicitly set TargetHost for SNI
-            }
-        };
+                RemoteEndPoint = new DnsEndPoint(host, port),
+                KeepAliveInterval = timers.Probe,
+                IdleTimeout = timers.Idle,
+                DefaultStreamErrorCode = 0,
+                DefaultCloseErrorCode = 0,
+                MaxInboundBidirectionalStreams = 100,
+                MaxInboundUnidirectionalStreams = 100,
+                ClientAuthenticationOptions = new SslClientAuthenticationOptions
+                {
+                    ApplicationProtocols = new List<SslApplicationProtocol> { alpnProtocol },
+                    RemoteCertificateValidationCallback = (sender, certificate, chain, errors) => true,
+                    TargetHost = SniHost(host)
+                }
+            };
 
-        var connection = await QuicConnection.ConnectAsync(clientOptions, _cts.Token);
-        _clientConnection = connection;
-        var peerId = "0"; // Server is always peer "0" for client
-        _connections[peerId] = connection;
+            var connection = await QuicConnection.ConnectAsync(clientOptions, _cts.Token);
+            var peerId = Interlocked.Increment(ref _nextPeerId).ToString();
+            _connections[peerId] = connection;
 
-        _logger.LogInfo($"[QuicTransport] Connected to {host}:{port}");
-        OnPeerConnected?.Invoke(peerId);
-        await ReceiveFromConnectionAsync(peerId, connection);
-        if (ReferenceEquals(_clientConnection, connection))
-            _clientConnection = null;
+            _logger.LogInfo($"[QuicTransport] Connected to {host}:{port}");
+            OnPeerConnected?.Invoke(peerId);
+            OutboundConnected?.Invoke(peerId, host, port);
+            await ReceiveFromConnectionAsync(peerId, connection);
+        }
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            if (!_isRunning || _cts.IsCancellationRequested)
+                return;
+
+            _logger.LogWarning($"[QuicTransport] Connection to {host}:{port} failed: {ex.Message}");
+            DialFailed?.Invoke(host, port);
+        }
     }
 
     private async Task AcceptConnectionsAsync()

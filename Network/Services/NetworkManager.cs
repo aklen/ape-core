@@ -37,6 +37,11 @@ public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, I
     private readonly TimeProvider _time;
     private readonly bool _allowUnauthenticated;
     private string _role = String.Empty;
+    private readonly object _dialGate = new();
+    private readonly Dictionary<string, DialTarget> _targets = new(StringComparer.Ordinal);
+    private TimeSpan _reconnectInitial = NetworkEndpointConfig.DefaultInitial;
+    private TimeSpan _reconnectMax = NetworkEndpointConfig.DefaultMax;
+    private bool _retryEnabled = true;
 
     public event Action<string, byte[]>? OnDataReceived;
     public event Action<string>? OnPeerConnected;
@@ -116,11 +121,15 @@ public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, I
         tempLogger.LogDebug($"NetworkManager initialized with {transportType} transport");
     }
 
-    internal NetworkManager(INetworkTransport transport, string? principalId = null, bool allowUnauthenticated = false)
+    internal NetworkManager(
+        INetworkTransport transport,
+        string? principalId = null,
+        bool allowUnauthenticated = false,
+        TimeProvider? time = null)
     {
         ArgumentNullException.ThrowIfNull(transport);
         _transport = transport;
-        _time = TimeProvider.System;
+        _time = time ?? TimeProvider.System;
         _allowUnauthenticated = allowUnauthenticated;
         PrincipalId = string.IsNullOrEmpty(principalId) ? transport.LocalPeerId : principalId;
         Wire();
@@ -191,7 +200,13 @@ public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, I
             }
 
             OnPeerDisconnected?.Invoke(connectionId);
+            NoteDisconnected(connectionId);
         };
+        if (_transport is IOutboundDial dial)
+        {
+            dial.OutboundConnected += NoteOutboundConnected;
+            dial.DialFailed += NoteDialFailed;
+        }
     }
 
     private void SendHello(string connectionId)
@@ -472,13 +487,75 @@ public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, I
     public void Connect(string address, int port, string? peerName = null, string? role = null)
     {
         _role = role ?? "client";
+        if (_transport is IOutboundDial dial)
+        {
+            dial.StartOutbound(peerName, _role);
+            Track(address, port);
+            return;
+        }
+
         _transport.Connect(address, port, peerName, role);
+    }
+
+    public void Track(string host, int port, string? principal = null)
+    {
+        if (!_retryEnabled)
+            return;
+
+        host = host.Trim();
+        if (host.Length == 0 || port is <= 0 or > 65535)
+        {
+            _logger?.LogWarning($"[NetworkManager] Ignored dial target {host}:{port}");
+            return;
+        }
+
+        var key = EndpointKey(host, port);
+        lock (_dialGate)
+        {
+            if (_targets.TryGetValue(key, out var existing))
+            {
+                if (!string.IsNullOrEmpty(principal))
+                    existing.Principal = principal;
+                return;
+            }
+
+            _targets[key] = new DialTarget
+            {
+                Host = host,
+                Port = port,
+                Principal = principal,
+                NextAttempt = _time.GetUtcNow(),
+                Delay = _reconnectInitial
+            };
+        }
+
+        Pump();
+    }
+
+    public void Untrack(string host, int port)
+    {
+        lock (_dialGate)
+            _targets.Remove(EndpointKey(host, port));
+    }
+
+    public void SetReconnect(TimeSpan initial, TimeSpan maximum)
+    {
+        if (initial < TimeSpan.Zero || maximum < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(initial), "Reconnect waits cannot be negative.");
+        if (maximum < initial)
+            maximum = initial;
+
+        _reconnectInitial = initial;
+        _reconnectMax = maximum;
     }
 
     public void SetKeepAlive(TimeSpan interval) => _transport.SetKeepAlive(interval);
 
     public void Stop()
     {
+        _retryEnabled = false;
+        lock (_dialGate)
+            _targets.Clear();
         _transport.Stop();
         lock (_peersGate)
             _peers.Clear();
@@ -534,6 +611,117 @@ public class NetworkManager : INetworkManager, IPrincipalSigner, ICoreService, I
 
         foreach (var connectionId in pending)
             Flush(connectionId);
+        Pump();
+    }
+
+    private void NoteOutboundConnected(string connectionId, string host, int port)
+    {
+        lock (_dialGate)
+        {
+            if (!_targets.TryGetValue(EndpointKey(host, port), out var target))
+                return;
+
+            target.Dialing = false;
+            target.ConnectionId = connectionId;
+            target.Delay = _reconnectInitial;
+        }
+    }
+
+    private void NoteDialFailed(string host, int port)
+    {
+        if (!_retryEnabled)
+            return;
+
+        lock (_dialGate)
+        {
+            if (!_targets.TryGetValue(EndpointKey(host, port), out var target))
+                return;
+
+            target.Dialing = false;
+            target.ConnectionId = null;
+            Schedule(target);
+            _logger?.LogInfo($"[NetworkManager] Reconnecting to {target.Host}:{target.Port} in {Seconds(target.NextAttempt):0}s");
+        }
+    }
+
+    private void NoteDisconnected(string connectionId)
+    {
+        if (!_retryEnabled)
+            return;
+
+        lock (_dialGate)
+        {
+            foreach (var target in _targets.Values)
+            {
+                if (!string.Equals(target.ConnectionId, connectionId, StringComparison.Ordinal))
+                    continue;
+
+                target.ConnectionId = null;
+                target.Dialing = false;
+                Schedule(target);
+                _logger?.LogInfo($"[NetworkManager] Reconnecting to {target.Host}:{target.Port} in {Seconds(target.NextAttempt):0}s");
+                return;
+            }
+        }
+    }
+
+    private void Schedule(DialTarget target)
+    {
+        var wait = target.Delay <= TimeSpan.Zero ? _reconnectInitial : target.Delay;
+        target.NextAttempt = _time.GetUtcNow() + wait;
+        var doubled = wait.Ticks > _reconnectMax.Ticks / 2 ? _reconnectMax : new TimeSpan(wait.Ticks * 2);
+        if (doubled > _reconnectMax)
+            doubled = _reconnectMax;
+        target.Delay = doubled;
+    }
+
+    private double Seconds(DateTimeOffset next) => Math.Max(0, (next - _time.GetUtcNow()).TotalSeconds);
+
+    private void Pump()
+    {
+        if (!_retryEnabled || _transport is not IOutboundDial dial)
+            return;
+
+        List<(string Host, int Port)> due = [];
+        var now = _time.GetUtcNow();
+        lock (_dialGate)
+        {
+            foreach (var target in _targets.Values)
+            {
+                if (target.Dialing || target.ConnectionId != null || target.NextAttempt > now)
+                    continue;
+
+                target.Dialing = true;
+                due.Add((target.Host, target.Port));
+            }
+        }
+
+        foreach (var (host, port) in due)
+        {
+            try
+            {
+                dial.Dial(host, port);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning($"[NetworkManager] Dial {host}:{port} failed: {ex.Message}");
+                NoteDialFailed(host, port);
+            }
+        }
+    }
+
+    private static string EndpointKey(string host, int port) =>
+        host.Trim().ToLowerInvariant() + "|" + port.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    private sealed class DialTarget
+    {
+        public required string Host { get; init; }
+        public required int Port { get; init; }
+        public string? Principal { get; set; }
+        public string? ConnectionId { get; set; }
+        public bool Dialing { get; set; }
+        public DateTimeOffset NextAttempt { get; set; }
+        public TimeSpan Delay { get; set; }
     }
 
     /// <inheritdoc/>
