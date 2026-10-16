@@ -31,6 +31,7 @@ public sealed class SceneCommitService : ICoreService, IDeterministicHostTick, I
     private int _recordHistoryLimit = 1000;
     private bool _halted;
     private HostFrameOutcomeJournal.Writer? _outcomeJournal;
+    private SceneCommitJournal? _commitJournal;
     private string? _lastFailureParticipant;
     private string? _lastFailureReason;
 
@@ -98,6 +99,9 @@ public sealed class SceneCommitService : ICoreService, IDeterministicHostTick, I
         var outcomePath = section?.GetString("outcomeJournalPath");
         if (!string.IsNullOrWhiteSpace(outcomePath))
             _outcomeJournal = HostFrameOutcomeJournal.CreateNew(outcomePath);
+        var commitPath = section?.GetString("commitJournalPath");
+        if (!string.IsNullOrWhiteSpace(commitPath))
+            _commitJournal = SceneCommitJournal.CreateNew(commitPath);
         var network = moduleAware.GetModuleSection(root, NetworkModuleIds.ModuleId);
         var networkOn = moduleAware.IsModuleEnabled(root, NetworkModuleIds.ModuleId)
             && (network?.GetBool("enabled") ?? false);
@@ -114,10 +118,15 @@ public sealed class SceneCommitService : ICoreService, IDeterministicHostTick, I
     {
         _outcomeJournal?.Dispose();
         _outcomeJournal = null;
+        _commitJournal?.Dispose();
+        _commitJournal = null;
     }
 
     internal void SetOutcomeJournal(HostFrameOutcomeJournal.Writer? journal) =>
         _outcomeJournal = journal;
+
+    internal void SetCommitJournal(SceneCommitJournal? journal) =>
+        _commitJournal = journal;
 
     /// <summary>Only an isolated replay host may align its first tick to a captured frame id.</summary>
     internal void AlignFirstReplayFrame(long firstFrameId)
@@ -340,7 +349,10 @@ public sealed class SceneCommitService : ICoreService, IDeterministicHostTick, I
             }
 
             foreach (var op in ops)
+            {
                 SceneCommitApplicator.Apply(_scene, op, _logger);
+                _commitJournal?.Append(participantId, op);
+            }
         }
 
         if (_logCommitsPerFrame && applied == 0)
